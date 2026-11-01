@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
 from capforge import core
+from capforge.cli import _is_skills_path
 
 
 def test_parse_skill_md_inline_lists():
@@ -141,6 +143,28 @@ def test_data_dir_create_flag(tmp_path, monkeypatch):
     assert not path.exists()
     created = core.data_dir("demo", "v1")
     assert created.is_dir()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/a773158d/.agents/skills",
+        "/home/capforge/.agents/skills",
+        "/home/other/.cptr/skills",
+        "/srv/terminal/.claude/skills",
+        "/home/x/.codex/skills",
+    ],
+)
+def test_doctor_accepts_skills_dirs_in_any_home(path):
+    assert _is_skills_path(Path(path))
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/srv/caps", "/home/x/.config/skills", "/home/x/.agents/other", "/home/x/skills"],
+)
+def test_doctor_rejects_paths_that_are_not_terminal_skills(path):
+    assert not _is_skills_path(Path(path))
 
 
 def test_workspace_guide_is_installed_and_reserved(tmp_path, monkeypatch):

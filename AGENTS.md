@@ -219,8 +219,9 @@ capability without failing the whole listing.
 - `uv run --locked pytest -q` passes, and `uv run --locked pytest -q -m "not slow"` is quick.
 - `uv run --locked ruff check .` and `uv run --locked mypy capforge` pass.
 - `uv run --locked capforge tools` still reports exactly ten tools with stable signatures.
-- `uv run --locked capforge doctor` is clean against a real caps dir (it warns when the caps dir is
-  not under `~/.agents/skills`, `~/.cptr/skills`, `~/.claude/skills` or `~/.codex/skills`).
+- `uv run --locked capforge doctor` is clean against a real caps dir (it warns when the caps dir
+  does not end in `.agents/skills`, `.cptr/skills`, `.claude/skills` or `.codex/skills`; the
+  terminal home may differ from capforge's home).
 - `tools/mcp_probe.py` completes against a running server.
 - `uv lock --check` passes and `uv.lock` is committed when dependencies changed.
 - If the capability contract changed: `contract.py`, `README.md` and `AGENTS.md.example` were

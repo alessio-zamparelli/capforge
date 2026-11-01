@@ -13,6 +13,21 @@ from typing import Literal, cast
 Transport = Literal["http", "stdio", "sse", "streamable-http"]
 TRANSPORTS = {"http", "stdio", "sse", "streamable-http"}
 
+# Terminal skills live in one of these directories under the terminal user's home.
+# The terminal usually runs in another container, so its home is not Path.home() here.
+SKILL_DIRS = {
+    (".agents", "skills"),
+    (".cptr", "skills"),
+    (".claude", "skills"),
+    (".codex", "skills"),
+}
+
+
+def _is_skills_path(path: Path) -> bool:
+    """Accept any <home>/.agents/skills-style path, regardless of whose home it is."""
+    parts = path.resolve().parts
+    return len(parts) >= 2 and (parts[-2], parts[-1]) in SKILL_DIRS
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -38,19 +53,14 @@ def _doctor() -> int:
     else:
         if not os.access(root, os.W_OK):
             problems.append(f"caps dir is not writable by uid {os.getuid()}: {root}")
-        # Open WebUI only picks up skills under these paths, relative to the terminal home.
-        home = Path.home()
-        known = [
-            home / ".agents" / "skills",
-            home / ".cptr" / "skills",
-            home / ".claude" / "skills",
-            home / ".codex" / "skills",
-        ]
-        if root not in [p.resolve() for p in known]:
+        # Open WebUI scans these names under the *terminal* user's home. The terminal
+        # normally runs in another container, so do not compare against Path.home().
+        if not _is_skills_path(root):
             problems.append(
-                f"caps dir is not one of the paths Open WebUI scans for terminal skills "
-                f"({', '.join(str(p) for p in known)}); the model will not see capabilities "
-                "in its per-turn skill manifest"
+                f"caps dir does not look like a terminal skills path: {root}. "
+                "Mount the same host folder at <terminal-home>/.agents/skills "
+                "(or .cptr/.claude/.codex) and point CAPFORGE_CAPS_DIR at capforge's mount; "
+                "the terminal's home can differ from this container's home."
             )
 
     try:
