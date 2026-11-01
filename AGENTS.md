@@ -34,6 +34,8 @@ capforge/
     contract.py     CONTRACT text and the scaffold templates (main/SKILL/test/.gitignore)
     server.py       FastMCP instance and the ten @mcp.tool functions (the public API)
     cli.py          capforge serve | doctor | tools
+docs/
+    ARCHITECTURE.md     design, data model, security posture, deployment, change map
 tests/
     test_lifecycle.py   end-to-end: scaffold -> test -> promote -> run -> edit -> rollback
 tools/

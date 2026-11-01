@@ -2,6 +2,8 @@
 
 Deterministic, versioned capabilities exposed over MCP, for Open WebUI + Open Terminal.
 
+Design and internals: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 The model writes a capability folder in a directory it can also reach through the terminal,
 tests the draft, promotes it to an immutable tag, and from then on `run_capability` executes
 that tag. Rollback is a pointer move; the working copy is never touched.

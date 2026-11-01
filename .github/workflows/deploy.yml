@@ -1,5 +1,10 @@
 name: Deploy container to GHCR
 
+# Pin the runner image instead of `ubuntu-latest`: GitHub is migrating that
+# label to Ubuntu 26.04 between October 19 and November 19, 2026
+# (actions/runner-images#14748). Pinning keeps CI reproducible regardless of
+# where a given runner is in the rollout. Keep both jobs on the same image.
+
 on:
   push:
     branches:
@@ -20,7 +25,7 @@ jobs:
   # Only publish if the suite still passes. The tests build real venvs and
   # execute real capability subprocesses, so this is a meaningful gate.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -34,7 +39,22 @@ jobs:
           # Keep in sync with the uv image tag in the Dockerfile.
           version: "0.12.24"
           python-version: "3.12"
+          # Cache the uv download cache and the managed Python 3.12 install.
+          # Keying on uv.lock (not pyproject.toml) avoids invalidation on
+          # metadata-only edits; --locked still fails on real drift.
           enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          cache-python: true
+
+      # Capability venvs are built with pip by the test suite, outside uv.
+      # Cache the wheels those installs download (pytest, six, ...).
+      - name: Cache pip downloads for capability venvs
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Sync environment from lockfile
         run: uv sync --locked
@@ -43,7 +63,7 @@ jobs:
         run: uv run --locked pytest -q
 
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: test
     permissions:
       contents: read
@@ -86,8 +106,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Namespaced so this workflow does not share layers with any future
+          # workflow that also uses the GitHub Actions cache backend.
+          cache-from: type=gha,scope=capforge
+          cache-to: type=gha,mode=max,scope=capforge
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
