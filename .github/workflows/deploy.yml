@@ -29,6 +29,12 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      # Install a uv-managed Python for the test job instead of borrowing the
+      # runner image's system interpreter. Without this, setup-uv's
+      # cache-python has nothing to cache and logs a "no managed Python
+      # installation was found" warning.
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - name: Checkout
         uses: actions/checkout@v7

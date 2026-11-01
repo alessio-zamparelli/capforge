@@ -445,7 +445,8 @@ CI/CD (`.github/workflows/deploy.yml`):
 Caching layers, all speed-only (correctness still comes from `--locked` and the test gate):
 
 - `setup-uv` caches the uv download cache keyed on `uv.lock`, plus the managed Python 3.14
-  installation (`cache-python`).
+  installation (`cache-python`). CI sets `UV_PYTHON_PREFERENCE=only-managed` so uv installs that
+  managed interpreter instead of using the runner image's system Python.
 - `actions/cache` keeps `~/.cache/pip` for the capability venvs, which the test suite builds with
   pip rather than uv.
 - Buildx imports/exports Docker layers through the GitHub Actions cache under the `capforge`
