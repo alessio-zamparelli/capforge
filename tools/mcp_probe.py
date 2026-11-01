@@ -27,9 +27,10 @@ def cleanup(contract: dict, name: str) -> None:
     caps = Path(contract["caps_dir"])
     state = Path(contract["state_dir"])
     shutil.rmtree(caps / name, ignore_errors=True)
-    for sub in ("versions", "venvs", "data", "backups", "locks"):
+    for sub in ("versions", "venvs", "data", "backups"):
         shutil.rmtree(state / sub / name, ignore_errors=True)
     (state / "state" / f"{name}.json").unlink(missing_ok=True)
+    (state / "locks" / f"{name}.lock").unlink(missing_ok=True)
     for lock in (state / "locks").glob(f"{name}-*.lock"):
         lock.unlink(missing_ok=True)
 

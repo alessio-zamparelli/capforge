@@ -143,6 +143,33 @@ def test_data_dir_create_flag(tmp_path, monkeypatch):
     assert created.is_dir()
 
 
+def test_workspace_guide_is_installed_and_reserved(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    path = core.ensure_workspace_skill()
+    assert path is not None
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("---")
+    assert core.WORKSPACE_SKILL_MARKER in text
+    assert "get_contract" in text
+    assert core.list_capabilities() == []
+
+
+def test_workspace_guide_preserves_user_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    path = tmp_path / "caps" / "_capforge" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\ndescription: mine\n---\n", encoding="utf-8")
+    assert core.ensure_workspace_skill() == path
+    assert "description: mine" in path.read_text(encoding="utf-8")
+
+
+def test_workspace_guide_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_GUIDE", "0")
+    assert core.ensure_workspace_skill() is None
+    assert not (tmp_path / "caps" / "_capforge").exists()
+
+
 def test_tool_surface_is_fixed_at_ten():
     from capforge.server import mcp
 
