@@ -28,7 +28,7 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/"
-    # Keeps the python:3.12-slim base image current.
+    # Keeps the python:3.14-slim base image current.
     schedule:
       interval: "weekly"
     labels:

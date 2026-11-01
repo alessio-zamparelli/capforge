@@ -1,13 +1,14 @@
 # Architecture
 
-Status: describes `capforge` 0.1.0 as implemented. If code and this document disagree, the code
-wins; update this file in the same change.
+Status: describes `capforge` 0.2.0 as implemented. If code and this document disagree, the code
+wins; update this file in the same change. Requires Python 3.14 (pinned by `.python-version`).
 
 Related documents:
 
 - [`README.md`](../README.md) — install, run, deployment and the public contract.
 - [`AGENTS.md`](../AGENTS.md) — contributor rules, test strategy and definition of done.
 - [`AGENTS.md.example`](../AGENTS.md.example) — the guide deployed into a capability workspace.
+- [`NEXT.md`](NEXT.md) — known limitations and later work.
 
 ## 1. What capforge is
 
@@ -71,9 +72,9 @@ the terminal's skills home in both containers (see [Deployment](#11-deployment-t
 ```
 capforge/
     __init__.py     __version__
-    core.py         paths, validation, SKILL.md parsing, state JSON, hashing,
-                    venv construction, process execution, test running
-    versioning.py   snapshot, promote, prune, rollback, list_tags, diff, git audit
+    core.py         paths, validation, locks, SKILL.md parsing, state JSON, hashing,
+                    venv construction, process-group execution, test running, logging
+    versioning.py   snapshot, promote, prune (+ data/venv GC), rollback, list_tags, diff, git audit
     contract.py     CONTRACT text and scaffold templates (strings only)
     server.py       FastMCP instance and the ten @mcp.tool functions
     cli.py          capforge serve | doctor | tools
@@ -152,14 +153,17 @@ sequenceDiagram
 
 Promotion is the only transition from draft to runnable version. It is guarded by:
 
-1. `draft_ready`: `SKILL.md` exists, has a `description`, and the entrypoint exists.
-2. Tests pass (unless `skip_tests=true`), using the supplied package set if one is given.
-3. The tag does not already exist. Tags are never overwritten.
-4. The draft differs from the active content hash, unless `force=true`.
+1. `draft_ready`: `SKILL.md` exists, has a `description`, and a contained entrypoint exists.
+2. Package specs pass `PKG_RE` and the 50-package limit.
+3. Tests pass (unless `skip_tests=true`), using the supplied package set if one is given.
+4. The tag does not already exist. Tags are never overwritten.
+5. The draft differs from the active content hash, unless `force=true`.
 
 If a new `packages` list is supplied, it is written into `SKILL.md` **before** the snapshot, so the
 tag carries the frontmatter its venv will be built from. Reordering that step changes what a
-promoted version declares.
+promoted version declares. The state entry also records `entrypoint`, and `run_capability` reads
+the tag's own `SKILL.md`, so later draft edits cannot change the live version's entrypoint or
+dependency set. The whole promotion holds `cap_lock(name)`.
 
 ### 5.3 Execution
 
@@ -172,36 +176,48 @@ promoted version declares.
 | none | yes | `<caps>/<name>` | `draft` + `warning` |
 | none | no | — | error |
 
+A broken draft (`SKILL.md` deleted, invalid metadata) does not stop an already-promoted tag from
+running: `run_capability` validates the name and reads state before loading any draft metadata.
+
 Execution steps:
 
-1. Select the package list: the active tag's recorded packages, otherwise the draft's.
-2. Ensure `<state>/venvs/<name>/<requirements_hash>/` exists, installing the packages if needed.
+1. Load the source's own `SKILL.md`; use its contained `entrypoint`. For an active tag, the package
+   list is exactly the one recorded at promotion (`[]` stays `[]`, it does not fall back to the
+   draft).
+2. Ensure `<state>/venvs/<name>/<requirements_hash>/` exists, installing the packages if needed,
+   under a per-requirements lock.
 3. Build an allowlisted environment and add `CAPFORGE_CAP`, `CAPFORGE_VERSION`,
    `CAPFORGE_DATA_DIR`, `VIRTUAL_ENV`, and a venv-prefixed `PATH`.
-4. Run `<venv>/bin/python <entrypoint>` with `cwd` set to the source directory, one JSON object on
-   stdin, and a hard timeout.
-5. Parse stdout as JSON and return exit code, stdout/stderr tails, duration, and result.
+4. Start `<venv>/bin/python <entrypoint>` in a **new session/process group**, `cwd` set to the
+   source directory, one JSON object on stdin, and a hard timeout. Output is drained by reader
+   threads that keep only the last 256 KB per stream.
+5. On timeout, `SIGKILL` the whole process group (no orphaned children). On success, parse stdout
+   as JSON and return exit code, stdout/stderr tails, duration, and result.
 
 The capability never receives argv. Diagnostics belong on stderr. A non-zero exit, a timeout, or
 unparseable stdout is a failed call. A parsed `{"error": "..."}` is a **handled** failure: it is
 returned as a successful MCP call whose `result` contains `error`, and the model is expected to
 read it.
 
-Implementation quirks worth knowing:
+Implementation details worth knowing:
 
-- `execute` parses the **entire trimmed stdout** as one JSON value. The contract text and scaffold
-  test say "last line"; the implementation is stricter.
+- `_parse_output` tries the **entire trimmed stdout** first (pretty-printed JSON), then the **last
+  non-empty line**. Diagnostics on stdout are therefore tolerated, matching the contract.
 - Empty stdout with exit 0 is treated as success with `result: null`. The contract asks for a JSON
   value, so capabilities should always emit one.
-- `test_capability` runs pytest when any `tests/test_*.py` exists; otherwise it performs a smoke
-  run with `{}` on stdin. It reuses the draft, not the active tag.
+- `test_capability` runs pytest when any `tests/test_*.py` exists; otherwise it calls `execute`
+  with `{}` and requires the same JSON contract. A capability that cannot emit valid JSON is
+  refused promotion.
+- `test_capability` reports `tests_ok` and (when `args` is given) `run_ok` separately; `ok` is the
+  conjunction.
 
 ### 5.4 Rollback and diff
 
 `rollback_capability` updates only `state.active` to an existing tag after confirming the tag's
-files exist. It does not copy files, touch the draft, or create a new tag. `list_tags` reports tags,
-the active marker and pruned tags; `diff_against_active=true` shells out to
-`git diff --no-index` between the active version directory and the draft.
+files exist, under `cap_lock(name)`. It does not copy files, touch the draft, or create a new tag.
+`list_tags` reports tags, the active marker, entrypoints and pruned tags;
+`diff_against_active=true` shells out to `git diff --no-index` between the active version
+directory and the draft.
 
 ## 6. Storage model
 
@@ -211,15 +227,19 @@ the active marker and pruned tags; `diff_against_active=true` shells out to
 <CAPFORGE_STATE_DIR>/venvs/<name>/<hash>/       one venv per requirement set
 <CAPFORGE_STATE_DIR>/data/<name>/<tag>/         writable per-version data
 <CAPFORGE_STATE_DIR>/state/<name>.json          active tag + tag index + prune log
+<CAPFORGE_STATE_DIR>/backups/<name>/<stamp>/    drafts archived by scaffold(overwrite)
+<CAPFORGE_STATE_DIR>/locks/<name>.lock          per-capability mutation lock
 ```
 
 | Location | Owner | Mutability | Notes |
 |---|---|---|---|
 | caps draft | model / terminal / capforge | editable | The only source for `test_capability` and scaffolding. |
 | versions | capforge | append-only by convention | Promotion refuses an existing tag. Filesystem permissions do not prevent direct edits. |
-| venvs | capforge | build cache | Keyed by requirement hash; old venvs are kept for old tags. |
-| data | capability process | writable | Per capability and per version; never shared between tags. |
+| venvs | capforge | build cache | Keyed by requirement hash; GC'd on prune when no surviving tag needs them. |
+| data | capability process | writable | Per capability and per version; removed when its tag is pruned. |
 | state JSON | capforge | read/write | The source of truth for the active pointer. |
+| backups | capforge | write once | Previous drafts, never read automatically. |
+| locks | capforge | coordination | `flock` files; empty and safe to delete while idle. |
 | caps git repo | capforge | best effort | Initialized on first promotion; one commit per promotion. |
 
 ### 6.1 State JSON
@@ -243,16 +263,16 @@ the active marker and pruned tags; `diff_against_active=true` shells out to
 }
 ```
 
-Writes are atomic: JSON is written to a sibling temp file and moved with `Path.replace`. Reads are
-tolerant: missing or corrupt state yields an empty capability state rather than a crash. Note that
-this means corrupt state can silently make an existing tag invisible; the version files remain on
-disk.
+Writes are atomic: JSON is written to a sibling temp file and moved with `Path.replace`, under the
+per-capability lock. Reads are tolerant: missing or corrupt state yields an empty capability state
+rather than a crash, and a corrupt file is renamed to `<name>.corrupt-<ns>.json` with a warning
+instead of being overwritten. The version files remain on disk.
 
 ### 6.2 Hashing
 
 - `tree_hash(root)` — SHA-256 over the sorted relative path, a NUL, the file bytes, and another NUL
   for every regular file, ignoring `__pycache__`, `.git`, `.pytest_cache`, `.venv`, `venv`,
-  `.mypy_cache`, `.ruff_cache`. It is the definition of "the draft changed".
+  `.mypy_cache`, `.ruff_cache` (shared `SKIP_PARTS`). It is the definition of "the draft changed".
 - `requirements_hash(packages)` — SHA-256 of the newline-joined, sorted, deduplicated package list,
   truncated to 16 hex characters. It keys the venv cache.
 
@@ -266,7 +286,9 @@ detection disagree about what belongs to a capability.
 - The default tag is `v<n>-<YYYYmmdd-HHMMSS>`, where `n` is the current tag count plus one.
 - Pruning keeps `CAPFORGE_KEEP_TAGS` (default 5) tags. The oldest non-active tag is removed first;
   the active tag is never pruned, even when it is the oldest.
-- The pruned list in state grows without bound. It is an audit aid, not a retention policy.
+- A pruned tag's per-version data directory is removed and venvs no surviving tag (or its pytest
+  twin) needs are garbage-collected. Unknown venv directory names are left alone.
+- The pruned list in state is capped at 100 entries; it is an audit aid, not a retention policy.
 - Git is best effort. A missing `git`, failed init, or failed commit does not fail a promotion.
 - `rollback` is a pointer move. The draft stays whatever the model last wrote.
 - `force=true` re-tags an unchanged draft; otherwise an identical draft returns
@@ -274,26 +296,30 @@ detection disagree about what belongs to a capability.
 - `dry_run` in `versioning.promote` is internal and reports the hash and would-be prunes without
   writing.
 
-Concurrency is **not** coordinated. State writes are atomic per file but there is no lock across a
-read-modify-write cycle, so two simultaneous promotions/rollbacks for the same capability can lose
-an update. Venv creation also uses a temp directory but no inter-process lock. Capability processes
-sharing a version's data directory can race on files. This is acceptable for the current
-single-operator deployment model; add per-capability locks before allowing concurrent mutation.
+Concurrency is coordinated with POSIX `flock` on a local filesystem: `cap_lock(name)` covers
+state read-modify-write, frontmatter writes and scaffolding; a per-requirements lock covers venv
+construction. Locks are per capability and must not be nested. Capability processes sharing a
+version's data directory can still race on files; that is the capability author's concern.
+Multi-replica deployments would need a shared lock/state backend, not these local files.
 
 ## 8. Execution environment and security
 
 ### 8.1 What is enforced
 
-- One fresh subprocess per call. No long-lived capability process, no in-process import of
-  capability code.
+- One fresh subprocess per call, in a new session/process group. No long-lived capability process,
+  no in-process import of capability code.
 - A per-capability virtualenv selected by requirement hash. The venv's interpreter is the only
   interpreter used.
 - `cwd` is the draft or the version directory, never `/` or the server's working directory.
 - An environment allowlist: `PATH`, `LANG`, `LC_ALL`, `TZ`, `TERM`, `SSL_CERT_FILE`,
-  `SSL_CERT_DIR`, `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`. `PYTHONPATH` and `PYTHONHOME` are
-  removed. `CAPFORGE_*` values are set explicitly.
+  `SSL_CERT_DIR`. `PYTHONPATH` and `PYTHONHOME` are removed. `CAPFORGE_*` values are set
+  explicitly. `PIP_INDEX_URL`/`PIP_EXTRA_INDEX_URL` are added only for venv/pip construction via
+  `_install_env()`, so index credentials never reach capability code.
+- Package specs are validated with `PKG_RE` before pip sees them; a leading `-` cannot be read as a
+  pip option.
 - A per-version data directory in `CAPFORGE_DATA_DIR`.
-- A hard timeout per run and per test/install.
+- A hard timeout per run and per test/install, enforced on the process group.
+- Bounded stdout/stderr capture (256 KB tail per stream).
 - Name and tag validation plus path containment for every server-side path derived from caller
   input.
 
@@ -311,7 +337,8 @@ This is important when deciding what to host:
 - **No authentication** on the MCP endpoint. Put it on an internal network or terminate auth at a
   proxy.
 - **No secret injection**, which is a control, not a restriction: there is no place to put a key by
-  design. The allowlist also drops `*_KEY`, `*_TOKEN` and `*_SECRET` variables.
+  design. The allowlist also drops `*_KEY`, `*_TOKEN` and `*_SECRET` variables, and pip index
+  settings are visible only to the installer.
 
 Deployment posture: treat capability authors as semi-trusted. If capabilities come from an
 untrusted population, run them in a separate container/user with read-only mounts for everything
@@ -338,8 +365,10 @@ Response conventions:
 - Anticipated failures return `{"ok": false, "error": "..."}`. Internal `CapError` messages are
   written for the model to read and are not re-raised across MCP.
 - Capability-level handled failures appear inside a successful call as `result.error`.
-- Results include stderr/stdout tails (4 KB per stream in `ExecResult`, 3 KB in test responses) and
-  durations. There are no metrics or traces.
+- Results include stderr/stdout tails (4 KB per stream in `ExecResult`, 3 KB in test responses),
+  durations, and the entrypoint/packages actually used by `run_capability`.
+- Runs, promotions and rollbacks are logged at INFO with stable `key=value` fields; verbosity is
+  controlled by `CAPFORGE_LOG_LEVEL`. There are no metrics or traces.
 
 The fixed surface is a feature. Adding an eleventh tool changes the cached prompt prefix for every
 conversation. If a new operation is needed, prefer a mode of an existing tool or a capability.
@@ -352,15 +381,18 @@ conversation. If a new operation is needed, prefer a mode of an existing tool or
 | Missing description | same as above |
 | Missing entrypoint | same as above |
 | Tests fail | `test_capability` returns `ok: false`; promotion refused |
+| Smoke run emits non-JSON | `test_capability` returns `ok: false`; promotion refused |
+| Invalid package spec | `CapError` before pip runs |
 | Duplicate tag | `CapError`: tags are immutable |
 | Unchanged draft | `promoted: false` unless `force` |
 | Active tag files missing | `run_capability` refuses with a rollback/promote hint |
+| Draft broken after promotion | active tag still runs from its own snapshot |
 | pip install fails / times out | `CapError` with the tail of stderr |
-| Capability times out | `ok: false`, `timed_out: true` |
+| Capability times out | `ok: false`, `timed_out: true`; process group killed |
 | Non-zero exit | `ok: false`, stderr reported |
 | stdout is not JSON | `ok: false`, parse error appended to stderr |
 | Empty stdout, exit 0 | `ok: true`, `result: null` (quirk) |
-| Corrupt state JSON | treated as no active tag; version files remain |
+| Corrupt state JSON | quarantined as `.corrupt-<ns>.json`, treated as no active tag |
 | Broken sibling capability | skipped per capability; listing still succeeds |
 
 ## 11. Deployment topology
@@ -370,10 +402,14 @@ Two containers share one host directory:
 ```
 host: /srv/caps
   ├── mounted at /home/user/.agents/skills in open-terminal
-  └── mounted at /home/user/.agents/skills in capforge
-env: CAPFORGE_CAPS_DIR=/home/user/.agents/skills
+  └── mounted at /home/capforge/.agents/skills in capforge
+env: CAPFORGE_CAPS_DIR=/home/capforge/.agents/skills
 env: CAPFORGE_STATE_DIR=/var/lib/capforge   (separate volume)
 ```
+
+[`docker-compose.yml`](../docker-compose.yml) is the runnable version of this topology: it
+builds the local image and bind-mounts `./caps` and `./state` by default. Both host
+directories must be writable by UID 10001.
 
 Paths must agree inside both containers, not just on the host, because the terminal edits the same
 absolute path that capforge reads. The state directory holds tags, venvs and per-version data; back
@@ -381,14 +417,14 @@ it up and do not share it between deployments.
 
 The container image:
 
-- Python 3.12-slim plus git, built with `uv sync --locked --no-dev`;
+- Python 3.14-slim plus git, built with `uv sync --locked --no-dev`;
 - runs as UID 10001, with `/home/capforge/.agents/skills` and `/var/lib/capforge` writable;
 - listens on `:8099/mcp`, default transport `http` (FastMCP streamable HTTP);
 - healthcheck is a TCP connect, because an HTTP probe without MCP headers is not meaningful.
 
 CI/CD (`.github/workflows/deploy.yml`):
 
-1. `uv sync --locked` then `uv run --locked pytest -q` gates the build.
+1. `uv sync --locked`, `ruff check`, `mypy capforge` and `uv run --locked pytest -q` gate the build.
 2. On success, Buildx builds `linux/amd64` and pushes to `ghcr.io/<owner>/capforge` on `main`
    (`latest`), `v*.*.*` tags (semver), and a short-SHA fallback.
 3. A build-provenance attestation is pushed with the image.
@@ -396,7 +432,7 @@ CI/CD (`.github/workflows/deploy.yml`):
 
 Caching layers, all speed-only (correctness still comes from `--locked` and the test gate):
 
-- `setup-uv` caches the uv download cache keyed on `uv.lock`, plus the managed Python 3.12
+- `setup-uv` caches the uv download cache keyed on `uv.lock`, plus the managed Python 3.14
   installation (`cache-python`).
 - `actions/cache` keeps `~/.cache/pip` for the capability venvs, which the test suite builds with
   pip rather than uv.
@@ -412,32 +448,28 @@ Caching layers, all speed-only (correctness still comes from `--locked` and the 
 | Change validation, paths, execution, venvs | `core.py`, tests |
 | Change tags, promotion, pruning, rollback | `versioning.py`, tests |
 | Change dependencies | `pyproject.toml`, run `uv lock`, commit `uv.lock` |
-| Change the image or CI | `Dockerfile`, `.env.example`, `.dockerignore`, `.github/` |
+| Change the image, local deployment or CI | `Dockerfile`, `docker-compose.yml`, `.env.example`, `.dockerignore`, `.github/` |
 | Change server behavior the model sees | README and `AGENTS.md.example` (the runtime guide) |
 
 ## 13. Testing strategy
 
 The suite is end-to-end by design:
 
-- `tests/test_lifecycle.py` creates a temporary caps and state directory, reloads `core`,
-  `versioning` and `server` after setting environment variables, and drives the tools as functions.
-- Tests build real venvs and execute real subprocesses; there is no mocking of the process or venv
-  layer. `pytest -q` currently runs 24 tests in about 70 seconds.
+- `tests/test_units.py` is the fast suite: parsing, package validation, hashes, state coercion,
+  entrypoint containment and the fixed ten-tool surface. `pytest -q -m "not slow"` runs only it.
+- `tests/test_lifecycle.py` (marked `slow`) creates a temporary caps and state directory, reloads
+  `core`, `versioning` and `server` after setting environment variables, and drives the tools as
+  functions.
+- Slow tests build real venvs and execute real subprocesses; there is no mocking of the process or
+  venv layer.
 - Coverage focuses on the invariants: name validation, duplicate tags, failed-test promotion,
-  unchanged drafts, pruning that preserves the active tag, rollback, draft-vs-active isolation,
-  timeouts, environment filtering, per-version data, invalid JSON, and listing a broken capability.
-- `tools/mcp_probe.py` exercises the same lifecycle over real MCP HTTP against a running server.
+  unchanged drafts, pruning that preserves the active tag (and removes data), rollback,
+  draft-vs-active isolation for code, entrypoint and empty packages, process-group timeouts,
+  environment filtering including pip index settings, per-version data, invalid JSON, smoke-test
+  JSON validation, corrupt state quarantine, overwrite archiving, and listing a broken capability.
+- `tools/mcp_probe.py` exercises the same lifecycle over real MCP HTTP against a running server and
+  cleans up after itself.
 
 CI runs the same commands with `uv` and blocks the image build on failure.
 
-## 14. Known limitations and likely next steps
-
-- Add per-capability locking for state read-modify-write and venv creation.
-- Add retention for old venvs and data directories; tags are pruned but their venvs/data are not.
-- Enforce network and filesystem isolation if capabilities become less trusted.
-- Add structured logging/metrics for call latency, failures and promotion events.
-- Add authentication if the server is exposed beyond an internal network.
-- Consider a pluggable state store if multi-replica deployment is ever required; the JSON files
-  assume a single writer and a local filesystem.
-- Fix the stdout contract mismatch (whole-output parsing vs "last line") and the unused `python:`
-  frontmatter field, or remove them.
+Known limitations and next steps are tracked in [`NEXT.md`](NEXT.md).

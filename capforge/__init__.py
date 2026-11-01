@@ -1,3 +1,3 @@
-"""capforge - deterministic, versioned capabilities for Open WebUI + Open Terminal."""
+"""capforge: deterministic, versioned capabilities exposed over MCP."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

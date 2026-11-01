@@ -38,8 +38,8 @@ jobs:
         with:
           # Keep in sync with the uv image tag in the Dockerfile.
           version: "0.12.24"
-          python-version: "3.12"
-          # Cache the uv download cache and the managed Python 3.12 install.
+          python-version: "3.14"
+          # Cache the uv download cache and the managed Python 3.14 install.
           # Keying on uv.lock (not pyproject.toml) avoids invalidation on
           # metadata-only edits; --locked still fails on real drift.
           enable-cache: true
@@ -58,6 +58,12 @@ jobs:
 
       - name: Sync environment from lockfile
         run: uv sync --locked
+
+      - name: Lint
+        run: uv run --locked ruff check .
+
+      - name: Type check
+        run: uv run --locked mypy capforge
 
       - name: Run test suite
         run: uv run --locked pytest -q

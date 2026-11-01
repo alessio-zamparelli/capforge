@@ -4,7 +4,7 @@
 # .github/workflows/deploy.yml and the one used to generate uv.lock.
 FROM ghcr.io/astral-sh/uv:0.12.24 AS uv
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -27,7 +27,7 @@ WORKDIR /app
 # Dependency layer: only invalidated by pyproject.toml or uv.lock changes.
 # `--no-dev` keeps pytest/httpx out of the runtime image. --locked makes a
 # stale lockfile a build failure.
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 

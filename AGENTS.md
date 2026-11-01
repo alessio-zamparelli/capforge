@@ -36,13 +36,16 @@ capforge/
     cli.py          capforge serve | doctor | tools
 docs/
     ARCHITECTURE.md     design, data model, security posture, deployment, change map
+    NEXT.md             known limitations and later work
 tests/
     test_lifecycle.py   end-to-end: scaffold -> test -> promote -> run -> edit -> rollback
+    test_units.py       fast: parsing, validation, hashes, state coercion, tool surface
 tools/
     mcp_probe.py        real MCP-over-HTTP exercise of the server, like Open WebUI
 AGENTS.md.example       template for the capability workspace, not this file
 uv.lock                 resolved dependency graph; CI and Docker build with --locked
-Dockerfile              uv multi-stage image: Python 3.12 + git, uid 10001, TCP healthcheck
+Dockerfile              uv multi-stage image: Python 3.14 + git, uid 10001, TCP healthcheck
+docker-compose.yml      local example: bind-mounted caps/state, uid 10001, :8099
 .env.example            deployment variables; no credential variables by design
 .dockerignore
 .github/workflows/deploy.yml   test gate -> build/push GHCR + provenance attestation
@@ -74,24 +77,33 @@ via `_fail(...)`; never let a `CapError` escape to the MCP layer. Unknown bugs m
 ```
 
 Frontmatter keys that matter: `name`, `description` (the only field in the per-turn manifest),
-`entrypoint` and `packages`. `python` is parsed into `Capability.python` but is **not used**:
-execution always goes through the per-capability venv's interpreter. Either wire it up or drop it
-from the parsed metadata; do not document it to users as working. The parser in
-`core.parse_skill_md` is deliberately tolerant and does not use a YAML library: do not add a
-dependency for it.
+`entrypoint` and `packages`. There is no `python:` field: execution always goes through the
+per-capability venv's interpreter. The parser in `core.parse_skill_md` is deliberately tolerant
+and does not use a YAML library: do not add a dependency for it.
+
+Packages are validated with `PKG_RE` before they reach pip or `SKILL.md`. Specs are plain
+requirements (no spaces, commas, quotes, URLs or leading `-`), max 50 per capability. This is a
+security boundary, not cosmetics: an unvalidated token such as `--target=...` is a pip option.
+
+`entrypoint` is resolved and contained inside the capability folder. A `run_capability` that
+targets an active tag reads the tag's **own** `SKILL.md`, so editing the draft's `entrypoint` or
+`packages` cannot change or break the live version.
 
 Execution rules, enforced in `core.execute`:
 
 - one JSON object on **stdin** (never argv); result as JSON on **stdout**; exit 0 for success;
+- `execute()` parses the whole trimmed stdout first, then falls back to the **last non-empty
+  line**, so diagnostics on stdout are tolerated while pretty-printed JSON still works;
 - diagnostics on stderr, returned to the caller on failure;
-- a filtered environment (`ENV_ALLOWLIST` only: PATH, locale, TZ, TERM, SSL certs, pip index);
+- a filtered environment (`ENV_ALLOWLIST` only: PATH, locale, TZ, TERM, SSL certs). pip index
+  settings are exposed to the installer through `_install_env()`, never to capability code;
 - `CAPFORGE_DATA_DIR` is per capability **and per version**; `CAPFORGE_VERSION` names the tag;
 - `PATH` is prefixed with the capability's venv; the venv's Python runs the entrypoint;
-- a hard timeout (`CAPFORGE_RUN_TIMEOUT`, default 120s).
+- a hard timeout (`CAPFORGE_RUN_TIMEOUT`, default 120s), enforced on the child's **process group**;
+- stdout/stderr capture is bounded (256 KB tail per stream) so a runaway child cannot exhaust RAM.
 
-Note a real inconsistency: `CONTRACT` and the scaffold test talk about "the last line" of stdout,
-but `execute()` parses the **entire trimmed stdout** as one JSON value. Anything else is a failure.
-Prefer the actual behaviour; if you touch it, fix the docs and the scaffold test in the same commit.
+The smoke path in `run_tests` (no `tests/test_*.py`) calls `execute()` itself, so a capability that
+cannot emit valid JSON fails `test_capability` and is refused promotion.
 
 ## State and versioning model
 
@@ -99,12 +111,16 @@ Prefer the actual behaviour; if you touch it, fix the docs and the scaffold test
 - Tags are immutable copies under `<state>/versions/<name>/<tag>/`; an existing tag can never be
   overwritten. Promotion snapshots, records state, then makes the tag active.
 - `run_capability` executes the active tag. It falls back to the draft only when nothing was ever
-  promoted, and adds a `warning`.
+  promoted, and adds a `warning`. A broken draft does not stop an already-promoted tag from running.
 - `rollback_capability` only moves the active pointer; it never edits the draft or copies files.
 - State lives in `<state>/state/<name>.json` (`active` entry + `tags` + `pruned`), written
-  atomically via a temp file and `Path.replace`.
+  atomically via a temp file and `Path.replace`. Corrupt files are renamed to
+  `<name>.corrupt-<ns>.json` and treated as empty rather than silently overwritten.
+- State mutations hold a per-capability `flock` (`<state>/locks/<name>.lock`); venv builds hold a
+  per-requirements lock. Do not nest the same lock.
 - Pruning keeps `CAPFORGE_KEEP_TAGS` (default 5) tags and **never** drops the active one, even when
-  it is the oldest.
+  it is the oldest. A pruned tag also loses its per-version data and its unused venvs; the
+  `pruned` audit list is capped at 100 entries.
 - The caps root is best-effort git-initialised on first promotion; each promotion commits
   `<name>@<tag>`. Git failures are non-fatal and must stay that way.
 
@@ -117,18 +133,22 @@ hash is recomputed **before** `snapshot()`, so the tag carries the frontmatter i
 from. Do not reorder that.
 
 Venvs are keyed by `requirements_hash(sorted(set(packages)))`, one per requirement set under
-`<state>/venvs/<name>/<hash>/`. A new set builds a fresh venv; old ones are left in place for tags
-that pinned them. Test runs use the capability's packages **plus pytest**, so they get a different
-hash than run-time venvs. stdlib-only uses `--without-pip`. Treat venv creation as slow and real:
-tests actually build them.
+`<state>/venvs/<name>/<hash>/`. A new set builds a fresh venv; venvs no surviving tag needs are
+garbage-collected on prune. Test runs use the capability's packages **plus pytest**, so they get a
+different hash than run-time venvs (both hashes are treated as live). stdlib-only uses
+`--without-pip`. Treat venv creation as slow and real: tests actually build them.
 
 ## Setup and commands
 
-Requires Python 3.11+ (`X | None` syntax, `from __future__ import annotations` throughout).
+Requires **Python 3.14** and uv (`.python-version` pins 3.14; `requires-python = ">=3.14"`).
+Do not add a CI version matrix.
 
 ```sh
 uv sync                                # fastmcp + dev tools, exactly from uv.lock
-uv run pytest -q                       # full suite; ~65s because it builds real venvs
+uv run pytest -q -m "not slow"         # fast unit tests, no venvs
+uv run pytest -q                       # full suite; builds real venvs
+uv run ruff check .                    # lint
+uv run mypy capforge                   # type check
 uv run capforge doctor                 # paths, writability, scanned-skill-path warnings, fastmcp
 uv run capforge serve                  # MCP over streamable HTTP on 0.0.0.0:8099/mcp
 uv run capforge serve --transport stdio   # local MCP client
@@ -151,7 +171,7 @@ Environment variables are documented in the README table; when adding one, also 
 `get_contract()` if it is a limit, and cover it in the tests. Current ones: `CAPFORGE_CAPS_DIR`,
 `CAPFORGE_STATE_DIR`, `CAPFORGE_KEEP_TAGS`, `CAPFORGE_RUN_TIMEOUT`, `CAPFORGE_TEST_TIMEOUT`,
 `CAPFORGE_INSTALL_TIMEOUT`, `CAPFORGE_HOST`, `CAPFORGE_PORT`, `CAPFORGE_PATH`,
-`CAPFORGE_TRANSPORT`.
+`CAPFORGE_TRANSPORT`, `CAPFORGE_LOG_LEVEL`.
 
 ## Conventions
 
@@ -161,29 +181,36 @@ Environment variables are documented in the README table; when adding one, also 
 - Double quotes, ~100-column lines, module-level UPPERCASE constants.
 - Raise `CapError` for anything the model should read verbatim; use plain exceptions only for bugs.
 - Validate and contain every path. Names match `NAME_RE` (`^[a-z][a-z0-9_]{0,63}$`), tags match
-  `TAG_RE`, and anything derived from a name/tag/package must pass through `_contained(...)` before
-  touching disk. Never build a path from unsanitised model input.
+  `TAG_RE`, packages match `PKG_RE`, and anything derived from a name/tag/package must pass
+  through `_contained(...)` before touching disk. Never build a path from unsanitised model input.
+- Log runs and promotions at INFO with stable `key=value` fields; use `CAPFORGE_LOG_LEVEL` to
+  change verbosity. Never log capability output bodies or environment values.
 - Keep `__version__` in `capforge/__init__.py` and `[project].version` in `pyproject.toml` equal.
 - Capabilities themselves stay deterministic: sorted output, pinned formats, no invented
   timestamps, no secrets, no assumed network, writes only under `CAPFORGE_DATA_DIR`.
 
 ## Testing
 
-`tests/test_lifecycle.py` is the reference for behaviour. Its `env` fixture creates a temp caps and
-state dir, sets env vars, then `importlib.reload`s `core`, `versioning` and `server`. Follow that
-pattern for new tests: state and module globals must not leak between tests, and env changes need a
-reload only if code captured the value at import time (most accessors read env per call).
+`tests/test_lifecycle.py` is the reference for behaviour and is marked `slow`. Its `env` fixture
+creates a temp caps and state dir, sets env vars, then `importlib.reload`s `core`, `versioning` and
+`server`. Follow that pattern for new tests: state and module globals must not leak between tests,
+and env changes need a reload only if code captured the value at import time (most accessors read
+env per call). `tests/test_units.py` is the fast suite: parsing, validation, hashes, state
+coercion and the ten-tool surface.
 
-Do not mock subprocesses or venvs. The suite deliberately exercises real Python processes, the
+Do not mock subprocesses or venvs. The slow suite deliberately exercises real Python processes, the
 stdin/stdout JSON contract, timeouts, environment filtering and per-version data directories.
 Coverage worth preserving when refactoring: name validation, duplicate tags, promotion refusing
 failed tests, unchanged drafts (`force`), pruning the active tag, rollback, draft-vs-active
-isolation, bad JSON output, timeouts, env filtering, and listing a broken capability without
-failing the whole listing.
+isolation (including `entrypoint` and empty `packages`), bad JSON output, smoke-test JSON
+validation, package-spec rejection, timeout process-group kill, env filtering (including
+`PIP_INDEX_URL`), corrupt state quarantine, overwrite archiving, retention, and listing a broken
+capability without failing the whole listing.
 
 ## Definition of done
 
-- `uv run --locked pytest -q` passes.
+- `uv run --locked pytest -q` passes, and `uv run --locked pytest -q -m "not slow"` is quick.
+- `uv run --locked ruff check .` and `uv run --locked mypy capforge` pass.
 - `uv run --locked capforge tools` still reports exactly ten tools with stable signatures.
 - `uv run --locked capforge doctor` is clean against a real caps dir (it warns when the caps dir is
   not under `~/.agents/skills`, `~/.cptr/skills`, `~/.claude/skills` or `~/.codex/skills`).

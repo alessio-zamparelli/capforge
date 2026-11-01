@@ -21,8 +21,8 @@ The entrypoint is executed as a fresh subprocess, once per call:
     <venv>/bin/python main.py < /dev/stdin
 
 * stdin  : one JSON object with the call arguments. Never argv, never environment variables.
-* stdout : one JSON value on the last line. Anything else on stdout is ignored for parsing
-           but is kept in the log the caller sees, so print diagnostics freely.
+* stdout : one JSON value. It may be the whole output or the last non-empty line; anything
+           before it is kept in the log the caller sees, so print diagnostics freely.
 * stderr : logs. Shown to the caller on failure.
 * exit 0 : success. Any other exit code is a failure and stderr is reported.
 
@@ -38,8 +38,9 @@ Raise only for bugs; an uncaught exception is a failed call.
 3. **Write only under CAPFORGE_DATA_DIR.** It is per-capability and per-version. Everything
    else in the filesystem is read-only in spirit: the hub, other capabilities and the versions
    tree are not yours to modify.
-4. **No secrets.** Environment is filtered down to PATH and locale. There is no place to put
-   an API key in this design, by construction.
+4. **No secrets.** Environment is filtered down to PATH, locale and TLS settings. pip index
+   settings are visible to the installer only, never to your process. There is no place to
+   put an API key in this design, by construction.
 5. **Be fast.** Calls time out (default 120s, CAPFORGE_RUN_TIMEOUT). Long work belongs in a
    subprocess you poll, or in a file you write and read back later.
 6. **Deterministic output.** Same args plus same data directory must give the same result.
@@ -56,15 +57,21 @@ requirement set:
     packages: [pypdf>=5, httpx]
     ---
 
-Or call install_packages(name, packages) to add them now and record them. Installs are
-isolated from the hub and from every other capability. stdlib-only is the happy path.
+Package entries are plain requirement specs: no spaces, commas, quotes, URLs or leading
+`-`. That keeps them safe as pip arguments and unambiguous in the frontmatter. At most 50
+per capability. Call install_packages(name, packages) to add them now and record them;
+promote_capability(name, packages=[...]) replaces the set (including to remove one).
+Installs are isolated from the hub and from every other capability. stdlib-only is the
+happy path.
 
 ## Versioning
 
 The working copy is the draft. `test_capability` runs the draft. `promote_capability` snapshots
 the draft into an immutable tag, records it in a git commit, and makes it the version
-`run_capability` executes. `rollback_capability` points back at an older tag without touching
-the draft. The last N tags are kept (default 5, CAPFORGE_KEEP_TAGS); older ones are deleted.
+`run_capability` executes. The tag carries its own SKILL.md, so later draft edits cannot
+change its entrypoint or dependencies. `rollback_capability` points back at an older tag
+without touching the draft. The last N tags are kept (default 5, CAPFORGE_KEEP_TAGS); older
+ones are deleted together with their per-version data and unused virtualenvs.
 """
 
 SCAFFOLD_MAIN = '''\
@@ -174,4 +181,4 @@ def test_rejects_bad_input() -> None:
     assert "error" in run({{"text": 42}})
 '''
 
-GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
+GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n.venv/\n"

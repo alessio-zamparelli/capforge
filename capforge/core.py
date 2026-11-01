@@ -2,30 +2,50 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+log = logging.getLogger("capforge")
+
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\[\],<>=!~;: -]{0,200}$")
+# A single pip requirement. Deliberately conservative: no whitespace, commas,
+# URLs or leading '-' so a model-authored spec can never be read as a pip flag
+# or break the `packages: [a, b]` frontmatter it is serialized into.
+PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+*!<>=~;\[\]-]{0,199}$")
 
 DEFAULT_RUN_TIMEOUT = 120
 DEFAULT_TEST_TIMEOUT = 300
 DEFAULT_INSTALL_TIMEOUT = 240
 DEFAULT_KEEP_TAGS = 5
+MAX_PACKAGES = 50
+MAX_CAPTURE_BYTES = 256 * 1024
 
 # Environment variables a capability is allowed to inherit. Everything else is dropped,
-# so a capability cannot read provider keys or the hub's own credentials.
-ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL")
+# so a capability cannot read provider keys or the hub's own credentials. pip/install
+# settings are deliberately absent: only the installer needs them.
+ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR")
+PIP_ENV_ALLOWLIST = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL")
+
+# Keep in sync with versioning.SKIP.
+SKIP_PARTS = frozenset(
+    {"__pycache__", ".git", ".pytest_cache", ".venv", "venv", ".mypy_cache", ".ruff_cache"}
+)
 
 
 class CapError(Exception):
@@ -88,9 +108,59 @@ def cap_path(name: str) -> Path:
 
 
 def version_path(name: str, tag: str) -> Path:
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
     if not TAG_RE.match(tag or ""):
         raise CapError(f"Invalid tag {tag!r}.")
     return _contained(state_dir() / "versions", state_dir() / "versions" / name / tag)
+
+
+def validate_packages(packages: list[str] | None) -> list[str]:
+    """Return clean requirement specs or raise a message the model can act on."""
+    cleaned: list[str] = []
+    for raw in packages or []:
+        spec = str(raw).strip()
+        if not spec:
+            continue
+        if not PKG_RE.match(spec):
+            raise CapError(
+                f"Invalid package requirement {raw!r}. Use a plain requirement such as "
+                "'pypdf>=5' or 'httpx': no spaces, commas, URLs, quotes or leading '-'."
+            )
+        cleaned.append(spec)
+    if len(cleaned) > MAX_PACKAGES:
+        raise CapError(f"Too many packages ({len(cleaned)}); the limit is {MAX_PACKAGES}.")
+    return cleaned
+
+
+# ----------------------------------------------------------------------------- locks
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Serialise read-modify-write cycles across processes on a local filesystem."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:  # pragma: no cover - filesystems without flock
+            log.warning("flock unavailable on %s; continuing without a lock", path)
+            yield
+            return
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def cap_lock(name: str) -> Iterator[None]:
+    """One lock per capability, covering state and frontmatter mutations."""
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
+    lock = _contained(state_dir(), state_dir() / "locks" / f"{name}.lock")
+    with _file_lock(lock):
+        yield
 
 
 # ----------------------------------------------------------------------- frontmatter
@@ -139,7 +209,6 @@ class Capability:
     path: Path
     description: str = ""
     entrypoint: str = "main.py"
-    python: str = "python3"
     packages: list[str] = field(default_factory=list)
     body: str = ""
     error: str | None = None
@@ -149,27 +218,51 @@ class Capability:
         return self.error is None and (self.path / self.entrypoint).is_file()
 
 
-def load_capability(name: str) -> Capability:
-    path = cap_path(name)
+def _load_from(name: str, path: Path) -> Capability:
+    path = Path(path).resolve()
     skill = path / "SKILL.md"
-    if not path.is_dir():
-        raise CapError(f"No capability named {name!r} in {caps_dir()}. Use scaffold_capability to create one.")
     cap = Capability(name=name, path=path)
     if not skill.is_file():
         cap.error = "SKILL.md is missing"
         return cap
     meta, body = parse_skill_md(skill.read_text(encoding="utf-8", errors="replace"))
     cap.description = str(meta.get("description") or "").strip()
-    cap.entrypoint = str(meta.get("entrypoint") or "main.py").strip()
-    cap.python = str(meta.get("python") or "python3").strip()
-    pkgs = meta.get("packages") or []
-    cap.packages = [str(p) for p in (pkgs if isinstance(pkgs, list) else [pkgs]) if str(p).strip()]
+    raw_entry = str(meta.get("entrypoint") or "main.py").strip() or "main.py"
     cap.body = body
     if not cap.description:
         cap.error = "SKILL.md frontmatter has no description"
-    elif not (path / cap.entrypoint).is_file():
+        return cap
+    raw_pkgs = meta.get("packages") or []
+    try:
+        cap.packages = validate_packages(
+            [str(p) for p in (raw_pkgs if isinstance(raw_pkgs, list) else [raw_pkgs]) if str(p).strip()]
+        )
+    except CapError as exc:
+        cap.error = str(exc)
+        return cap
+    try:
+        entry = _contained(path, path / raw_entry)
+        cap.entrypoint = entry.relative_to(path).as_posix()
+    except (CapError, ValueError):
+        cap.error = f"entrypoint {raw_entry!r} escapes the capability folder"
+        return cap
+    if not (path / cap.entrypoint).is_file():
         cap.error = f"entrypoint {cap.entrypoint!r} not found"
     return cap
+
+
+def load_capability(name: str) -> Capability:
+    path = cap_path(name)
+    if not path.is_dir():
+        raise CapError(
+            f"No capability named {name!r} in {caps_dir()}. Use scaffold_capability to create one."
+        )
+    return _load_from(name, path)
+
+
+def load_capability_at(name: str, path: Path) -> Capability:
+    """Load metadata from a snapshot, so the active tag describes itself."""
+    return _load_from(name, path)
 
 
 def list_capabilities() -> list[Capability]:
@@ -192,21 +285,52 @@ def list_capabilities() -> list[Capability]:
 # ----------------------------------------------------------------------------- state
 
 
+def _empty_state(name: str) -> dict[str, Any]:
+    return {"name": name, "active": None, "tags": [], "pruned": []}
+
+
 def _state_file(name: str) -> Path:
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
     return _contained(state_dir(), state_dir() / "state" / f"{name}.json")
+
+
+def _quarantine_state(path: Path) -> None:
+    dest = path.with_name(f"{path.stem}.corrupt-{time.time_ns()}{path.suffix}")
+    try:
+        path.replace(dest)
+        log.warning("quarantined corrupt state file %s -> %s", path, dest)
+    except OSError:
+        log.exception("could not quarantine corrupt state file %s", path)
 
 
 def read_state(name: str) -> dict[str, Any]:
     path = _state_file(name)
     if not path.is_file():
-        return {"name": name, "active": None, "tags": []}
+        return _empty_state(name)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"name": name, "active": None, "tags": []}
-    data.setdefault("name", name)
-    data.setdefault("active", None)
-    data.setdefault("tags", [])
+        _quarantine_state(path)
+        return _empty_state(name)
+    if not isinstance(data, dict):
+        _quarantine_state(path)
+        return _empty_state(name)
+    data["name"] = name
+    if data.get("active") is not None and not isinstance(data.get("active"), dict):
+        data["active"] = None
+    raw_tags = data.get("tags")
+    data["tags"] = [
+        tag
+        for tag in (raw_tags if isinstance(raw_tags, list) else [])
+        if isinstance(tag, dict) and TAG_RE.match(str(tag.get("tag") or ""))
+    ]
+    raw_pruned = data.get("pruned")
+    data["pruned"] = [
+        item
+        for item in (raw_pruned if isinstance(raw_pruned, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("tag"), str)
+    ]
     return data
 
 
@@ -224,10 +348,9 @@ def write_state(name: str, data: dict[str, Any]) -> None:
 def tree_hash(root: Path) -> str:
     """Stable content hash of a capability snapshot, ignoring caches and VCS."""
     digest = hashlib.sha256()
-    skip = {"__pycache__", ".git", ".pytest_cache", ".venv", "venv", ".mypy_cache", ".ruff_cache"}
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root)
-        if any(part in skip for part in rel.parts):
+        if any(part in SKIP_PARTS for part in rel.parts):
             continue
         if not path.is_file():
             continue
@@ -243,6 +366,87 @@ def requirements_hash(packages: list[str]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+# ------------------------------------------------------------------------ processes
+
+
+def _drain(stream: Any, sink: list[bytes]) -> None:
+    """Read a pipe to EOF, keeping only the tail so a runaway child cannot exhaust RAM."""
+    total = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        sink.append(chunk)
+        total += len(chunk)
+        while total > MAX_CAPTURE_BYTES and len(sink) > 1:
+            total -= len(sink.pop(0))
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_process(
+    cmd: list[str],
+    *,
+    cwd: Path | None,
+    env: dict[str, str],
+    payload: str | None,
+    timeout: int,
+) -> tuple[int | None, str, str, bool]:
+    """Run one child in its own process group and capture a bounded tail of its output."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        start_new_session=True,
+    )
+    out_sink: list[bytes] = []
+    err_sink: list[bytes] = []
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, out_sink), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err_sink), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    if payload is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    for reader in readers:
+        reader.join(timeout=5)
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    stdout = b"".join(out_sink).decode("utf-8", errors="replace")
+    stderr = b"".join(err_sink).decode("utf-8", errors="replace")
+    return proc.returncode, stdout, stderr, timed_out
+
+
 # --------------------------------------------------------------------------- venvs
 
 
@@ -251,44 +455,9 @@ def _venv_for(name: str, packages: list[str]) -> Path:
     return base / requirements_hash(packages)
 
 
-def ensure_venv(name: str, packages: list[str], log: list[str] | None = None) -> Path:
-    """Return a venv holding exactly `packages`. Reused when the requirement set is unchanged."""
-    venv = _venv_for(name, packages)
-    python = venv / "bin" / "python"
-    if python.is_file():
-        return venv
-    venv.parent.mkdir(parents=True, exist_ok=True)
-    tmp = venv.with_name(venv.name + ".building")
-    shutil.rmtree(tmp, ignore_errors=True)
-    # pip is only needed when there is something to install, so the stdlib-only path skips it.
-    with_pip = bool(packages)
-    proc = subprocess.run(
-        [sys.executable, "-m", "venv", *( [] if with_pip else ["--without-pip"] ), str(tmp)],
-        capture_output=True, text=True, timeout=install_timeout(), env=_base_env(),
-    )
-    if proc.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise CapError(f"Could not create a virtualenv: {proc.stderr.strip()[-800:]}")
-    if with_pip:
-        pip = [
-            str(tmp / "bin" / "python"), "-m", "pip", "install",
-            "--quiet", "--disable-pip-version-check", *packages,
-        ]
-        try:
-            proc = subprocess.run(pip, capture_output=True, text=True, timeout=install_timeout(), env=_base_env())
-        except subprocess.TimeoutExpired:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise CapError(f"Installing {packages} timed out after {install_timeout()}s") from None
-        if log is not None:
-            log.append(f"pip install {' '.join(packages)} -> exit {proc.returncode}")
-        if proc.returncode != 0:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise CapError(f"Installing {packages} failed:\n{proc.stderr.strip()[-2000:]}")
-    tmp.replace(venv)
-    return venv
-
-
-# ------------------------------------------------------------------------ execution
+def _venv_lock(name: str, packages: list[str]) -> Path:
+    digest = requirements_hash(packages)
+    return _contained(state_dir(), state_dir() / "locks" / f"{name}-venv-{digest}.lock")
 
 
 def _base_env() -> dict[str, str]:
@@ -302,10 +471,78 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def data_dir(name: str, tag: str | None) -> Path:
+def _install_env() -> dict[str, str]:
+    """The installer may see pip index settings; capability code never does."""
+    env = _base_env()
+    env.update({k: os.environ[k] for k in PIP_ENV_ALLOWLIST if k in os.environ})
+    return env
+
+
+def ensure_venv(name: str, packages: list[str], notes: list[str] | None = None) -> Path:
+    """Return a venv holding exactly `packages`. Reused when the requirement set is unchanged."""
+    clean = sorted(set(validate_packages(packages)))
+    venv = _venv_for(name, clean)
+    python = venv / "bin" / "python"
+    if python.is_file():
+        return venv
+    with _file_lock(_venv_lock(name, clean)):
+        if python.is_file():
+            return venv
+        venv.parent.mkdir(parents=True, exist_ok=True)
+        tmp = venv.with_name(venv.name + ".building")
+        shutil.rmtree(tmp, ignore_errors=True)
+        # pip is only needed when there is something to install, so the stdlib-only path skips it.
+        with_pip = bool(clean)
+        code, _, stderr, timed_out = _run_process(
+            [sys.executable, "-m", "venv", *([] if with_pip else ["--without-pip"]), str(tmp)],
+            cwd=None,
+            env=_install_env(),
+            payload=None,
+            timeout=install_timeout(),
+        )
+        if timed_out or code != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            reason = "timed out" if timed_out else (stderr.strip()[-800:] or f"exit {code}")
+            raise CapError(f"Could not create a virtualenv: {reason}")
+        if with_pip:
+            code, _, stderr, timed_out = _run_process(
+                [
+                    str(tmp / "bin" / "python"),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    "--disable-pip-version-check",
+                    *clean,
+                ],
+                cwd=None,
+                env=_install_env(),
+                payload=None,
+                timeout=install_timeout(),
+            )
+            if notes is not None:
+                notes.append(f"pip install {' '.join(clean)} -> exit {code}")
+            if timed_out:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise CapError(f"Installing {clean} timed out after {install_timeout()}s")
+            if code != 0:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise CapError(f"Installing {clean} failed:\n{stderr.strip()[-2000:]}")
+        if venv.exists():
+            shutil.rmtree(venv, ignore_errors=True)
+        tmp.replace(venv)
+        log.info("built venv cap=%s requirements=%s path=%s", name, clean, venv)
+    return venv
+
+
+# ------------------------------------------------------------------------ execution
+
+
+def data_dir(name: str, tag: str | None, *, create: bool = True) -> Path:
     safe_tag = re.sub(r"[^A-Za-z0-9._-]", "_", tag or "draft")
     path = _contained(state_dir(), state_dir() / "data" / name / safe_tag)
-    path.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -334,6 +571,23 @@ class ExecResult:
         return out
 
 
+def _parse_output(stdout: str) -> tuple[Any, str | None]:
+    """Parse the whole output first, then the last non-empty line (the documented contract)."""
+    text = stdout.strip()
+    if not text:
+        return None, None
+    try:
+        return json.loads(text), None
+    except ValueError as exc:
+        last = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+        if last and last != text:
+            try:
+                return json.loads(last), None
+            except ValueError:
+                pass
+        return None, str(exc)
+
+
 def execute(
     cap: Capability,
     source: Path,
@@ -344,7 +598,7 @@ def execute(
     timeout: int | None = None,
 ) -> ExecResult:
     """Run one capability entrypoint in a subprocess: JSON in on stdin, JSON out on stdout."""
-    entry = source / cap.entrypoint
+    entry = _contained(source, source / cap.entrypoint)
     if not entry.is_file():
         raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
     venv = ensure_venv(cap.name, packages if packages is not None else cap.packages)
@@ -357,67 +611,109 @@ def execute(
 
     payload = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
     started = time.monotonic()
-    try:
-        proc = subprocess.run(
-            [str(venv / "bin" / "python"), str(entry)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=timeout or run_timeout(),
-            cwd=str(source),
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return ExecResult(
-            ok=False, exit_code=None, stdout="", stderr=f"Timed out after {timeout or run_timeout()}s",
-            duration_ms=int((time.monotonic() - started) * 1000), timed_out=True,
-        )
+    code, stdout, stderr, timed_out = _run_process(
+        [str(venv / "bin" / "python"), str(entry)],
+        cwd=source,
+        env=env,
+        payload=payload,
+        timeout=timeout or run_timeout(),
+    )
     duration = int((time.monotonic() - started) * 1000)
-    parsed: Any = None
-    parse_error = None
-    if proc.returncode == 0:
-        text = proc.stdout.strip()
-        if text:
-            try:
-                parsed = json.loads(text)
-            except ValueError as exc:
-                parse_error = str(exc)
-    ok = proc.returncode == 0 and parse_error is None
-    stderr = proc.stderr
+    if timed_out:
+        log.info(
+            "run cap=%s version=%s ok=false duration_ms=%d timed_out=true",
+            cap.name,
+            tag or "draft",
+            duration,
+        )
+        return ExecResult(
+            ok=False,
+            exit_code=None,
+            stdout=stdout,
+            stderr=f"Timed out after {timeout or run_timeout()}s",
+            duration_ms=duration,
+            timed_out=True,
+        )
+    parsed, parse_error = _parse_output(stdout)
+    ok = code == 0 and parse_error is None
     if parse_error:
         stderr = f"{stderr}\nstdout is not valid JSON: {parse_error}".strip()
+    log.info(
+        "run cap=%s version=%s ok=%s exit=%s duration_ms=%d",
+        cap.name,
+        tag or "draft",
+        ok,
+        code,
+        duration,
+    )
     return ExecResult(
-        ok=ok, exit_code=proc.returncode, stdout=proc.stdout, stderr=stderr,
-        duration_ms=duration, result=parsed,
+        ok=ok,
+        exit_code=code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_ms=duration,
+        result=parsed,
     )
 
 
-def run_tests(cap: Capability, source: Path, packages: list[str] | None = None, timeout: int | None = None) -> ExecResult:
-    """Run the capability's own test suite, or a smoke run when it has none."""
+def run_tests(
+    cap: Capability,
+    source: Path,
+    packages: list[str] | None = None,
+    timeout: int | None = None,
+) -> ExecResult:
+    """Run the capability's own test suite, or a real smoke run when it has none."""
     tests = source / "tests"
-    venv = ensure_venv(cap.name, list(packages if packages is not None else cap.packages) + ["pytest"])
+    if not (tests.is_dir() and any(tests.rglob("test_*.py"))):
+        # Same execution path as a real call: invalid stdout must fail the gate.
+        return execute(
+            cap,
+            source,
+            {},
+            tag=None,
+            packages=packages,
+            timeout=timeout or test_timeout(),
+        )
+    venv = ensure_venv(
+        cap.name, list(packages if packages is not None else cap.packages) + ["pytest"]
+    )
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
+    env["CAPFORGE_VERSION"] = "draft"
     env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, "test"))
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
     started = time.monotonic()
-    if tests.is_dir() and any(tests.rglob("test_*.py")):
-        cmd = [str(venv / "bin" / "python"), "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", str(tests)]
-    else:
-        cmd = [str(venv / "bin" / "python"), str(source / cap.entrypoint)]
-    try:
-        proc = subprocess.run(
-            cmd, input="{}", capture_output=True, text=True,
-            timeout=timeout or test_timeout(), cwd=str(source), env=env,
-        )
-    except subprocess.TimeoutExpired:
+    code, stdout, stderr, timed_out = _run_process(
+        [
+            str(venv / "bin" / "python"),
+            "-m",
+            "pytest",
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+            str(tests),
+        ],
+        cwd=source,
+        env=env,
+        payload=None,
+        timeout=timeout or test_timeout(),
+    )
+    duration = int((time.monotonic() - started) * 1000)
+    if timed_out:
         return ExecResult(
-            ok=False, exit_code=None, stdout="", stderr=f"Tests timed out after {timeout or test_timeout()}s",
-            duration_ms=int((time.monotonic() - started) * 1000), timed_out=True,
+            ok=False,
+            exit_code=None,
+            stdout=stdout,
+            stderr=f"Tests timed out after {timeout or test_timeout()}s",
+            duration_ms=duration,
+            timed_out=True,
         )
     return ExecResult(
-        ok=proc.returncode == 0, exit_code=proc.returncode,
-        stdout=proc.stdout, stderr=proc.stderr,
-        duration_ms=int((time.monotonic() - started) * 1000),
+        ok=code == 0,
+        exit_code=code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_ms=duration,
     )

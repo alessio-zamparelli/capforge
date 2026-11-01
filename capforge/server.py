@@ -2,33 +2,41 @@
 
 from __future__ import annotations
 
-import json
+import logging
 import shutil
+import time
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
-from . import __version__
+from . import __version__, versioning
 from .contract import CONTRACT, GITIGNORE, SCAFFOLD_MAIN, SCAFFOLD_SKILL, SCAFFOLD_TEST
 from .core import (
     CapError,
+    cap_lock,
     cap_path,
     caps_dir,
     data_dir,
+    ensure_venv,
     execute,
     install_timeout,
     keep_tags,
-    list_capabilities as discover,
     load_capability,
+    load_capability_at,
     requirements_hash,
     run_tests,
     run_timeout,
     state_dir,
     test_timeout,
     tree_hash,
-    ensure_venv,
+    validate_packages,
 )
-from . import versioning
+from .core import (
+    list_capabilities as discover,
+)
+
+log = logging.getLogger("capforge")
 
 mcp = FastMCP(
     "capforge",
@@ -48,6 +56,15 @@ def _cap_or_error(name: str):
         return load_capability(name), None
     except CapError as exc:
         return None, _fail(str(exc))
+
+
+def _archive_draft(name: str, path: Path) -> Path:
+    """Keep the previous draft instead of deleting it on scaffold(overwrite=true)."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = state_dir() / "backups" / name / f"{stamp}-{time.time_ns() % 1_000_000:06d}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(path, dest, ignore=versioning.SKIP)
+    return dest
 
 
 # ------------------------------------------------------------------------ discovery
@@ -90,7 +107,9 @@ def list_capabilities() -> dict:
                 "draft_ready": cap.draft_ready,
                 "draft_error": cap.error,
                 "draft_changed": bool(
-                    active.get("content_hash") and cap.draft_ready and active["content_hash"] != tree_hash(cap.path)
+                    active.get("content_hash")
+                    and cap.draft_ready
+                    and active["content_hash"] != tree_hash(cap.path)
                 ),
                 "tags": len(state.get("tags") or []),
                 "packages": cap.packages,
@@ -136,27 +155,47 @@ def scaffold_capability(
     overwrite: bool = False,
 ) -> dict:
     """Create a capability folder with SKILL.md, a working main.py and one passing test.
-    Start here instead of writing files by hand: the skeleton already satisfies the contract."""
+    Start here instead of writing files by hand: the skeleton already satisfies the contract.
+    overwrite=true archives the previous draft under the state directory first."""
     try:
         path = cap_path(name)
     except CapError as exc:
         return _fail(str(exc))
-    if path.exists() and not overwrite:
-        return _fail(f"{name!r} already exists at {path}. Pass overwrite=true to replace it, or edit it in place.")
-    if not description.strip():
+    description = description.strip()
+    if not description:
         return _fail("description is required: it is the only thing the model sees in the manifest.")
-    pkgs = [p for p in (packages or []) if str(p).strip()]
+    if "\n" in description or "\r" in description or "---" in description:
+        return _fail("description must be one line and must not contain '---'.")
+    if len(description) > 500:
+        return _fail("description must be at most 500 characters.")
     try:
-        if path.exists():
-            shutil.rmtree(path)
-        (path / "tests").mkdir(parents=True)
-        (path / "SKILL.md").write_text(
-            SCAFFOLD_SKILL.format(name=name, description=description.strip(), packages=", ".join(pkgs)),
-            encoding="utf-8",
-        )
-        (path / "main.py").write_text(SCAFFOLD_MAIN.format(name=name), encoding="utf-8")
-        (path / "tests" / "test_main.py").write_text(SCAFFOLD_TEST.format(name=name), encoding="utf-8")
-        (path / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
+        pkgs = validate_packages(packages or [])
+    except CapError as exc:
+        return _fail(str(exc))
+
+    backup: Path | None = None
+    try:
+        with cap_lock(name):
+            if path.exists() and not overwrite:
+                return _fail(
+                    f"{name!r} already exists at {path}. Pass overwrite=true to replace it "
+                    "(the old draft is archived first), or edit it in place."
+                )
+            if path.exists():
+                backup = _archive_draft(name, path)
+                shutil.rmtree(path)
+            (path / "tests").mkdir(parents=True)
+            (path / "SKILL.md").write_text(
+                SCAFFOLD_SKILL.format(
+                    name=name, description=description, packages=", ".join(pkgs)
+                ),
+                encoding="utf-8",
+            )
+            (path / "main.py").write_text(SCAFFOLD_MAIN.format(name=name), encoding="utf-8")
+            (path / "tests" / "test_main.py").write_text(
+                SCAFFOLD_TEST.format(name=name), encoding="utf-8"
+            )
+            (path / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     except OSError as exc:
         return _fail(f"Could not write {path}: {exc}")
     return {
@@ -164,6 +203,7 @@ def scaffold_capability(
         "name": name,
         "path": str(path),
         "files": ["SKILL.md", "main.py", "tests/test_main.py"],
+        "backup": str(backup) if backup else None,
         "next": "Edit main.py and SKILL.md, then call test_capability(name) and promote_capability(name).",
     }
 
@@ -171,20 +211,24 @@ def scaffold_capability(
 @mcp.tool
 def install_packages(name: str, packages: list[str]) -> dict:
     """Install Python packages into this capability's own virtualenv and record them in
-    SKILL.md. Isolated from the hub and from every other capability."""
+    SKILL.md. Isolated from the hub and from every other capability. To remove packages,
+    call promote_capability with the exact new `packages` list."""
     cap, err = _cap_or_error(name)
     if err:
         return err
-    wanted = [str(p).strip() for p in (packages or []) if str(p).strip()]
+    try:
+        wanted = validate_packages(packages)
+    except CapError as exc:
+        return _fail(str(exc))
     if not wanted:
         return _fail("packages is empty")
     merged = sorted({*cap.packages, *wanted})
     try:
-        venv = ensure_venv(cap.name, merged)
+        with cap_lock(cap.name):
+            venv = ensure_venv(cap.name, merged)
+            versioning.write_packages(cap.name, merged)
     except CapError as exc:
         return _fail(str(exc))
-    versioning._write_packages(cap.name, merged)
-    reloaded = load_capability(cap.name)
     return {
         "ok": True,
         "name": cap.name,
@@ -202,8 +246,8 @@ def install_packages(name: str, packages: list[str]) -> dict:
 
 @mcp.tool
 def test_capability(name: str, args: dict | None = None) -> dict:
-    """Run the draft's test suite (pytest if tests/test_*.py exists, otherwise a smoke run).
-    Optionally also run the entrypoint once with `args` and return what it produced.
+    """Run the draft's test suite (pytest if tests/test_*.py exists, otherwise a real smoke
+    run through the same JSON contract). Optionally also run the entrypoint once with `args`.
     This is the pre-promotion gate: promote refuses while this fails."""
     cap, err = _cap_or_error(name)
     if err:
@@ -220,6 +264,7 @@ def test_capability(name: str, args: dict | None = None) -> dict:
         "ok": tests.ok,
         "name": cap.name,
         "draft_hash": tree_hash(cap.path)[:12],
+        "tests_ok": tests.ok,
         "tests": {
             "passed": tests.ok,
             "exit_code": tests.exit_code,
@@ -233,8 +278,11 @@ def test_capability(name: str, args: dict | None = None) -> dict:
             run = execute(cap, cap.path, args, tag=None)
         except CapError as exc:
             payload["run"] = {"ok": False, "error": str(exc)}
+            payload["run_ok"] = False
+            payload["ok"] = False
         else:
             payload["run"] = run.as_dict()
+            payload["run_ok"] = run.ok
             payload["ok"] = bool(payload["ok"] and run.ok)
     return payload
 
@@ -245,41 +293,56 @@ def test_capability(name: str, args: dict | None = None) -> dict:
 @mcp.tool
 def run_capability(name: str, args: dict | None = None) -> dict:
     """Execute the ACTIVE tagged version of a capability. Falls back to the draft only when
-    nothing has been promoted yet, and says so in the result."""
-    cap, err = _cap_or_error(name)
-    if err:
-        return err
-    state = versioning.read_state(cap.name)
+    nothing has been promoted yet, and says so in the result. The tag's own SKILL.md defines
+    its entrypoint and packages; later draft edits cannot change what the tag runs."""
+    try:
+        path = cap_path(name)
+    except CapError as exc:
+        return _fail(str(exc))
+    if not path.is_dir():
+        return _fail(
+            f"No capability named {name!r} in {caps_dir()}. Use scaffold_capability to create one."
+        )
+
+    state = versioning.read_state(name)
     active = state.get("active") or {}
     tag = active.get("tag")
 
     if tag:
-        source = versioning.version_path(cap.name, tag)
+        source = versioning.version_path(name, tag)
         if not source.is_dir():
-            return _fail(f"Active tag {tag!r} is recorded but its files are gone. Roll back or promote again.")
-        packages = active.get("packages") or cap.packages
+            return _fail(
+                f"Active tag {tag!r} is recorded but its files are gone. Roll back or promote again."
+            )
+        source_cap = load_capability_at(name, source)
+        if source_cap.error:
+            return _fail(f"Active tag {tag!r} is not runnable: {source_cap.error}")
+        packages = active["packages"] if "packages" in active else source_cap.packages
         mode = "active"
     else:
-        if not cap.draft_ready:
+        source_cap = load_capability(name)
+        if not source_cap.draft_ready:
             return _fail(
-                f"{name!r} has never been promoted and the draft is not runnable ({cap.error}). "
-                "Run test_capability and promote_capability first."
+                f"{name!r} has never been promoted and the draft is not runnable "
+                f"({source_cap.error}). Run test_capability and promote_capability first."
             )
-        source, packages, tag, mode = cap.path, cap.packages, None, "draft"
+        source, packages, tag, mode = source_cap.path, source_cap.packages, None, "draft"
 
     try:
-        result = execute(cap, source, args or {}, tag=tag, packages=packages)
+        result = execute(source_cap, source, args or {}, tag=tag, packages=packages)
     except CapError as exc:
         return _fail(str(exc))
 
     out = result.as_dict()
     out.update(
         {
-            "name": cap.name,
+            "name": name,
             "version": tag or "draft",
             "mode": mode,
-            "content_hash": (active.get("content_hash") or tree_hash(cap.path))[:12],
-            "data_dir": str(data_dir(cap.name, tag)),
+            "entrypoint": source_cap.entrypoint,
+            "packages": packages,
+            "content_hash": (active.get("content_hash") or tree_hash(source))[:12],
+            "data_dir": str(data_dir(name, tag)),
         }
     )
     if mode == "draft":
@@ -300,13 +363,19 @@ def promote_capability(
     force: bool = False,
 ) -> dict:
     """Snapshot the draft into an immutable tag and make it the active version.
-    Runs the tests first and refuses on failure. Old tags beyond the keep limit are pruned.
-    Pass force=true to tag an unchanged draft (a re-release of the same content)."""
+    Runs the tests first and refuses on failure. Old tags beyond the keep limit are pruned,
+    along with their per-version data and unused venvs. Pass force=true to tag an unchanged
+    draft (a re-release of the same content)."""
     cap, err = _cap_or_error(name)
     if err:
         return err
     if not cap.draft_ready:
         return _fail(f"Draft is not runnable: {cap.error}")
+    if packages is not None:
+        try:
+            packages = validate_packages(packages)
+        except CapError as exc:
+            return _fail(str(exc))
 
     if not skip_tests:
         try:
@@ -337,7 +406,8 @@ def promote_capability(
 def rollback_capability(name: str, tag: str) -> dict:
     """Make an older tag active again. Does not touch the working copy."""
     try:
-        result = versioning.rollback(cap_path(name).name, tag)
+        validated = cap_path(name).name
+        result = versioning.rollback(validated, tag)
     except CapError as exc:
         return _fail(str(exc))
     result["ok"] = True

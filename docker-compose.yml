@@ -1,0 +1,55 @@
+# Example capforge deployment.
+#
+#   mkdir -p caps state
+#   sudo chown -R 10001:10001 caps state
+#   docker compose up --build
+#
+# Then add http://<host>:8099/mcp as an MCP (Streamable HTTP) server in
+# Open WebUI.
+#
+# The caps directory is the contract with Open Terminal: mount the same host
+# directory in the terminal container at its skills home. The container path
+# below is capforge's own home, and CAPFORGE_CAPS_DIR must match it. Host paths
+# are CAPFORGE_CAPS_HOST / CAPFORGE_STATE_HOST; Compose also reads .env for the
+# other ${...} defaults.
+
+services:
+  capforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: capforge:local
+    # To deploy the image published to GHCR instead of building, remove the
+    # build block above and use:
+    #   image: ghcr.io/<owner>/capforge:latest
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${CAPFORGE_PORT:-8099}:8099"
+    environment:
+      # Container paths, not host paths. They must match the volumes below.
+      CAPFORGE_CAPS_DIR: /home/capforge/.agents/skills
+      CAPFORGE_STATE_DIR: /var/lib/capforge
+      CAPFORGE_HOST: "0.0.0.0"
+      CAPFORGE_PORT: "8099"
+      CAPFORGE_PATH: /mcp
+      CAPFORGE_TRANSPORT: http
+      CAPFORGE_KEEP_TAGS: "${CAPFORGE_KEEP_TAGS:-5}"
+      CAPFORGE_RUN_TIMEOUT: "${CAPFORGE_RUN_TIMEOUT:-120}"
+      CAPFORGE_TEST_TIMEOUT: "${CAPFORGE_TEST_TIMEOUT:-300}"
+      CAPFORGE_INSTALL_TIMEOUT: "${CAPFORGE_INSTALL_TIMEOUT:-240}"
+      CAPFORGE_LOG_LEVEL: "${CAPFORGE_LOG_LEVEL:-INFO}"
+    volumes:
+      # The draft the model edits. Set CAPFORGE_CAPS_HOST to the host directory
+      # the terminal's skills folder is mounted from.
+      - "${CAPFORGE_CAPS_HOST:-./caps}:/home/capforge/.agents/skills"
+      # Versions, venvs and per-version data. Keep this on its own volume and
+      # back it up; losing it loses every tag.
+      - "${CAPFORGE_STATE_HOST:-./state}:/var/lib/capforge"
+    # Hardening option, once you have confirmed capabilities only write under
+    # CAPFORGE_DATA_DIR:
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
