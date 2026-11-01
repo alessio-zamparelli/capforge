@@ -29,6 +29,9 @@ services:
     ports:
       - "${CAPFORGE_PORT:-8099}:8099"
     environment:
+      # Remap the app user to the host owner of the bind mounts.
+      PUID: "${PUID:-10001}"
+      PGID: "${PGID:-10001}"
       # Container paths, not host paths. They must match the volumes below.
       CAPFORGE_CAPS_DIR: /home/capforge/.agents/skills
       CAPFORGE_STATE_DIR: /var/lib/capforge
@@ -36,6 +39,7 @@ services:
       CAPFORGE_PORT: "8099"
       CAPFORGE_PATH: /mcp
       CAPFORGE_TRANSPORT: http
+      CAPFORGE_GUIDE: "${CAPFORGE_GUIDE:-1}"
       CAPFORGE_KEEP_TAGS: "${CAPFORGE_KEEP_TAGS:-5}"
       CAPFORGE_RUN_TIMEOUT: "${CAPFORGE_RUN_TIMEOUT:-120}"
       CAPFORGE_TEST_TIMEOUT: "${CAPFORGE_TEST_TIMEOUT:-300}"

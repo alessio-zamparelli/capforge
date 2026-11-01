@@ -151,7 +151,9 @@ def promote(
         if dry_run:
             result["content_hash"] = draft_hash
             result["packages"] = packages if packages is not None else cap.packages
-            result["would_prune"] = _would_prune(tags, keep_tags())
+            result["would_prune"] = _would_prune(
+                tags, keep_tags(), active_tag=(active or {}).get("tag")
+            )
             return result
 
         # Record the packages before snapshotting, so the tag carries the frontmatter its venv is built from.
@@ -225,11 +227,17 @@ def write_packages(name: str, packages: list[str]) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _would_prune(tags: list[dict[str, Any]], keep: int) -> list[str]:
+def _would_prune(
+    tags: list[dict[str, Any]], keep: int, active_tag: str | None = None
+) -> list[str]:
     """Tags that would be dropped if one more tag were added. Oldest first, active excluded."""
-    ordered = sorted(tags, key=lambda t: t.get("created_at") or 0)
-    surplus = len(ordered) + 1 - keep
-    return [t["tag"] for t in ordered[: max(0, surplus)]]
+    ordered = [
+        tag
+        for tag in sorted(tags, key=lambda t: t.get("created_at") or 0)
+        if tag.get("tag") != active_tag
+    ]
+    surplus = len(tags) + 1 - keep
+    return [tag["tag"] for tag in ordered[: max(0, surplus)]]
 
 
 def _gc_venvs(name: str, tags: list[dict[str, Any]]) -> None:

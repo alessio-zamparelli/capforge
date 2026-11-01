@@ -81,8 +81,10 @@ def _doctor() -> int:
 
 
 def _serve(args: argparse.Namespace) -> int:
+    from .core import ensure_workspace_skill
     from .server import mcp
 
+    ensure_workspace_skill()
     transport = args.transport or "http"
     if transport not in TRANSPORTS:
         print(f"invalid transport {transport!r}; choose one of {sorted(TRANSPORTS)}", file=sys.stderr)

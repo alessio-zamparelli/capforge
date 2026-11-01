@@ -14,10 +14,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never
 
 # git powers the best-effort audit trail (`git log` per promotion) and
-# `list_tags(diff_against_active=true)`. It is optional at runtime, but the
-# image is expected to deliver those features.
+# `list_tags(diff_against_active=true)`. util-linux provides `setpriv`, which
+# the entrypoint uses to drop privileges after applying PUID/PGID.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git \
+ && apt-get install -y --no-install-recommends git util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /uvx /bin/
@@ -35,16 +35,20 @@ COPY capforge ./capforge
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
-# Run unprivileged. Keep this UID in sync with the volume ownership docs.
-RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin capforge \
+# Default identity. PUID/PGID at runtime remap this user and its group; the
+# entrypoint starts as root only long enough to chown the mounts and drop.
+RUN useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin capforge \
  && mkdir -p /home/capforge/.agents/skills /var/lib/capforge \
  && chown -R capforge:capforge /home/capforge /var/lib/capforge
 
-USER capforge
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # The venv is uv-managed; running the console script directly avoids a second
 # uv process (and signal-forwarding layer) as PID 1.
 ENV PATH="/app/.venv/bin:$PATH" \
+    PUID=10001 \
+    PGID=10001 \
     CAPFORGE_CAPS_DIR=/home/capforge/.agents/skills \
     CAPFORGE_STATE_DIR=/var/lib/capforge \
     CAPFORGE_HOST=0.0.0.0 \
@@ -59,4 +63,5 @@ EXPOSE 8099
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ['CAPFORGE_PORT'])), 3).close()"
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["capforge", "serve"]

@@ -53,33 +53,40 @@ Environment:
 | `CAPFORGE_INSTALL_TIMEOUT` | `240` | seconds per pip install |
 | `CAPFORGE_HOST` / `CAPFORGE_PORT` / `CAPFORGE_PATH` | `0.0.0.0` / `8099` / `/mcp` | transport |
 | `CAPFORGE_LOG_LEVEL` | `INFO` | server log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `CAPFORGE_GUIDE` | `1` | install the generated `_capforge` guide skill on serve; set `0` to disable |
+| `PUID` / `PGID` | `10001` / `10001` | remap the container user to the host owner; the entrypoint chowns the mounts and drops privileges |
 
 ## Deploy with Docker
 
     mkdir -p caps state
-    sudo chown -R 10001:10001 caps state
-    docker compose up --build
+    PUID=$(id -u) PGID=$(id -g) docker compose up --build
 
 `docker-compose.yml` builds the local image, publishes `:8099`, and bind-mounts `./caps`
 (the shared draft) and `./state`. Set `CAPFORGE_CAPS_HOST` to the host directory Open
 Terminal scans (in `.env` or the shell), and `CAPFORGE_STATE_HOST` if state should live
-elsewhere. To use the
-image published to GHCR, remove the `build` block and set
+elsewhere. To use the image published to GHCR, remove the `build` block and set
 `image: ghcr.io/<owner>/capforge:latest`.
+
+The entrypoint starts as root only long enough to remap the app user to `PUID`/`PGID`,
+recursively chown the caps and state mounts, and then drop privileges with `setpriv`. With
+`docker run --user` or rootless Docker the remap is skipped, so pre-chown the mounts:
+
+    sudo chown -R "$(id -u):$(id -g)" caps state
 
 Or without Compose:
 
     docker build -t capforge .
     docker run --rm -p 8099:8099 \
+      -e PUID="$(id -u)" -e PGID="$(id -g)" \
       --env-file .env.example \
       -v "$PWD/caps:/home/capforge/.agents/skills" \
       -v "$PWD/state:/var/lib/capforge" \
       capforge
 
 The image is built with uv (`uv sync --locked --no-dev`), so a stale
-`uv.lock` fails the build instead of silently resolving new versions. It runs as UID 10001,
-listens on `:8099/mcp`, and declares a TCP healthcheck. `.env.example` documents every
-variable. Mounted host folders must be writable by that UID.
+`uv.lock` fails the build instead of silently resolving new versions. It defaults to
+UID/GID 10001, remaps to `PUID`/`PGID` when started as root, listens on `:8099/mcp`, and
+declares a TCP healthcheck. `.env.example` documents every variable.
 
 CI runs the test suite, then builds and pushes the image to GHCR on pushes to `main`
 and on `v*.*.*` tags: `ghcr.io/<owner>/capforge`. The workflow is
@@ -114,6 +121,11 @@ but `CAPFORGE_CAPS_DIR` must point at capforge's mount:
 `CAPFORGE_STATE_DIR` should be its own volume: it holds the tags, the venvs and the data.
 
 ## The ten tools
+
+On startup, `capforge serve` installs a generated guide at `<caps>/_capforge/SKILL.md` so the
+model's per-turn skill manifest explains the MCP loop. The leading `_` reserves the name: it is
+not listed as a capability, and `NAME_RE` rejects it as a capability name. A file without the
+managed marker is never overwritten; set `CAPFORGE_GUIDE=0` to skip the injection.
 
 | tool | purpose |
 |---|---|

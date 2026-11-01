@@ -44,8 +44,9 @@ tools/
     mcp_probe.py        real MCP-over-HTTP exercise of the server, like Open WebUI
 AGENTS.md.example       template for the capability workspace, not this file
 uv.lock                 resolved dependency graph; CI and Docker build with --locked
-Dockerfile              uv multi-stage image: Python 3.14 + git, uid 10001, TCP healthcheck
-docker-compose.yml      local example: bind-mounted caps/state, uid 10001, :8099
+Dockerfile              uv multi-stage image: Python 3.14 + git, PUID/PGID, TCP healthcheck
+docker-entrypoint.sh    remap to PUID/PGID, chown mounts, setpriv drop
+docker-compose.yml      local example: bind-mounted caps/state, PUID/PGID, :8099
 .env.example            deployment variables; no credential variables by design
 .dockerignore
 .github/workflows/deploy.yml   test gate -> build/push GHCR + provenance attestation
@@ -88,6 +89,12 @@ security boundary, not cosmetics: an unvalidated token such as `--target=...` is
 `entrypoint` is resolved and contained inside the capability folder. A `run_capability` that
 targets an active tag reads the tag's **own** `SKILL.md`, so editing the draft's `entrypoint` or
 `packages` cannot change or break the live version.
+
+On `capforge serve`, `core.ensure_workspace_skill()` installs a generated guide at
+`<caps>/_capforge/SKILL.md` so the model's per-turn manifest explains the MCP loop. The leading
+`_` reserves the name: discovery skips it and `NAME_RE` rejects it as a capability. Files without
+the managed marker are treated as user-authored and never overwritten; `CAPFORGE_GUIDE=0`
+disables the injection.
 
 Execution rules, enforced in `core.execute`:
 
@@ -171,7 +178,7 @@ Environment variables are documented in the README table; when adding one, also 
 `get_contract()` if it is a limit, and cover it in the tests. Current ones: `CAPFORGE_CAPS_DIR`,
 `CAPFORGE_STATE_DIR`, `CAPFORGE_KEEP_TAGS`, `CAPFORGE_RUN_TIMEOUT`, `CAPFORGE_TEST_TIMEOUT`,
 `CAPFORGE_INSTALL_TIMEOUT`, `CAPFORGE_HOST`, `CAPFORGE_PORT`, `CAPFORGE_PATH`,
-`CAPFORGE_TRANSPORT`, `CAPFORGE_LOG_LEVEL`.
+`CAPFORGE_TRANSPORT`, `CAPFORGE_LOG_LEVEL`, `CAPFORGE_GUIDE`.
 
 ## Conventions
 

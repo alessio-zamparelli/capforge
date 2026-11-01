@@ -247,8 +247,9 @@ def install_packages(name: str, packages: list[str]) -> dict:
 @mcp.tool
 def test_capability(name: str, args: dict | None = None) -> dict:
     """Run the draft's test suite (pytest if tests/test_*.py exists, otherwise a real smoke
-    run through the same JSON contract). Optionally also run the entrypoint once with `args`.
-    This is the pre-promotion gate: promote refuses while this fails."""
+    run through the same JSON contract). Optionally also run the entrypoint once with `args`
+    and report `run_ok` separately. The test suite is the pre-promotion gate: promote refuses
+    while tests fail."""
     cap, err = _cap_or_error(name)
     if err:
         return err
@@ -341,7 +342,7 @@ def run_capability(name: str, args: dict | None = None) -> dict:
             "mode": mode,
             "entrypoint": source_cap.entrypoint,
             "packages": packages,
-            "content_hash": (active.get("content_hash") or tree_hash(source))[:12],
+            "content_hash": str(active.get("content_hash") or tree_hash(source))[:12],
             "data_dir": str(data_dir(name, tag)),
         }
     )
@@ -432,4 +433,7 @@ def list_tags(name: str, diff_against_active: bool = False) -> dict:
 
 
 if __name__ == "__main__":
+    from .core import ensure_workspace_skill
+
+    ensure_workspace_skill()
     mcp.run()
