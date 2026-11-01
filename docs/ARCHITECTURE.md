@@ -120,6 +120,12 @@ the name matches `^[a-z][a-z0-9_]{0,63}$` and does not start with `.` or `_`. Fo
 The model's per-turn skill manifest is a separate mechanism: Open WebUI reads the folder directly.
 `list_capabilities` is for the MCP caller and includes active-tag and draft-diff information.
 
+On startup, `capforge serve` calls `ensure_workspace_skill()`, which writes a generated guide to
+`<caps>/_capforge/SKILL.md` so the per-turn manifest explains the MCP loop. The leading underscore
+reserves the folder: it is skipped by discovery and is not a valid capability name. The write is
+atomic, is skipped with `CAPFORGE_GUIDE=0`, and leaves a file without the managed marker untouched.
+A read-only caps directory degrades to a warning; capabilities still work.
+
 ### 5.2 Authoring and promotion
 
 ```mermaid
@@ -163,7 +169,8 @@ If a new `packages` list is supplied, it is written into `SKILL.md` **before** t
 tag carries the frontmatter its venv will be built from. Reordering that step changes what a
 promoted version declares. The state entry also records `entrypoint`, and `run_capability` reads
 the tag's own `SKILL.md`, so later draft edits cannot change the live version's entrypoint or
-dependency set. The whole promotion holds `cap_lock(name)`.
+dependency set. The state transition in `versioning.promote` holds `cap_lock(name)`; the
+pre-promotion test run happens before the lock and uses the draft as it is at that moment.
 
 ### 5.3 Execution
 
@@ -252,6 +259,7 @@ directory and the draft.
     "path": "/var/lib/capforge/versions/wordcount/v2",
     "content_hash": "…",
     "created_at": 1760000000,
+    "entrypoint": "main.py",
     "packages": ["six"],
     "requirements_hash": "…",
     "note": "what changed",
@@ -408,8 +416,10 @@ env: CAPFORGE_STATE_DIR=/var/lib/capforge   (separate volume)
 ```
 
 [`docker-compose.yml`](../docker-compose.yml) is the runnable version of this topology: it
-builds the local image and bind-mounts `./caps` and `./state` by default. Both host
-directories must be writable by UID 10001.
+builds the local image and bind-mounts `./caps` and `./state` by default. The entrypoint
+remaps the app user to `PUID`/`PGID` (default 10001) and recursively chowns both mounts, so
+a root-started container needs no host `chown`. Rootless Docker or `--user` skips the remap
+and must pre-chown the mounts.
 
 Paths must agree inside both containers, not just on the host, because the terminal edits the same
 absolute path that capforge reads. The state directory holds tags, venvs and per-version data; back
@@ -417,8 +427,10 @@ it up and do not share it between deployments.
 
 The container image:
 
-- Python 3.14-slim plus git, built with `uv sync --locked --no-dev`;
-- runs as UID 10001, with `/home/capforge/.agents/skills` and `/var/lib/capforge` writable;
+- Python 3.14-slim plus git/util-linux, built with `uv sync --locked --no-dev`;
+- starts as root only for `docker-entrypoint.sh`, which remaps `capforge` to `PUID`/`PGID`,
+  chowns `/home/capforge/.agents/skills` and `/var/lib/capforge`, and drops privileges with
+  `setpriv`; `--user` bypasses the remap;
 - listens on `:8099/mcp`, default transport `http` (FastMCP streamable HTTP);
 - healthcheck is a TCP connect, because an HTTP probe without MCP headers is not meaningful.
 

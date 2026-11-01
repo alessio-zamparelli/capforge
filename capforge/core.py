@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .contract import WORKSPACE_SKILL, WORKSPACE_SKILL_MARKER
+
 log = logging.getLogger("capforge")
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -63,6 +65,42 @@ def caps_dir() -> Path:
 
 def state_dir() -> Path:
     return Path(os.environ.get("CAPFORGE_STATE_DIR") or (Path.home() / ".capforge")).resolve()
+
+
+# Reserved: leading underscore is invalid as a capability name and skipped by discovery.
+WORKSPACE_SKILL_DIR = "_capforge"
+
+
+def guide_enabled() -> bool:
+    raw = os.environ.get("CAPFORGE_GUIDE", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def ensure_workspace_skill() -> Path | None:
+    """Install the generated guide skill into the caps root, unless disabled.
+
+    The folder is reserved (leading underscore), so it never appears in
+    `list_capabilities` and cannot collide with a real capability. A file without the
+    managed marker is treated as user-authored and is never overwritten; deleting the
+    generated file restores it on the next `serve`.
+    """
+    if not guide_enabled():
+        return None
+    path = caps_dir() / WORKSPACE_SKILL_DIR / "SKILL.md"
+    try:
+        if path.is_file():
+            existing = path.read_text(encoding="utf-8", errors="replace")
+            if WORKSPACE_SKILL_MARKER not in existing or existing == WORKSPACE_SKILL:
+                return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(WORKSPACE_SKILL, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        log.warning("could not install the workspace guide at %s", path, exc_info=True)
+        return None
+    log.info("installed workspace guide at %s", path)
+    return path
 
 
 def keep_tags() -> int:
@@ -317,7 +355,8 @@ def read_state(name: str) -> dict[str, Any]:
         _quarantine_state(path)
         return _empty_state(name)
     data["name"] = name
-    if data.get("active") is not None and not isinstance(data.get("active"), dict):
+    active = data.get("active")
+    if not isinstance(active, dict) or not TAG_RE.match(str(active.get("tag") or "")):
         data["active"] = None
     raw_tags = data.get("tags")
     data["tags"] = [
@@ -382,6 +421,15 @@ def _drain(stream: Any, sink: list[bytes]) -> None:
             total -= len(sink.pop(0))
 
 
+def _write_stdin(stream: Any, data: bytes) -> None:
+    """Write stdin from a thread so a large payload cannot deadlock against stdout."""
+    try:
+        stream.write(data)
+        stream.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -418,12 +466,12 @@ def _run_process(
     ]
     for reader in readers:
         reader.start()
+    writer: threading.Thread | None = None
     if payload is not None and proc.stdin is not None:
-        try:
-            proc.stdin.write(payload.encode("utf-8"))
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
+        writer = threading.Thread(
+            target=_write_stdin, args=(proc.stdin, payload.encode("utf-8")), daemon=True
+        )
+        writer.start()
     timed_out = False
     try:
         proc.wait(timeout=timeout)
@@ -434,6 +482,8 @@ def _run_process(
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+    if writer is not None:
+        writer.join(timeout=5)
     for reader in readers:
         reader.join(timeout=5)
     for stream in (proc.stdout, proc.stderr):
@@ -596,6 +646,7 @@ def execute(
     tag: str | None,
     packages: list[str] | None = None,
     timeout: int | None = None,
+    data_tag: str | None = None,
 ) -> ExecResult:
     """Run one capability entrypoint in a subprocess: JSON in on stdin, JSON out on stdout."""
     entry = _contained(source, source / cap.entrypoint)
@@ -605,7 +656,7 @@ def execute(
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
     env["CAPFORGE_VERSION"] = tag or "draft"
-    env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, tag))
+    env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, data_tag if data_tag is not None else tag))
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
 
@@ -673,6 +724,7 @@ def run_tests(
             tag=None,
             packages=packages,
             timeout=timeout or test_timeout(),
+            data_tag="test",
         )
     venv = ensure_venv(
         cap.name, list(packages if packages is not None else cap.packages) + ["pytest"]
