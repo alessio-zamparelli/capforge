@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+.env
+.env.*
+!.env.example
+tests
+tools
+AGENTS.md
+AGENTS.md.example

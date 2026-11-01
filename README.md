@@ -25,13 +25,16 @@ Three constraints from Open WebUI 0.12.x drove the design, all verified in its s
 
 ## Install
 
-    pip install -e '.[mcp]'
+    uv sync    # installs from uv.lock (fastmcp + pytest/httpx dev tools)
+
+`uv sync` installs the runtime dependency (fastmcp) and the default `dev` group. Without uv,
+`pip install -e . pytest httpx` still works, but the lockfile is the source of truth.
 
 ## Run
 
-    capforge doctor                  # checks paths, permissions, fastmcp
-    capforge serve                   # MCP over streamable HTTP on :8099/mcp
-    capforge serve --transport stdio # for a local MCP client
+    uv run capforge doctor                  # paths, permissions, fastmcp
+    uv run capforge serve                   # MCP over streamable HTTP on :8099/mcp
+    uv run capforge serve --transport stdio # for a local MCP client
 
 Environment:
 
@@ -44,6 +47,27 @@ Environment:
 | `CAPFORGE_TEST_TIMEOUT` | `300` | seconds per test run |
 | `CAPFORGE_INSTALL_TIMEOUT` | `240` | seconds per pip install |
 | `CAPFORGE_HOST` / `CAPFORGE_PORT` / `CAPFORGE_PATH` | `0.0.0.0` / `8099` / `/mcp` | transport |
+
+## Deploy with Docker
+
+    docker build -t capforge .
+    docker run --rm -p 8099:8099 \
+      --env-file .env.example \
+      -v capforge-caps:/home/capforge/.agents/skills \
+      -v capforge-state:/var/lib/capforge \
+      capforge
+
+The image is built with uv (`uv sync --locked --no-dev`), so a stale
+`uv.lock` fails the build instead of silently resolving new versions. It runs as UID 10001,
+listens on `:8099/mcp`, and declares a TCP healthcheck.
+`.env.example` documents every variable. Mounted host folders must be writable by that
+UID. Keep the state directory on its own volume, and mount the caps directory at the
+same host path the Open Terminal container scans (see the compose example below).
+
+CI runs the test suite, then builds and pushes the image to GHCR on pushes to `main`
+and on `v*.*.*` tags: `ghcr.io/<owner>/capforge`. The workflow is
+`.github/workflows/deploy.yml`; Dependabot updates Actions, pip dependencies and the
+base image weekly via `.github/dependabot.yml`.
 
 ## Wire it into Open WebUI
 
@@ -117,6 +141,7 @@ back.
 
 ## Tests
 
-    pip install -e '.[mcp]' pytest
-    pytest -q                     # 24 tests, ~65s (they build real venvs)
-    capforge serve & CAPFORGE_URL=http://127.0.0.1:8099/mcp python tools/mcp_probe.py
+    uv sync
+    uv run pytest -q   # 24 tests, ~65s (they build real venvs)
+    uv run capforge serve &
+    CAPFORGE_URL=http://127.0.0.1:8099/mcp uv run python tools/mcp_probe.py

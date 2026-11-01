@@ -7,10 +7,15 @@ name = "capforge"
 version = "0.1.0"
 description = "Deterministic, versioned capabilities exposed over MCP for Open WebUI + Open Terminal"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["fastmcp>=4.0.0"]
 
-[project.optional-dependencies]
-mcp = ["fastmcp>=4.0.0"]
+[dependency-groups]
+# `uv sync` installs this group by default; CI and local development rely on it.
+# The Docker image explicitly passes --no-dev.
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.0",
+]
 
 [project.scripts]
 capforge = "capforge.cli:main"

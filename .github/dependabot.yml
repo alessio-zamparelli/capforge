@@ -1,0 +1,38 @@
+# Dependabot: keep GitHub Actions, Python dependencies and the base image
+# current. See https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # `@vN` action refs (immutable commit-SHA pinning is a separate hardening
+    # step) — Dependabot opens PRs for new majors/minors automatically.
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    # Tracks pyproject.toml and uv.lock. The only runtime dependency is
+    # fastmcp; pytest/httpx are in the dev group.
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "python"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    # Keeps the python:3.12-slim base image current.
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "docker"
+    cooldown:
+      default-days: 7
