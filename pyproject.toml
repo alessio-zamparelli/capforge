@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "capforge"
+version = "0.1.0"
+description = "Deterministic, versioned capabilities exposed over MCP for Open WebUI + Open Terminal"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["fastmcp>=4.0.0"]
+
+[project.scripts]
+capforge = "capforge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["capforge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,45 @@
+# AGENTS.md — capability workspace
+
+This folder holds capabilities: small programs exposed to the model as tools through the
+`capforge` MCP server. The same folder is readable here, so you can write, run and repair a
+capability yourself.
+
+## The loop
+
+1. `get_contract()` once, if you have not seen it.
+2. `scaffold_capability(name, description)` — never start from an empty file.
+3. Edit `<caps>/<name>/SKILL.md` and `main.py` with the file tools.
+4. `test_capability(name, args={...})` — this runs `tests/` with pytest, then one real run.
+5. `promote_capability(name, tag="v2", note="what changed")` — tests must pass; it snapshots
+   the folder, commits it, and makes that tag the version `run_capability` executes.
+6. `run_capability(name, args)` — always the promoted tag, never the half-edited draft.
+7. `rollback_capability(name, tag)` if the new version misbehaves.
+
+You can also run a capability directly from the shell while iterating:
+
+    cd ~/.agents/skills/<name>
+    echo '{"text": "hello"}' | python3 main.py
+
+## The contract, in one paragraph
+
+The entrypoint reads **one JSON object on stdin** and writes **one JSON value on stdout**,
+exit 0. Arguments never arrive as argv. Diagnostics go to stderr. Return
+`{"error": "..."}` for a handled failure with a message meant for the model. Validate every
+argument: it came from a language model, and a specific complaint ("start_date must be
+YYYY-MM-DD") is worth more than a traceback.
+
+## Rules
+
+* Write only under `$CAPFORGE_DATA_DIR`. It is per capability and per version.
+* Assume no network. If you need a package, list it in `packages:` in SKILL.md or call
+  `install_packages`; each capability gets its own venv.
+* No secrets: the environment is filtered and there is nowhere to put a key.
+* Be fast. Calls time out at 120s by default.
+* Same args plus same data directory must give the same result. Sort, pin formats, do not
+  invent timestamps.
+
+## Versioning
+
+The folder is always the draft. Tags are immutable copies kept outside it, N per capability
+(default 5), the active one never pruned. `list_tags(name, diff_against_active=true)` shows
+how the draft differs from what is live.
