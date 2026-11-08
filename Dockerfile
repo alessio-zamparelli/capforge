@@ -2,7 +2,7 @@
 
 # Keep this tag in sync with the uv version pinned in
 # .github/workflows/deploy.yml and the one used to generate uv.lock.
-FROM ghcr.io/astral-sh/uv:0.13.6 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.7 AS uv
 
 FROM python:3.14-slim
 
