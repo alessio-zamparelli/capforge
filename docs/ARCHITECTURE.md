@@ -1,6 +1,6 @@
 # Architecture
 
-Status: describes `capforge` 0.2.0 as implemented. If code and this document disagree, the code
+Status: describes `capforge` 0.3.0 as implemented. If code and this document disagree, the code
 wins; update this file in the same change. Requires Python 3.14 (pinned by `.python-version`).
 
 Related documents:
@@ -24,14 +24,19 @@ its own tools** without changing the MCP tool list. A capability is an ordinary 
 
 The model edits that folder through Open Terminal, runs it as a draft, promotes a tested snapshot
 to an immutable tag, and from then on `run_capability(name, args)` executes the tagged version.
-The working copy is never the thing that runs after promotion.
+The working copy is never the thing that runs after promotion. A capability whose frontmatter
+declares `kind: web` is a different animal: it is a long-lived ASGI service (FastAPI or any uvicorn
+app) that `serve_capability` boots from the active tag and reverse-proxies at
+`http://<host>:8080/<name>/<path>`, with a token-gated web console for start/stop/restart.
 
 The design is intentionally small:
 
-- one fixed MCP surface (ten tools), no tool-per-capability;
-- one process per capability call, with a JSON stdin/stdout contract;
+- one fixed MCP surface (eleven tools), no tool-per-capability;
+- one process per capability call, with a JSON stdin/stdout contract (CLI kind), or one resident
+  uvicorn child per served `kind: web` capability;
 - one draft per capability, immutable versions outside it, state in JSON files;
 - a separate virtualenv per requirement set;
+- a reverse proxy + console on a dedicated `:8080` listener;
 - git as a best-effort audit log.
 
 ## 2. Constraints that shape the design
@@ -42,7 +47,7 @@ details, and changing them invalidates most of the architecture.
 | Constraint | Consequence |
 |---|---|
 | `tools/list` is resolved every message, but the tool list for a turn is fixed once the turn starts. | A newly created capability cannot appear as its own tool in the turn that created it. A dispatcher (`run_capability`) resolves the target at execution time, closing the loop within one turn. |
-| Tools reach the model as `<server_id>_<tool_name>` and a changing set/description invalidates the provider prompt cache. | The MCP surface is fixed at ten stable tools. Capabilities live behind the surface. Adding or renaming a tool is a cache-invalidating breaking change. |
+| Tools reach the model as `<server_id>_<tool_name>` and a changing set/description invalidates the provider prompt cache. | The MCP surface is fixed at eleven stable tools. Capabilities live behind the surface. Adding or renaming a tool is a cache-invalidating breaking change. |
 | Open WebUI re-reads terminal skills from `.agents/skills` (also `.cptr`, `.claude`, `.codex`) and `AGENTS.md` every turn. | `CAPFORGE_CAPS_DIR` points at that same folder, so capabilities appear in the per-turn manifest for free and the model edits exactly what the server executes. |
 | Capability code is authored by a model. | Input validation, a promotion test gate, a filtered environment, per-capability venvs, timeouts, and deterministic-output rules are mandatory. |
 | There is no safe place for provider credentials in capability code. | The execution environment is allowlisted down to PATH/locale/SSL/pip-index settings; secrets are absent by construction, not merely discouraged. |
@@ -61,6 +66,10 @@ flowchart LR
     CF -->|spawn| Proc[capability subprocess]
     Proc -->|JSON stdin/stdout| CF
     Proc -->|read/write| Data[(per-version data)]
+    User[Browser] -->|token login, start/stop| Con[console + control API]
+    Caller[Any HTTP client] -->|/name/path| Proxy[reverse proxy]
+    Con -->|/api/*| CF
+    Proxy -->|127.0.0.1:child| WebCap[served kind: web child]
 ```
 
 The caps directory is the only place where the terminal and capforge must agree. It is mounted at
@@ -73,27 +82,39 @@ the terminal's skills home in both containers (see [Deployment](#11-deployment-t
 capforge/
     __init__.py     __version__
     core.py         paths, validation, locks, SKILL.md parsing, state JSON, hashing,
-                    venv construction, process-group execution, test running, logging
+                    venv construction, process-group execution, test running, web-kind
+                    parsing, boot probe, stray-child sweep, logging
     versioning.py   snapshot, promote, prune (+ data/venv GC), rollback, list_tags, diff, git audit
     contract.py     CONTRACT text and scaffold templates (strings only)
-    server.py       FastMCP instance and the ten @mcp.tool functions
-    cli.py          capforge serve | doctor | tools
+    web.py          serve engine (registry, uvicorn children, proxy) + console API
+    server.py       FastMCP instance and the eleven @mcp.tool functions
+    cli.py          capforge serve (two listeners) | doctor | tools
 ```
 
 ```mermaid
 flowchart TB
     CLI[cli.py] --> SRV[server.py]
     CLI --> CORE[core.py]
+    CLI --> WEB[web.py]
     SRV --> CORE
     SRV --> VER[versioning.py]
+    SRV --> WEB
     SRV --> CON[contract.py]
     VER --> CORE
+    WEB --> CORE
+    WEB --> VER
+    WEB --> HTTPX[httpx + starlette]
     CORE --> STDLIB[Python standard library]
 ```
 
 Dependency rules:
 
 - `core.py`, `versioning.py` and `contract.py` are **stdlib-only**. `core` has no knowledge of MCP.
+- `web.py` is the only module that imports `starlette` and `httpx`. It contains the serve engine
+  (registry, spawned uvicorn children, reverse proxy) and the console/control API.
+- `versioning.py` imports `web` **lazily**, only inside prune (to stop an instance pinned to a
+  pruned tag) and venv GC (to keep a served instance's requirement set alive); a broken or absent
+  `web` must never break versioning.
 - `server.py` is the only module that imports `fastmcp`. It is a thin adapter: argument handling,
   error normalization, response shaping.
 - `versioning.py` depends on `core` (paths, hashes, state), never the reverse.
@@ -161,7 +182,9 @@ Promotion is the only transition from draft to runnable version. It is guarded b
 
 1. `draft_ready`: `SKILL.md` exists, has a `description`, and a contained entrypoint exists.
 2. Package specs pass `PKG_RE` and the 50-package limit.
-3. Tests pass (unless `skip_tests=true`), using the supplied package set if one is given.
+3. Tests pass (unless `skip_tests=true`), using the supplied package set if one is given. For
+   `kind: web`, the gate also boots the app with uvicorn on a throwaway port and probes it over
+   HTTP (`probe_web_boot`); the child and its process group are killed before returning.
 4. The tag does not already exist. Tags are never overwritten.
 5. The draft differs from the active content hash, unless `force=true`.
 
@@ -198,8 +221,13 @@ Execution steps:
 4. Start `<venv>/bin/python <entrypoint>` in a **new session/process group**, `cwd` set to the
    source directory, one JSON object on stdin, and a hard timeout. Output is drained by reader
    threads that keep only the last 256 KB per stream.
-5. On timeout, `SIGKILL` the whole process group (no orphaned children). On success, parse stdout
-   as JSON and return exit code, stdout/stderr tails, duration, and result.
+5. **Nothing survives a call.** On timeout *and* on normal exit, the whole process group is
+   `SIGKILL`ed (`killpg` runs in the post-`wait` `finally`, unconditionally). A descendant that
+   escaped the group with a second `setsid` re-parents to the nearest subreaper — the server sets
+   `PR_SET_CHILD_SUBREAPER` at startup — and `sweep_stray_children()` kills it right after the
+   call. Served web instances register themselves as owned and are exempt.
+6. On success, parse stdout as JSON and return exit code, stdout/stderr tails, duration, and
+   result.
 
 The capability never receives argv. Diagnostics belong on stderr. A non-zero exit, a timeout, or
 unparseable stdout is a failed call. A parsed `{"error": "..."}` is a **handled** failure: it is
@@ -218,6 +246,65 @@ Implementation details worth knowing:
 - `test_capability` reports `tests_ok` and (when `args` is given) `run_ok` separately; `ok` is the
   conjunction.
 
+`run_capability` refuses `kind: web` capabilities: they have no JSON entrypoint and no one-shot
+semantics; the model is pointed at `serve_capability`.
+
+### 5.5 Serving web capabilities
+
+`serve_capability(name, action)` dispatches to `web.start/stop/restart/status`. The rules:
+
+- **Drafts are never served.** Start requires an active tag whose recorded packages and
+  frontmatter are used verbatim; the child runs the tag's own snapshot.
+- **One instance per capability**, pinned to the tag it was started against. `restart` is the
+  "pick up the new promotion" move; a promotion alone does not touch a running instance
+  (`status` reports `stale: true` meanwhile).
+- **Registry.** `<state>/served/registry.json` records, per capability: tag, entrypoint, app
+  object, packages, endpoints, desired state (`start`/`stop`) and last pid/port. Writes are
+  atomic, under the per-capability lock plus a registry lock. Corrupt entries are quarantined
+  like state JSON; entries failing name/tag/desired validation are dropped.
+- **Spawn.** A free port is chosen, the child is `<venv>/bin/python -m uvicorn <module>:<app>
+  --host 127.0.0.1 --port <port> --app-dir <dir>`, in its own process group, env built by the
+  same allowlist as execute() plus `CAPFORGE_SERVE_PORT`, `CAPFORGE_PUBLIC_URL`, and
+  `CAPFORGE_SERVE=1`. Boot is confirmed by parsing the child log's "running on
+  http://127.0.0.1:<port>" line and probing it; the budget is `CAPFORGE_SERVE_BOOT_TIMEOUT`
+  (default 60s). Failures return the child's log tail.
+- **Endpoints.** On a successful boot, `/openapi.json` is fetched (bounded to 256 KB) and
+  reduced to method/path/summary triples for the console. Non-FastAPI apps simply have none.
+- **Logs.** The child's stdout+stderr append to `<state>/served/<name>/<tag>/server.log`,
+  rotated at 5 MB (one generation kept at boot, tail-truncated in place by `status`).
+- **Restore.** At server startup, `web.restore()` re-spawns entries whose desired state is
+  `start` and whose version directory still exists. Failures are logged and the entry is marked
+  `stop`; nothing blocks the listeners.
+- **Prune integration.** Pruning a tag first stops the instance pinned to it. `web.stop_pinned`
+  deliberately does **not** reacquire `cap_lock(name)`: prune already holds it, and a nested
+  flock on a second fd deadlocks. Venv GC consults `web.running_requirements_hashes` so the
+  venv a live child is executing is never removed.
+
+### 5.6 The web listener and console
+
+`capforge serve` (HTTP transport) runs **two uvicorn servers in one process**: FastMCP on
+`:8099/mcp` and `web.asgi_app()` on `:8080`. Both have uvicorn's signal capture disabled; a
+single anyio signal handler sets `should_exit` on both, kills served children
+(`web.shutdown()`), and exits. `--transport stdio` skips the web listener entirely.
+
+The `:8080` app, in route order:
+
+1. `/api/login` (POST token, constant-time compare, HTTP-only `SameSite=Strict` cookie session,
+   5-failure/10-minute per-IP backoff), `/api/session`, `/api/caps`, `/api/caps/<name>/<action>`
+   (start/stop/restart; requires session **and** an `X-CSRF: 1` header, runs the action in a
+   worker thread under `cap_lock`).
+2. `/assets` (static bundle) when the built UI exists (`CAPFORGE_UI_DIR`, `CAPFORGE_WEB_UI=1`).
+3. `/{name}` → 307 to `/{name}/`, and `/{name}/{path}` → the reverse proxy: streams to the
+   child on loopback with `X-Capforge-Capability`/`-Version` headers added, hop-by-hop headers
+   stripped, bodies capped at 32 MB, 404 for unserved names, 502 when the child is dead.
+4. The console bundle at the root, or — when disabled — a compact JSON index of served
+   capabilities.
+
+`CAPFORGE_WEB_TOKEN` gates everything under `/api/*` except `/api/session`. Unset means the
+console and control API are **disabled** (403) while the proxy keeps working; the token value
+is never echoed, logged or included in any schema. `CAPFORGE_WEB_PORT=0` disables the entire
+listener (no proxy either), and `serve_capability` then refuses to start instances.
+
 ### 5.4 Rollback and diff
 
 `rollback_capability` updates only `state.active` to an existing tag after confirming the tag's
@@ -234,6 +321,8 @@ directory and the draft.
 <CAPFORGE_STATE_DIR>/venvs/<name>/<hash>/       one venv per requirement set
 <CAPFORGE_STATE_DIR>/data/<name>/<tag>/         writable per-version data
 <CAPFORGE_STATE_DIR>/state/<name>.json          active tag + tag index + prune log
+<CAPFORGE_STATE_DIR>/served/registry.json       serve registry (desired state, endpoints)
+<CAPFORGE_STATE_DIR>/served/<name>/<tag>/server.log  uvicorn child log, rotated
 <CAPFORGE_STATE_DIR>/backups/<name>/<stamp>/    drafts archived by scaffold(overwrite)
 <CAPFORGE_STATE_DIR>/locks/<name>.lock          per-capability mutation lock
 ```
@@ -247,6 +336,8 @@ directory and the draft.
 | state JSON | capforge | read/write | The source of truth for the active pointer. |
 | backups | capforge | write once | Previous drafts, never read automatically. |
 | locks | capforge | coordination | `flock` files; empty and safe to delete while idle. |
+| served registry | capforge | read/write | Desired state per served capability; quarantined when corrupt. |
+| served logs | capforge | append | uvicorn child output, rotated at 5 MB. |
 | caps git repo | capforge | best effort | Initialized on first promotion; one commit per promotion. |
 
 ### 6.1 State JSON
@@ -327,7 +418,11 @@ Multi-replica deployments would need a shared lock/state backend, not these loca
   pip option.
 - A per-version data directory in `CAPFORGE_DATA_DIR`.
 - A hard timeout per run and per test/install, enforced on the process group.
+- **Nothing survives a call**: the process group is killed after `wait()` regardless of exit
+  status, and adopted (`PR_SET_CHILD_SUBREAPER`) strays are swept immediately after.
 - Bounded stdout/stderr capture (256 KB tail per stream).
+- Served web children additionally get `CAPFORGE_SERVE_PORT`, `CAPFORGE_PUBLIC_URL` and
+  `CAPFORGE_SERVE=1`; they bind `127.0.0.1` only, so the only public entry point is the proxy.
 - Name and tag validation plus path containment for every server-side path derived from caller
   input.
 
@@ -341,12 +436,16 @@ This is important when deciding what to host:
   boundary.
 - **No network isolation.** "Assume no network" is a policy; egress is not blocked. A capability
   that makes HTTP calls will succeed if the host allows it.
-- **No memory/CPU limits** beyond the wall-clock timeout. No process tree limits or cgroup.
+- **No memory/CPU limits** beyond the wall-clock timeout. No process tree limits or cgroup. The
+  timeout does not apply to served web instances, which are resident by design.
 - **No authentication** on the MCP endpoint. Put it on an internal network or terminate auth at a
-  proxy.
+  proxy. The web listener has exactly one gate — `CAPFORGE_WEB_TOKEN` for the console/control
+  API — and the reverse proxy itself is unauthenticated by design: it fronts capability apps,
+  and a capability that needs auth should implement it.
 - **No secret injection**, which is a control, not a restriction: there is no place to put a key by
   design. The allowlist also drops `*_KEY`, `*_TOKEN` and `*_SECRET` variables, and pip index
-  settings are visible only to the installer.
+  settings are visible only to the installer. The console token never enters capability
+  environments or API responses.
 
 Deployment posture: treat capability authors as semi-trusted. If capabilities come from an
 untrusted population, run them in a separate container/user with read-only mounts for everything
@@ -363,6 +462,7 @@ except the data directory, add egress policy, and enforce resource limits outsid
 | `install_packages` | write | venv + `SKILL.md` |
 | `test_capability` | execute | draft tests, draft smoke run, test venv/data |
 | `run_capability` | execute | active version (or first-run draft) |
+| `serve_capability` | execute | serve registry, spawned uvicorn child of the active tag |
 | `promote_capability` | write | tests, versions, state, git |
 | `rollback_capability` | write | state pointer |
 | `list_tags` | read | state + optional git diff |
@@ -378,8 +478,10 @@ Response conventions:
 - Runs, promotions and rollbacks are logged at INFO with stable `key=value` fields; verbosity is
   controlled by `CAPFORGE_LOG_LEVEL`. There are no metrics or traces.
 
-The fixed surface is a feature. Adding an eleventh tool changes the cached prompt prefix for every
-conversation. If a new operation is needed, prefer a mode of an existing tool or a capability.
+The fixed surface is a feature. `serve_capability` was added in 0.3.0 as a deliberate one-time
+cache break (a dispatcher over actions, not one tool per operation); it was the first addition
+after 0.1.0. Adding another tool changes the cached prompt prefix for every conversation again.
+If a new operation is needed, prefer a mode of an existing tool or a capability.
 
 ## 10. Failure modes
 
@@ -400,7 +502,12 @@ conversation. If a new operation is needed, prefer a mode of an existing tool or
 | Non-zero exit | `ok: false`, stderr reported |
 | stdout is not JSON | `ok: false`, parse error appended to stderr |
 | Empty stdout, exit 0 | `ok: true`, `result: null` (quirk) |
+| Capability forks a daemon | daemon killed: in-group by the post-`wait` `killpg`, detached by the subreaper sweep |
+| Web boot fails / exceeds budget | promotion gate refuses; `serve_capability(start)` returns the child log tail |
+| Served child dies | proxy returns 502; `status` reports `failed` and clears the in-memory instance |
 | Corrupt state JSON | quarantined as `.corrupt-<ns>.json`, treated as no active tag |
+| Corrupt serve registry | quarantined the same way; serving continues from memory |
+| Console without token | 403 on `/api/*`; proxy unaffected |
 | Broken sibling capability | skipped per capability; listing still succeeds |
 
 ## 11. Deployment topology
@@ -427,16 +534,21 @@ it up and do not share it between deployments.
 
 The container image:
 
-- Python 3.14-slim plus git/util-linux, built with `uv sync --locked --no-dev`;
+- Python 3.14-slim plus git/util-linux, built with `uv sync --locked --no-dev`; the console
+  bundle is built in a separate `oven/bun` stage (`bun install --frozen-lockfile`, `bun run
+  build`) and copied to `/app/ui/dist`;
 - starts as root only for `docker-entrypoint.sh`, which remaps `capforge` to `PUID`/`PGID`,
   chowns `/home/capforge/.agents/skills` and `/var/lib/capforge`, and drops privileges with
   `setpriv`; `--user` bypasses the remap;
-- listens on `:8099/mcp`, default transport `http` (FastMCP streamable HTTP);
-- healthcheck is a TCP connect, because an HTTP probe without MCP headers is not meaningful.
+- listens on `:8099/mcp` (FastMCP streamable HTTP) and `:8080` (reverse proxy + console), with
+  `CAPFORGE_WEB_TOKEN` unset by default, i.e. the console disabled;
+- healthcheck is a TCP connect to the MCP port, because an HTTP probe without MCP headers is not
+  meaningful.
 
 CI/CD (`.github/workflows/deploy.yml`):
 
-1. `uv sync --locked`, `ruff check`, `mypy capforge` and `uv run --locked pytest -q` gate the build.
+1. `uv sync --locked`, `ruff check`, `mypy capforge` and `uv run --locked pytest -q` gate the build,
+   as does a `ui` job that runs `bun install --frozen-lockfile && bun run build`.
 2. On success, Buildx builds `linux/amd64` and pushes to `ghcr.io/<owner>/capforge` on `main`
    (`latest`), `v*.*.*` tags (semver), and a short-SHA fallback.
 3. A build-provenance attestation is pushed with the image.
@@ -456,10 +568,12 @@ Caching layers, all speed-only (correctness still comes from `--locked` and the 
 
 | Change | Touch |
 |---|---|
-| Add/modify an MCP tool | `server.py`, README tool table, `tools/mcp_probe.py` (asserts ten names), tests |
+| Add/modify an MCP tool | `server.py`, README tool table, `tools/mcp_probe.py` (asserts eleven names), tests |
 | Change the capability contract or scaffold | `contract.py`, `AGENTS.md.example`, README, this document |
-| Change validation, paths, execution, venvs | `core.py`, tests |
+| Change validation, paths, execution, venvs, process hygiene | `core.py`, tests |
 | Change tags, promotion, pruning, rollback | `versioning.py`, tests |
+| Change serving, proxy or console | `web.py`, `cli.py` (listeners), README, this document, `tests/test_web.py` |
+| Change the console bundle | `ui/` (`bun install` after dependency edits; commit `ui/bun.lock`) |
 | Change dependencies | `pyproject.toml`, run `uv lock`, commit `uv.lock` |
 | Change the image, local deployment or CI | `Dockerfile`, `docker-compose.yml`, `.env.example`, `.dockerignore`, `.github/` |
 | Change server behavior the model sees | README and `AGENTS.md.example` (the runtime guide) |
@@ -469,10 +583,19 @@ Caching layers, all speed-only (correctness still comes from `--locked` and the 
 The suite is end-to-end by design:
 
 - `tests/test_units.py` is the fast suite: parsing, package validation, hashes, state coercion,
-  entrypoint containment and the fixed ten-tool surface. `pytest -q -m "not slow"` runs only it.
+  entrypoint containment, web-kind validation, registry persistence/quarantine, the fixed
+  eleven-tool surface, console auth/CSRF against the ASGI app, and stray-sweep ownership.
+  `pytest -q -m "not slow"` runs only it.
 - `tests/test_lifecycle.py` (marked `slow`) creates a temporary caps and state directory, reloads
   `core`, `versioning` and `server` after setting environment variables, and drives the tools as
   functions.
+- `tests/test_web.py` (marked `slow`) drives the web lifecycle: boot-probe gate, serve start/
+  restart/stop, proxy semantics, process-group kill of a served child, daemon-escape regression
+  (double fork swept, naive fork killed with the group), prune-stops-pinned without deadlock,
+  restore, console round trip, and corrupt-registry quarantine. It reloads `web` alongside the
+  other modules and calls `core.set_subreaper()` in the test process.
+- Console tests use `httpx.ASGITransport` with `anyio.run`, not `starlette.testclient`
+  (starlette 1.10's `TestClient` requires the `httpx2` package, which is not a dependency).
 - Slow tests build real venvs and execute real subprocesses; there is no mocking of the process or
   venv layer.
 - Coverage focuses on the invariants: name validation, duplicate tags, failed-test promotion,

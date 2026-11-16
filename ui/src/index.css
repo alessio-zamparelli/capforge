@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* zinc dark theme (shadcn-style variables) */
+:root {
+  --background: 240 10% 4%;
+  --foreground: 0 0% 98%;
+  --card: 240 10% 7%;
+  --card-foreground: 0 0% 98%;
+  --muted: 240 4% 16%;
+  --muted-foreground: 240 5% 65%;
+  --border: 240 4% 18%;
+  --primary: 0 0% 98%;
+  --primary-foreground: 240 6% 10%;
+  --destructive: 0 62% 30%;
+  --destructive-foreground: 0 0% 98%;
+  --accent: 240 4% 14%;
+}
+
+body {
+  @apply bg-background text-foreground;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}

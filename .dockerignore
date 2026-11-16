@@ -13,5 +13,7 @@ venv
 !.env.example
 tests
 tools
+ui/node_modules
+ui/dist
 AGENTS.md
 AGENTS.md.example

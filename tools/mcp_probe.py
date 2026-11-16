@@ -1,7 +1,9 @@
 """Talk to the running capforge server over real MCP HTTP, the way Open WebUI would.
 
-The probe uses a unique capability name and removes it, its tags, venvs, data and locks
-afterwards when the caps/state directories are visible from this process.
+The probe uses unique capability names and removes them, their tags, venvs, data, locks
+and serve-registry entries afterwards when the caps/state directories are visible from
+this process. It also drives one `kind: web` capability through the full serving round
+trip (start -> proxy -> restart -> stop) against the web listener on :8080.
 """
 
 import json
@@ -13,7 +15,9 @@ from pathlib import Path
 import httpx
 
 URL = os.environ.get("CAPFORGE_URL", "http://127.0.0.1:8099/mcp")
+WEB_URL = os.environ.get("CAPFORGE_WEB_PROBE_URL", "http://127.0.0.1:8080")
 CAP_NAME = f"probe_{os.getpid()}"
+WEB_NAME = f"webprobe_{os.getpid()}"
 
 
 def parse(resp: httpx.Response):
@@ -29,10 +33,23 @@ def cleanup(contract: dict, name: str) -> None:
     shutil.rmtree(caps / name, ignore_errors=True)
     for sub in ("versions", "venvs", "data", "backups"):
         shutil.rmtree(state / sub / name, ignore_errors=True)
+    shutil.rmtree(state / "served" / name, ignore_errors=True)
     (state / "state" / f"{name}.json").unlink(missing_ok=True)
     (state / "locks" / f"{name}.lock").unlink(missing_ok=True)
     for lock in (state / "locks").glob(f"{name}-*.lock"):
         lock.unlink(missing_ok=True)
+    # A served instance must not survive the probe: stop it through the MCP
+    # surface first (the caller does that), then drop its registry entry.
+    registry = state / "served" / "registry.json"
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict) and name in data:
+        data.pop(name, None)
+        tmp = registry.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(registry)
 
 
 def main() -> int:
@@ -61,7 +78,8 @@ def main() -> int:
     listed = parse(client.post(URL, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
     names = [t["name"] for t in listed["result"]["tools"]]
     print("tools/list ->", names)
-    assert len(names) == 10, names
+    assert len(names) == 11, names
+    assert "serve_capability" in names, names
 
     def call(name, args):
         resp = parse(
@@ -113,9 +131,48 @@ def main() -> int:
 
         missing = call("run_capability", {"name": "does_not_exist", "args": {}})
         print("bad name ->", missing["ok"], missing["error"][:70])
+
+        # ---- kind: web round trip: scaffold -> test (boot probe) -> promote -> serve
+        web_made = call(
+            "scaffold_capability",
+            {"name": WEB_NAME, "description": "Probe web service.", "kind": "web"},
+        )
+        print("web scaffold ->", web_made["ok"], web_made.get("kind"), web_made.get("files"))
+
+        web_tested = call("test_capability", {"name": WEB_NAME})
+        print("web test (boot probe) ->", web_tested["ok"])
+
+        web_promo = call("promote_capability", {"name": WEB_NAME, "tag": "v1", "note": "web"})
+        print("web promote ->", web_promo["ok"], web_promo.get("tag"))
+
+        refused = call("run_capability", {"name": WEB_NAME, "args": {}})
+        print("run on web cap refused ->", refused["ok"] is False, refused.get("error", "")[:60])
+
+        started = call("serve_capability", {"name": WEB_NAME, "action": "start"})
+        print("serve start ->", started["ok"], started.get("status"), started.get("url"))
+        assert started.get("status") == "running", started
+        prefix = started["url"].rstrip("/")
+        with httpx.Client(timeout=30) as web_client:
+            health = web_client.get(f"{prefix}/health")
+            print("proxy /health ->", health.status_code, health.text[:60])
+            assert health.status_code == 200
+            bare = web_client.get(f"{WEB_URL}/{WEB_NAME}", follow_redirects=False)
+            print("bare /<name> ->", bare.status_code, bare.headers.get("location"))
+            assert bare.status_code == 307
+            unserved = web_client.get(f"{WEB_URL}/no_such_probe_cap/health")
+            print("unserved ->", unserved.status_code)
+            assert unserved.status_code == 404
+
+        restarted = call("serve_capability", {"name": WEB_NAME, "action": "restart"})
+        print("serve restart ->", restarted["ok"], restarted.get("status"))
+
+        stopped = call("serve_capability", {"name": WEB_NAME, "action": "stop"})
+        print("serve stop ->", stopped["ok"], stopped.get("status"))
+        assert stopped.get("status") == "stopped", stopped
     finally:
         cleanup(contract, CAP_NAME)
-        print("cleaned up", CAP_NAME)
+        cleanup(contract, WEB_NAME)
+        print("cleaned up", CAP_NAME, WEB_NAME)
     return 0
 
 

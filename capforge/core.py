@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -10,6 +11,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -30,13 +32,23 @@ TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # URLs or leading '-' so a model-authored spec can never be read as a pip flag
 # or break the `packages: [a, b]` frontmatter it is serialized into.
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+*!<>=~;\[\]-]{0,199}$")
+# The ASGI object name in `app:` frontmatter; it becomes half of a uvicorn
+# "module:variable" argument, so it must be a plain Python identifier.
+APP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+WEB_KINDS = ("cli", "web")
 
 DEFAULT_RUN_TIMEOUT = 120
 DEFAULT_TEST_TIMEOUT = 300
 DEFAULT_INSTALL_TIMEOUT = 240
+DEFAULT_SERVE_BOOT_TIMEOUT = 60
 DEFAULT_KEEP_TAGS = 5
 MAX_PACKAGES = 50
 MAX_CAPTURE_BYTES = 256 * 1024
+
+# prctl(PR_SET_CHILD_SUBREAPER): detached grandchildren of capability calls
+# re-parent to this process instead of PID 1, where the orphan sweep can find them.
+PR_SET_CHILD_SUBREAPER = 36
 
 # Environment variables a capability is allowed to inherit. Everything else is dropped,
 # so a capability cannot read provider keys or the hub's own credentials. pip/install
@@ -127,6 +139,11 @@ def test_timeout() -> int:
 
 def install_timeout() -> int:
     return _timeout("CAPFORGE_INSTALL_TIMEOUT", DEFAULT_INSTALL_TIMEOUT)
+
+
+def serve_boot_timeout() -> int:
+    """Budget for a web capability to bind its port (probe and serve share it)."""
+    return _timeout("CAPFORGE_SERVE_BOOT_TIMEOUT", DEFAULT_SERVE_BOOT_TIMEOUT)
 
 
 def _contained(base: Path, child: Path) -> Path:
@@ -248,6 +265,8 @@ class Capability:
     description: str = ""
     entrypoint: str = "main.py"
     packages: list[str] = field(default_factory=list)
+    kind: str = "cli"
+    app_name: str = "app"
     body: str = ""
     error: str | None = None
 
@@ -278,12 +297,33 @@ def _load_from(name: str, path: Path) -> Capability:
     except CapError as exc:
         cap.error = str(exc)
         return cap
+    cap.kind = str(meta.get("kind") or "cli").strip().lower() or "cli"
+    if cap.kind not in WEB_KINDS:
+        cap.error = f"kind must be one of {list(WEB_KINDS)}, got {cap.kind!r}"
+        return cap
+    cap.app_name = str(meta.get("app") or "app").strip() or "app"
+    if cap.kind == "web":
+        if "uvicorn" not in cap.packages:
+            cap.error = (
+                "kind: web requires 'uvicorn' in packages, e.g. packages: [fastapi, uvicorn]"
+            )
+            return cap
+        if not APP_NAME_RE.match(cap.app_name):
+            cap.error = f"app must be a Python identifier, got {cap.app_name!r}"
+            return cap
     try:
         entry = _contained(path, path / raw_entry)
         cap.entrypoint = entry.relative_to(path).as_posix()
     except (CapError, ValueError):
         cap.error = f"entrypoint {raw_entry!r} escapes the capability folder"
         return cap
+    if cap.kind == "web":
+        stem = Path(cap.entrypoint).stem
+        if not APP_NAME_RE.match(stem):
+            cap.error = (
+                f"web entrypoint {cap.entrypoint!r} must have a valid Python module name"
+            )
+            return cap
     if not (path / cap.entrypoint).is_file():
         cap.error = f"entrypoint {cap.entrypoint!r} not found"
     return cap
@@ -440,6 +480,115 @@ def _kill_group(proc: subprocess.Popen) -> None:
             pass
 
 
+# Direct children of this process that must survive a stray sweep: in-flight
+# call children and long-lived web instances. Sweeps never touch them.
+_live_children: set[int] = set()
+_owned_children: set[int] = set()
+_child_lock = threading.Lock()
+_subreaper_set = False
+
+
+def register_owned(pid: int) -> None:
+    """Mark a long-lived child (a served web instance) as wanted, not stray."""
+    with _child_lock:
+        _owned_children.add(pid)
+
+
+def unregister_owned(pid: int) -> None:
+    with _child_lock:
+        _owned_children.discard(pid)
+
+
+def set_subreaper() -> bool:
+    """Adopt detached grandchildren so the stray sweep can find them.
+
+    Without this, a daemon that double-forks inside a capability call re-parents
+    to PID 1 and becomes invisible to any parent-based accounting. Nearest
+    subreaper wins, so this works in containers where PID 1 is someone else, too.
+    """
+    global _subreaper_set
+    if _subreaper_set:
+        return True
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            log.warning("could not set the subreaper flag: %s", ctypes.get_errno())
+            return False
+    except OSError:
+        log.warning("prctl unavailable; detached processes will not be swept", exc_info=True)
+        return False
+    _subreaper_set = True
+    return True
+
+
+def _read_ppid(stat: Path) -> tuple[int, str] | None:
+    try:
+        text = stat.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    close = text.rfind(")")
+    if close == -1:
+        return None
+    fields = text[close + 2 :].split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1]), fields[0]
+    except ValueError:
+        return None
+
+
+def _reap_zombie(pid: int) -> None:
+    """Reap one known zombie child. Specific-pid waits avoid stealing the exit
+    status of a live child another thread is blocked on."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def sweep_stray_children() -> list[int]:
+    """Kill processes re-parented to this process that nothing owns.
+
+    A capability call must leave nothing running behind it: any descendant that
+    outlived its call is either a naive fork (already killed with its group) or a
+    detached daemon, which shows up here as an adopted child. Served web
+    instances are registered as owned and are exempt. Best effort and quiet.
+    """
+    killed: list[int] = []
+    zombies: list[int] = []
+    me = os.getpid()
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return killed
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        parsed = _read_ppid(entry / "stat")
+        if parsed is None or parsed[0] != me:
+            continue
+        if parsed[1] == "Z":
+            zombies.append(pid)
+            continue
+        with _child_lock:
+            owned = pid in _owned_children or pid in _live_children
+        if owned:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+            log.warning("killed stray process pid=%d re-parented by a capability call", pid)
+        except OSError:
+            pass
+    for pid in zombies:
+        _reap_zombie(pid)
+    return killed
+
+
 def _run_process(
     cmd: list[str],
     *,
@@ -458,6 +607,8 @@ def _run_process(
         env=env,
         start_new_session=True,
     )
+    with _child_lock:
+        _live_children.add(proc.pid)
     out_sink: list[bytes] = []
     err_sink: list[bytes] = []
     readers = [
@@ -477,11 +628,18 @@ def _run_process(
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+    finally:
+        # Nothing survives a call: the group dies on timeout, and also after a
+        # normal exit, so a capability cannot leave in-group children running.
+        # Detached (setsid'd) descendants escape the group; the stray sweep
+        # catches those after re-parenting.
         _kill_group(proc)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+        with _child_lock:
+            _live_children.discard(proc.pid)
     if writer is not None:
         writer.join(timeout=5)
     for reader in readers:
@@ -649,6 +807,11 @@ def execute(
     data_tag: str | None = None,
 ) -> ExecResult:
     """Run one capability entrypoint in a subprocess: JSON in on stdin, JSON out on stdout."""
+    if cap.kind == "web":
+        raise CapError(
+            f"{cap.name!r} is a web capability (kind: web): it has no JSON entrypoint. "
+            "Use serve_capability(name, action='start') to run it as a server."
+        )
     entry = _contained(source, source / cap.entrypoint)
     if not entry.is_file():
         raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
@@ -669,6 +832,7 @@ def execute(
         payload=payload,
         timeout=timeout or run_timeout(),
     )
+    sweep_stray_children()
     duration = int((time.monotonic() - started) * 1000)
     if timed_out:
         log.info(
@@ -713,9 +877,21 @@ def run_tests(
     packages: list[str] | None = None,
     timeout: int | None = None,
 ) -> ExecResult:
-    """Run the capability's own test suite, or a real smoke run when it has none."""
+    """Run the capability's own test suite, or a real smoke run when it has none.
+
+    Web capabilities are gated by a real boot + HTTP probe instead of the JSON
+    smoke path, in addition to pytest when tests exist: a promotion must prove
+    the ASGI app actually starts.
+    """
     tests = source / "tests"
-    if not (tests.is_dir() and any(tests.rglob("test_*.py"))):
+    has_tests = tests.is_dir() and any(tests.rglob("test_*.py"))
+    if cap.kind == "web":
+        if has_tests:
+            result = _run_pytest(cap, source, packages, timeout)
+            if not result.ok:
+                return result
+        return probe_web_boot(cap, source, packages=packages)
+    if not has_tests:
         # Same execution path as a real call: invalid stdout must fail the gate.
         return execute(
             cap,
@@ -726,6 +902,17 @@ def run_tests(
             timeout=timeout or test_timeout(),
             data_tag="test",
         )
+    return _run_pytest(cap, source, packages, timeout)
+
+
+def _run_pytest(
+    cap: Capability,
+    source: Path,
+    packages: list[str] | None,
+    timeout: int | None,
+) -> ExecResult:
+    """Run the draft's pytest suite in a venv with pytest added."""
+    tests = source / "tests"
     venv = ensure_venv(
         cap.name, list(packages if packages is not None else cap.packages) + ["pytest"]
     )
@@ -767,5 +954,143 @@ def run_tests(
         exit_code=code,
         stdout=stdout,
         stderr=stderr,
+        duration_ms=duration,
+    )
+
+
+# ------------------------------------------------------------------ web boot probe
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _http_probe(port: int, deadline: float) -> tuple[bool, str]:
+    """Raw-socket GET /, retried until the deadline. ANY response proves the
+    ASGI app booted; `/health` is a scaffold convention, not contractual."""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, "no HTTP response before the boot budget expired"
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=min(2.0, remaining)) as conn:
+                conn.settimeout(min(2.0, remaining))
+                conn.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                data = conn.recv(4096)
+                if data:
+                    head = data.decode("latin-1", errors="replace").splitlines()[0][:120]
+                    return True, head
+        except OSError:
+            pass
+        time.sleep(0.1)
+
+
+def web_child_argv(cap: Capability, source: Path, port: int) -> list[str]:
+    """uvicorn arguments for a web capability's ASGI app. `--app-dir` keeps
+    nested entrypoints importable; children always bind 127.0.0.1."""
+    module = Path(cap.entrypoint).stem
+    app_dir = (source / cap.entrypoint).parent
+    return [
+        "-m",
+        "uvicorn",
+        f"{module}:{cap.app_name}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--app-dir",
+        str(app_dir),
+        "--log-level",
+        "info",
+    ]
+
+
+def web_child_env(
+    cap: Capability,
+    *,
+    tag: str | None,
+    venv: Path,
+    port: int,
+    data_tag: str | None = None,
+    public_url: str | None = None,
+) -> dict[str, str]:
+    """Allowlisted environment for a web child: same rules as execute(), plus
+    the serve-specific variables the app may read."""
+    env = _base_env()
+    env["CAPFORGE_CAP"] = cap.name
+    env["CAPFORGE_VERSION"] = tag or "draft"
+    env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, data_tag if data_tag is not None else tag))
+    env["CAPFORGE_SERVE_PORT"] = str(port)
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
+    if public_url:
+        env["CAPFORGE_PUBLIC_URL"] = public_url
+    return env
+
+
+def probe_web_boot(
+    cap: Capability,
+    source: Path,
+    *,
+    packages: list[str] | None = None,
+    timeout: int | None = None,
+) -> ExecResult:
+    """Boot the ASGI app once on a throwaway port and probe it over HTTP.
+
+    Used as the promotion gate for kind: web. The child is killed before
+    returning; anything that detached itself is left to the stray sweep."""
+    entry = _contained(source, source / cap.entrypoint)
+    if not entry.is_file():
+        raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
+    venv = ensure_venv(cap.name, packages if packages is not None else cap.packages)
+    port = _free_port()
+    env = web_child_env(cap, tag=None, venv=venv, port=port, data_tag="test")
+    cmd = [str(venv / "bin" / "python"), *web_child_argv(cap, source, port)]
+    started = time.monotonic()
+    budget = timeout or serve_boot_timeout()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(source),
+        env=env,
+        start_new_session=True,
+    )
+    with _child_lock:
+        _live_children.add(proc.pid)
+    sink: list[bytes] = []
+    reader = threading.Thread(target=_drain, args=(proc.stdout, sink), daemon=True)
+    reader.start()
+    try:
+        up, detail = _http_probe(port, time.monotonic() + budget)
+    finally:
+        _kill_group(proc)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        reader.join(timeout=5)
+        with _child_lock:
+            _live_children.discard(proc.pid)
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+        sweep_stray_children()
+    duration = int((time.monotonic() - started) * 1000)
+    child_log = b"".join(sink).decode("utf-8", errors="replace")
+    if up:
+        log.info("boot probe ok cap=%s port=%d duration_ms=%d", cap.name, port, duration)
+        return ExecResult(ok=True, exit_code=0, stdout=detail, stderr=child_log, duration_ms=duration)
+    log.info("boot probe failed cap=%s port=%d duration_ms=%d", cap.name, port, duration)
+    return ExecResult(
+        ok=False,
+        exit_code=None,
+        stdout="",
+        stderr=f"web boot failed: {detail}\n{child_log[-2000:]}",
         duration_ms=duration,
     )

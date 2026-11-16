@@ -74,9 +74,32 @@ jobs:
       - name: Run test suite
         run: uv run --locked pytest -q
 
+  # The console bundle is part of the image; a broken build must not publish.
+  ui:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+        working-directory: ui
+
+      - name: Type check and build
+        run: bun run build
+        working-directory: ui
+
   build-and-push:
     runs-on: ubuntu-26.04
-    needs: test
+    needs:
+      - test
+      - ui
     permissions:
       contents: read
       packages: write

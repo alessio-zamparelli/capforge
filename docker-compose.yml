@@ -5,7 +5,8 @@
 #   docker compose up --build
 #
 # Then add http://<host>:8099/mcp as an MCP (Streamable HTTP) server in
-# Open WebUI.
+# Open WebUI. `kind: web` capabilities are served at http://<host>:8080/<name>/
+# and the token-gated console lives at http://<host>:8080/.
 #
 # The caps directory is the contract with Open Terminal: mount the same host
 # directory in the terminal container at its skills home. The container path
@@ -28,6 +29,7 @@ services:
       - no-new-privileges:true
     ports:
       - "${CAPFORGE_PORT:-8099}:8099"
+      - "${CAPFORGE_WEB_PORT:-8080}:8080"
     environment:
       # Remap the app user to the host owner of the bind mounts.
       PUID: "${PUID:-10001}"
@@ -39,6 +41,14 @@ services:
       CAPFORGE_PORT: "8099"
       CAPFORGE_PATH: /mcp
       CAPFORGE_TRANSPORT: http
+      # Web listener: reverse proxy for kind: web capabilities + console.
+      CAPFORGE_WEB_HOST: "0.0.0.0"
+      CAPFORGE_WEB_PORT: "${CAPFORGE_WEB_PORT:-8080}"
+      # Set a long random string to enable the console. Unset disables the
+      # console and the control API; the capability proxy keeps working.
+      # CAPFORGE_WEB_TOKEN: "${CAPFORGE_WEB_TOKEN}"
+      CAPFORGE_WEB_UI: "${CAPFORGE_WEB_UI:-1}"
+      CAPFORGE_SERVE_BOOT_TIMEOUT: "${CAPFORGE_SERVE_BOOT_TIMEOUT:-60}"
       CAPFORGE_GUIDE: "${CAPFORGE_GUIDE:-1}"
       CAPFORGE_KEEP_TAGS: "${CAPFORGE_KEEP_TAGS:-5}"
       CAPFORGE_RUN_TIMEOUT: "${CAPFORGE_RUN_TIMEOUT:-120}"

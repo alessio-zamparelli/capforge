@@ -16,8 +16,8 @@ updates:
 
   - package-ecosystem: "pip"
     directory: "/"
-    # Tracks pyproject.toml and uv.lock. The only runtime dependency is
-    # fastmcp; pytest/httpx are in the dev group.
+    # Tracks pyproject.toml and uv.lock. Runtime dependencies are fastmcp,
+    # starlette and httpx; pytest/ruff/mypy are in the dev group.
     schedule:
       interval: "weekly"
     labels:
@@ -26,9 +26,20 @@ updates:
     cooldown:
       default-days: 7
 
+  - package-ecosystem: "bun"
+    directory: "/ui"
+    # The console bundle's dependencies (react, vite, tailwind).
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ui"
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: "docker"
     directory: "/"
-    # Keeps the python:3.14-slim base image current.
+    # Keeps the python:3.14-slim and oven/bun base images current.
     schedule:
       interval: "weekly"
     labels:

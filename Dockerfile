@@ -4,6 +4,14 @@
 # .github/workflows/deploy.yml and the one used to generate uv.lock.
 FROM ghcr.io/astral-sh/uv:0.13.6 AS uv
 
+# The web console is built with bun and shipped as static files.
+FROM oven/bun:1 AS ui
+WORKDIR /src
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY ui/ ./
+RUN bun run build
+
 FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -44,6 +52,9 @@ RUN useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin cap
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
+# The console bundle (token-gated). CAPFORGE_UI_DIR=0 disables serving it.
+COPY --from=ui /src/dist /app/ui/dist
+
 # The venv is uv-managed; running the console script directly avoids a second
 # uv process (and signal-forwarding layer) as PID 1.
 ENV PATH="/app/.venv/bin:$PATH" \
@@ -54,9 +65,12 @@ ENV PATH="/app/.venv/bin:$PATH" \
     CAPFORGE_HOST=0.0.0.0 \
     CAPFORGE_PORT=8099 \
     CAPFORGE_PATH=/mcp \
-    CAPFORGE_TRANSPORT=http
+    CAPFORGE_TRANSPORT=http \
+    CAPFORGE_WEB_HOST=0.0.0.0 \
+    CAPFORGE_WEB_PORT=8080 \
+    CAPFORGE_UI_DIR=/app/ui/dist
 
-EXPOSE 8099
+EXPOSE 8099 8080
 
 # TCP check only: MCP requires a POST with protocol headers, so a plain HTTP
 # probe would report a healthy server as down.

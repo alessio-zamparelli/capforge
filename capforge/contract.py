@@ -45,6 +45,36 @@ Raise only for bugs; an uncaught exception is a failed call.
    subprocess you poll, or in a file you write and read back later.
 6. **Deterministic output.** Same args plus same data directory must give the same result.
    Sort collections, pin formats, never emit timestamps you did not ask for.
+7. **Leave nothing running.** A call must not leave processes behind it: anything you fork
+   that outlives the call is killed. A resident service is a web capability (`kind: web`)
+   served through `serve_capability`, never a detached daemon.
+
+## Web capabilities
+
+Frontmatter `kind: web` turns a capability into a long-lived HTTP service instead of a
+one-shot call:
+
+    ---
+    name: my_service
+    description: One sentence, shown to the model in the per-turn manifest.
+    kind: web
+    entrypoint: app.py
+    packages: [fastapi, uvicorn]
+    ---
+
+* `entrypoint` names the file containing the ASGI `app` object (optional `app:` overrides
+  the object name, default `app`). `uvicorn` must be in `packages`.
+* Write a FastAPI (or any ASGI) app. A `GET /health` returning 200 is a useful convention.
+* The service is a public network endpoint: validate every input, never return secrets,
+  write only under `CAPFORGE_DATA_DIR`, and never assume the caller is the model — anyone
+  who can reach the port is a caller.
+* There is no stdin/stdout JSON contract: the process is long-lived, the run timeout does
+  not apply, and the boot budget (CAPFORGE_SERVE_BOOT_TIMEOUT, default 60s) replaces it.
+* The environment is the same allowlist as a call, plus `CAPFORGE_SERVE_PORT` (the port you
+  are bound to) and `CAPFORGE_PUBLIC_URL` (the URL callers use).
+* Lifecycle: promote the draft, then `serve_capability(name, action="start")`. The instance
+  is pinned to the active tag; a later promotion does not change a running instance until
+  you `restart`. `test_capability` boots the app once and probes it before promotion.
 
 ## Dependencies
 
@@ -95,10 +125,14 @@ workspace and the code the `capforge` MCP server executes.
 1. `get_contract()` once. It has the layout, limits and full stdin/stdout contract.
 2. `list_capabilities()` to see names, active tags and whether a draft changed.
 3. `scaffold_capability(name, description)`; never start from an empty file.
+   Pass `kind="web"` for a long-lived HTTP service (FastAPI app) instead of a CLI.
 4. Edit `<name>/SKILL.md` and `<name>/main.py` with your file tools.
 5. `test_capability(name, args={...})`; it runs the tests and one real invocation.
 6. `promote_capability(name, tag, note)`; tests must pass and the tag becomes live.
 7. `run_capability(name, args)` always executes the active tag, not the draft.
+8. For `kind: web` capabilities: `serve_capability(name, action="start")` runs the active
+   tag as a long-lived server at `http://<host>:<web port>/<name>/`; actions are
+   start | stop | restart | status. `run_capability` refuses web capabilities.
 
 `rollback_capability(name, tag)` moves the active pointer. `list_tags(name,
 diff_against_active=true)` shows what differs from live.
@@ -121,6 +155,8 @@ A non-zero exit, a timeout or unparseable output is a failed call.
   Specs are plain requirements (`pypdf>=5`): no spaces, commas, URLs or leading `-`.
 * Be fast. Calls time out at 120s by default; long work belongs in a polled subprocess.
 * Be deterministic: same args and data directory, same result. Sort and pin formats.
+* Leave nothing running. Anything forked inside a call that outlives it is killed. A
+  resident service is `kind: web` served with `serve_capability`, not a detached daemon.
 
 The draft is never what runs after promotion. Tags are immutable copies; edit and test the draft,
 then promote.
@@ -234,3 +270,92 @@ def test_rejects_bad_input() -> None:
 '''
 
 GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n.venv/\n"
+
+SCAFFOLD_APP = '''\
+"""ASGI app for web capability {name}.
+
+Runs as a long-lived service: `serve_capability(name, action="start")` boots it with
+uvicorn and reverse-proxies it at http://<host>:<web port>/{name}/<path>.
+Validate every input: anyone who can reach the port is a caller, not just the model.
+"""
+
+from __future__ import annotations
+
+from fastapi import FastAPI
+
+app = FastAPI(title="{name}")
+
+
+@app.get("/")
+def index() -> dict:
+    return {{"service": "{name}", "status": "ok"}}
+
+
+@app.get("/health")
+def health() -> dict:
+    return {{"healthy": True}}
+'''
+
+SCAFFOLD_SKILL_WEB = """\
+---
+name: {name}
+description: {description}
+kind: web
+entrypoint: app.py
+packages: [{packages}]
+---
+
+# {name} (web service)
+
+A long-lived HTTP service. After promotion it runs at `http://<host>:<web port>/{name}/`
+(see `serve_capability`). The model reads this to decide whether to start it and how to
+call it.
+
+## Endpoints
+
+| method | path | meaning |
+|--------|------|---------|
+| GET | `/` | service info |
+| GET | `/health` | liveness probe, returns 200 |
+
+## Notes
+
+* The service is public: validate every input, return no secrets, write only under
+  `CAPFORGE_DATA_DIR`.
+* Start it with `serve_capability(name, action="start")`; stop with `action="stop"`.
+  `restart` picks up a newly promoted tag.
+"""
+
+SCAFFOLD_TEST_WEB = '''\
+"""Tests for {name}. These run before a promotion, and a failure blocks it.
+
+The hub also boots the real app and probes it over HTTP as part of the gate; this
+suite covers behaviour in-process.
+"""
+
+from __future__ import annotations
+
+import anyio
+import httpx
+
+from app import app
+
+
+def _get(path: str) -> httpx.Response:
+    async def call() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get(path)
+
+    return anyio.run(call)
+
+
+def test_index() -> None:
+    response = _get("/")
+    assert response.status_code == 200
+    assert response.json()["service"] == "{name}"
+
+
+def test_health() -> None:
+    assert _get("/health").status_code == 200
+'''

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "capforge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Deterministic, versioned capabilities exposed over MCP for Open WebUI + Open Terminal"
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,15 +17,15 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Code Generators",
 ]
-dependencies = ["fastmcp>=4.1.3"]
+dependencies = ["fastmcp>=4.1.3", "httpx>=0.27", "starlette>=0.41"]
 
 [dependency-groups]
 # `uv sync` installs this group by default; CI and local development rely on it.
 # The Docker image explicitly passes --no-dev.
 dev = [
-    "httpx>=0.27",
     "mypy>=2.4.0",
     "pytest>=8.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.17.2",
 ]
 

@@ -252,6 +252,15 @@ def _gc_venvs(name: str, tags: list[dict[str, Any]]) -> None:
             specs = [str(p) for p in pkgs]
             live.add(requirements_hash(specs))
             live.add(requirements_hash([*specs, "pytest"]))
+    # A served web instance runs from its venv right now; its requirement set is
+    # live even if no surviving tag references it. Lazy import: web.py needs
+    # starlette, and versioning must stay importable without it.
+    try:
+        from . import web
+
+        live.update(web.running_requirements_hashes(name))
+    except Exception:  # best effort; web.py may be absent or broken
+        log.debug("venv GC could not consult the serve registry for %s", name, exc_info=True)
     for entry in sorted(base.iterdir()):
         if not entry.is_dir() or entry.name in live:
             continue
@@ -273,6 +282,20 @@ def _prune(state: dict[str, Any], keep: int) -> list[str]:
         if victim is None:
             break
         tags.remove(victim)
+        # A served instance pinned to this tag is about to lose its version dir,
+        # data and venv. Stop it first. Caller (promote) holds cap_lock(name):
+        # stop_pinned must not reacquire it, a nested flock would deadlock.
+        try:
+            from . import web
+
+            web.stop_pinned(state["name"], victim["tag"])
+        except Exception:  # best effort; web.py may be absent or broken
+            log.warning(
+                "could not stop a served instance for pruned tag %s@%s",
+                state["name"],
+                victim["tag"],
+                exc_info=True,
+            )
         shutil.rmtree(version_path(state["name"], victim["tag"]), ignore_errors=True)
         shutil.rmtree(data_dir(state["name"], victim["tag"], create=False), ignore_errors=True)
         state.setdefault("pruned", []).append({"tag": victim["tag"], "at": int(time.time())})

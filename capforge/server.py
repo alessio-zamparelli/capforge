@@ -11,8 +11,18 @@ from typing import Any
 from fastmcp import FastMCP
 
 from . import __version__, versioning
-from .contract import CONTRACT, GITIGNORE, SCAFFOLD_MAIN, SCAFFOLD_SKILL, SCAFFOLD_TEST
+from .contract import (
+    CONTRACT,
+    GITIGNORE,
+    SCAFFOLD_APP,
+    SCAFFOLD_MAIN,
+    SCAFFOLD_SKILL,
+    SCAFFOLD_SKILL_WEB,
+    SCAFFOLD_TEST,
+    SCAFFOLD_TEST_WEB,
+)
 from .core import (
+    WEB_KINDS,
     CapError,
     cap_lock,
     cap_path,
@@ -27,6 +37,7 @@ from .core import (
     requirements_hash,
     run_tests,
     run_timeout,
+    serve_boot_timeout,
     state_dir,
     test_timeout,
     tree_hash,
@@ -37,6 +48,9 @@ from .core import (
 )
 
 log = logging.getLogger("capforge")
+
+# Set by cli._serve: "stdio" disables web serving (no HTTP surface to proxy through).
+RUNTIME_TRANSPORT = "http"
 
 mcp = FastMCP(
     "capforge",
@@ -75,6 +89,7 @@ def get_contract() -> dict:
     """Read this first: the folder layout, the stdin/stdout contract, and the rules a
     capability must follow. Returns the caps root (shared with the terminal), the state
     directory, and the current limits."""
+    web = _web_info()
     return {
         "ok": True,
         "version": __version__,
@@ -85,9 +100,29 @@ def get_contract() -> dict:
             "run_timeout_s": run_timeout(),
             "test_timeout_s": test_timeout(),
             "install_timeout_s": install_timeout(),
+            "serve_boot_timeout_s": serve_boot_timeout(),
         },
+        "web": web,
         "contract": CONTRACT,
     }
+
+
+def _web_info() -> dict:
+    """Web listener facts for get_contract; never includes the token value.
+    Lazy import keeps get_contract usable if the web install is broken."""
+    try:
+        from . import web
+
+        return {
+            "host": web.web_host(),
+            "port": web.web_port(),
+            "url_prefix": "http://<host>:<web port>/<name>/",
+            "console": "token-gated dashboard at the web root; CAPFORGE_WEB_TOKEN gates it, "
+            "unset disables it (the value is never exposed)",
+            "disabled": web.web_port() == 0,
+        }
+    except Exception as exc:
+        return {"disabled": True, "error": str(exc)}
 
 
 @mcp.tool
@@ -103,6 +138,7 @@ def list_capabilities() -> dict:
             {
                 "name": cap.name,
                 "description": cap.description,
+                "kind": cap.kind,
                 "active": active.get("tag"),
                 "draft_ready": cap.draft_ready,
                 "draft_error": cap.error,
@@ -131,6 +167,7 @@ def get_capability(name: str) -> dict:
         "name": cap.name,
         "path": str(cap.path),
         "description": cap.description,
+        "kind": cap.kind,
         "entrypoint": cap.entrypoint,
         "packages": cap.packages,
         "draft_ready": cap.draft_ready,
@@ -153,9 +190,11 @@ def scaffold_capability(
     description: str,
     packages: list[str] | None = None,
     overwrite: bool = False,
+    kind: str = "cli",
 ) -> dict:
     """Create a capability folder with SKILL.md, a working main.py and one passing test.
     Start here instead of writing files by hand: the skeleton already satisfies the contract.
+    kind="web" scaffolds a FastAPI service (app.py + a boot test) to run with serve_capability.
     overwrite=true archives the previous draft under the state directory first."""
     try:
         path = cap_path(name)
@@ -168,10 +207,15 @@ def scaffold_capability(
         return _fail("description must be one line and must not contain '---'.")
     if len(description) > 500:
         return _fail("description must be at most 500 characters.")
+    kind = str(kind).strip().lower() or "cli"
+    if kind not in WEB_KINDS:
+        return _fail(f"kind must be one of {list(WEB_KINDS)}, got {kind!r}.")
     try:
         pkgs = validate_packages(packages or [])
     except CapError as exc:
         return _fail(str(exc))
+    if kind == "web" and not {"fastapi", "uvicorn", "httpx"} <= set(pkgs):
+        pkgs = list(dict.fromkeys(["fastapi", "uvicorn", "httpx", *pkgs]))
 
     backup: Path | None = None
     try:
@@ -185,26 +229,46 @@ def scaffold_capability(
                 backup = _archive_draft(name, path)
                 shutil.rmtree(path)
             (path / "tests").mkdir(parents=True)
-            (path / "SKILL.md").write_text(
-                SCAFFOLD_SKILL.format(
-                    name=name, description=description, packages=", ".join(pkgs)
-                ),
-                encoding="utf-8",
-            )
-            (path / "main.py").write_text(SCAFFOLD_MAIN.format(name=name), encoding="utf-8")
-            (path / "tests" / "test_main.py").write_text(
-                SCAFFOLD_TEST.format(name=name), encoding="utf-8"
-            )
+            if kind == "web":
+                (path / "SKILL.md").write_text(
+                    SCAFFOLD_SKILL_WEB.format(
+                        name=name, description=description, packages=", ".join(pkgs)
+                    ),
+                    encoding="utf-8",
+                )
+                (path / "app.py").write_text(SCAFFOLD_APP.format(name=name), encoding="utf-8")
+                (path / "tests" / "test_main.py").write_text(
+                    SCAFFOLD_TEST_WEB.format(name=name), encoding="utf-8"
+                )
+                files = ["SKILL.md", "app.py", "tests/test_main.py"]
+            else:
+                (path / "SKILL.md").write_text(
+                    SCAFFOLD_SKILL.format(
+                        name=name, description=description, packages=", ".join(pkgs)
+                    ),
+                    encoding="utf-8",
+                )
+                (path / "main.py").write_text(SCAFFOLD_MAIN.format(name=name), encoding="utf-8")
+                (path / "tests" / "test_main.py").write_text(
+                    SCAFFOLD_TEST.format(name=name), encoding="utf-8"
+                )
+                files = ["SKILL.md", "main.py", "tests/test_main.py"]
             (path / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     except OSError as exc:
         return _fail(f"Could not write {path}: {exc}")
     return {
         "ok": True,
         "name": name,
+        "kind": kind,
         "path": str(path),
-        "files": ["SKILL.md", "main.py", "tests/test_main.py"],
+        "files": files,
         "backup": str(backup) if backup else None,
-        "next": "Edit main.py and SKILL.md, then call test_capability(name) and promote_capability(name).",
+        "next": (
+            "Edit app.py and SKILL.md, then test_capability(name) and promote_capability(name), "
+            "then serve_capability(name, action='start')."
+            if kind == "web"
+            else "Edit main.py and SKILL.md, then call test_capability(name) and promote_capability(name)."
+        ),
     }
 
 
@@ -349,6 +413,40 @@ def run_capability(name: str, args: dict | None = None) -> dict:
     if mode == "draft":
         out["warning"] = "Running the unpromoted draft. Promote it once the tests pass."
     return out
+
+
+# -------------------------------------------------------------------------- serving
+
+
+@mcp.tool
+def serve_capability(name: str, action: str = "status") -> dict:
+    """Start, stop, restart or inspect the long-lived web server for a capability's
+    ACTIVE tag. Requires kind: web and a promoted tag; drafts are never served.
+    start/stop/restart manage the instance pinned to the active tag; restart also
+    picks up a newly promoted tag. The service is reachable at the URL in the result
+    (the web listener's /<name>/ prefix)."""
+    if RUNTIME_TRANSPORT == "stdio":
+        return _fail(
+            "web serving requires HTTP transport: run `capforge serve` without "
+            "--transport stdio (the web listener is skipped in stdio mode)."
+        )
+    action = str(action).strip().lower() or "status"
+    if action not in ("start", "stop", "restart", "status"):
+        return _fail(f"action must be one of start, stop, restart, status; got {action!r}")
+    try:
+        from . import web
+
+        result = getattr(web, action)(name)
+    except CapError as exc:
+        return _fail(str(exc))
+    result["ok"] = True
+    result["action"] = action
+    if action == "start" and result.get("status") == "running":
+        result.setdefault(
+            "hint",
+            "Restart after the next promotion to move the instance to the new tag.",
+        )
+    return result
 
 
 # ------------------------------------------------------------------------ promotion

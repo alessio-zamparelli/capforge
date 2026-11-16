@@ -6,12 +6,16 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 Transport = Literal["http", "stdio", "sse", "streamable-http"]
 TRANSPORTS = {"http", "stdio", "sse", "streamable-http"}
+
+log = logging.getLogger("capforge")
 
 # Terminal skills live in one of these directories under the terminal user's home.
 # The terminal usually runs in another container, so its home is not Path.home() here.
@@ -47,6 +51,21 @@ def _doctor() -> int:
     print(f"keep tags  {keep_tags()}")
     print(f"python     {sys.version.split()[0]}")
     print(f"log level  {os.environ.get('CAPFORGE_LOG_LEVEL', 'INFO')}")
+
+    try:
+        from . import web
+
+        web_port = web.web_port()
+        if web_port == 0:
+            print("web listener disabled (CAPFORGE_WEB_PORT=0)")
+        else:
+            token = web.web_token()
+            console = "token-gated" if token else "disabled (no CAPFORGE_WEB_TOKEN)"
+            print(f"web        {web.web_host()}:{web_port} console={console}")
+            for name, record in sorted(web.read_registry().items()):
+                print(f"  served {name:24} tag={record.get('tag')} desired={record.get('desired')}")
+    except Exception as exc:  # a broken web install must not crash doctor
+        problems.append(f"web serving is not usable: {exc}")
 
     if not root.is_dir():
         problems.append(f"caps dir does not exist: {root} (create it, or set CAPFORGE_CAPS_DIR)")
@@ -91,8 +110,10 @@ def _doctor() -> int:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    from .core import ensure_workspace_skill
-    from .server import mcp
+    import signal  # noqa: F401 - referenced by _handle_signals below
+
+    from . import server as server_module
+    from .core import ensure_workspace_skill, set_subreaper
 
     ensure_workspace_skill()
     transport = args.transport or "http"
@@ -102,8 +123,76 @@ def _serve(args: argparse.Namespace) -> int:
     host = args.host or os.environ.get("CAPFORGE_HOST", "0.0.0.0")
     port = args.port if args.port is not None else _env_int("CAPFORGE_PORT", 8099)
     path = args.path or os.environ.get("CAPFORGE_PATH", "/mcp")
-    mcp.run(transport=cast(Transport, transport), host=host, port=port, path=path)
+    if transport == "stdio":
+        # No HTTP surface: web serving and the console make no sense here.
+        server_module.RUNTIME_TRANSPORT = "stdio"
+        server_module.mcp.run(transport=cast(Transport, "stdio"))
+        return 0
+    from . import web
+
+    # Detached grandchildren of capability calls re-parent here, so the stray
+    # sweep can find and kill them (nothing survives a call).
+    set_subreaper()
+    web.restore()
+    server_module.RUNTIME_TRANSPORT = "http"
+    _run_two_listeners(server_module.mcp, web, host, port, path)
     return 0
+
+
+def _run_two_listeners(mcp: Any, web: Any, host: str, port: int, mcp_path: str) -> None:
+    """FastMCP on :8099/mcp, the web app on :8080, one process, one signal set.
+
+    Both uvicorn servers have their own signal capture disabled; ours sets
+    should_exit on both and kills served children, so nothing is orphaned."""
+    import anyio
+    import uvicorn
+
+    mcp_app = mcp.http_app(path=mcp_path, transport="http")
+    web_port = web.web_port()
+    web_app = web.asgi_app() if web_port != 0 else None
+    if web_app is None:
+        log.info("web listener disabled (CAPFORGE_WEB_PORT=0)")
+
+    class _QuietServer(uvicorn.Server):
+        # Signal handling is owned by this function, not by either server.
+        @contextmanager
+        def capture_signals(self):
+            yield
+
+    mcp_server = _QuietServer(
+        uvicorn.Config(mcp_app, host=host, port=port, log_level=_uvicorn_log_level())
+    )
+    web_server = (
+        _QuietServer(
+            uvicorn.Config(
+                web_app, host=web.web_host(), port=web_port, log_level=_uvicorn_log_level()
+            )
+        )
+        if web_app is not None
+        else None
+    )
+
+    async def _handle_signals() -> None:
+        with anyio.open_signal_receiver(signal.SIGINT, signal.SIGTERM) as signals:
+            async for _sig in signals:
+                mcp_server.should_exit = True
+                if web_server is not None:
+                    web_server.should_exit = True
+                web.shutdown()
+                break
+
+    async def _main() -> None:
+        async with anyio.create_task_group() as group:
+            group.start_soon(mcp_server.serve)
+            if web_server is not None:
+                group.start_soon(web_server.serve)
+            group.start_soon(_handle_signals)
+
+    anyio.run(_main)
+
+
+def _uvicorn_log_level() -> str:
+    return os.environ.get("CAPFORGE_LOG_LEVEL", "INFO").lower()
 
 
 def main(argv: list[str] | None = None) -> int:
