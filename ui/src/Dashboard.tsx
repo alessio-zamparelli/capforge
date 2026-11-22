@@ -6,14 +6,16 @@ import {
   KeyRound,
   Loader2,
   RefreshCw,
+  RotateCcw,
   Square,
   Terminal,
+  Trash2,
   TriangleAlert,
   Play,
 } from "lucide-react";
 import * as api from "./api";
 import { isAuthError } from "./api";
-import type { CapInfo } from "./api";
+import type { CapDetail, CapInfo, LogTail, TagInfo } from "./api";
 
 const POLL_MS = 3000;
 
@@ -120,7 +122,7 @@ function CapRow({
   const [open, setOpen] = useState(false);
   const served = cap.served;
   const hasEndpoints = !!served && served.endpoints.length > 0;
-  const expandable = hasEndpoints || cap.env.length > 0;
+  const expandable = true;
   const running = served?.status === "running";
   const envSet = cap.env.filter((item) => item.configured).length;
   const envMissing = cap.env.filter((item) => item.required && !item.configured).length;
@@ -193,7 +195,8 @@ function CapRow({
       </div>
 
       {open && expandable && (
-        <div className="space-y-3 border-t border-border px-4 py-3">
+        <div className="space-y-4 border-t border-border px-4 py-3">
+          <DetailPanel cap={cap} onChanged={onChanged} onAuthLost={onAuthLost} />
           {hasEndpoints && (
             <div>
               {served?.url && (
@@ -225,6 +228,224 @@ function CapRow({
         </div>
       )}
     </li>
+  );
+}
+
+function DetailPanel({
+  cap,
+  onChanged,
+  onAuthLost,
+}: {
+  cap: CapInfo;
+  onChanged: () => Promise<void>;
+  onAuthLost: () => void;
+}) {
+  const [detail, setDetail] = useState<CapDetail | null>(null);
+  const [logKind, setLogKind] = useState<"pipeline" | "served">("pipeline");
+  const [log, setLog] = useState<LogTail | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState("");
+
+  const fail = (err: unknown) => {
+    if (isAuthError(err)) {
+      onAuthLost();
+      return;
+    }
+    setError(err instanceof Error ? err.message : String(err));
+  };
+
+  const load = useCallback(async () => {
+    try {
+      const next = await api.capDetail(cap.name);
+      setDetail(next);
+      setLog(next.log);
+      setError(null);
+    } catch (err) {
+      fail(err);
+    }
+  }, [cap.name, onAuthLost]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const refreshLog = async (kind: "pipeline" | "served" = logKind) => {
+    setBusy("log");
+    setError(null);
+    try {
+      setLog(await api.logs(cap.name, kind));
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const rollback = async (tag: string) => {
+    setBusy(`rollback:${tag}`);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.rollback(cap.name, tag);
+      setNotice(`Rolled back to ${tag}.`);
+      await load();
+      await onChanged();
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async () => {
+    setBusy("delete");
+    setError(null);
+    setNotice(null);
+    try {
+      await api.remove(cap.name, confirm);
+      setNotice("Capability deleted.");
+      await onChanged();
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const pipeline = detail?.pipeline;
+  const tags = detail?.tags ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="mb-2 flex flex-wrap items-center gap-2 text-sm font-medium">
+          <Terminal className="h-4 w-4 text-muted-foreground" />
+          Pipeline
+          {pipeline?.state && <Badge warn={pipeline.state !== "promoted"}>{pipeline.state}</Badge>}
+          {pipeline?.staging_id && (
+            <span className="text-xs text-muted-foreground">{pipeline.staging_id}</span>
+          )}
+          {pipeline?.sha && (
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
+              {pipeline.sha.slice(0, 12)}
+            </code>
+          )}
+        </div>
+        {pipeline?.error && <p className="text-xs text-red-300">{pipeline.error}</p>}
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span>kind {detail?.kind ?? cap.kind}</span>
+          <span>data {detail?.data ?? "version"}</span>
+          <span>draft {detail?.draft_changed ? "changed" : "current"}</span>
+          {detail?.active_content_hash && <span>hash {detail.active_content_hash}</span>}
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-2 text-sm font-medium">Tags</div>
+        {tags.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No tags yet.</p>
+        ) : (
+          <ul className="space-y-1">
+            {[...tags].reverse().map((tag: TagInfo) => (
+              <li key={tag.tag} className="flex flex-wrap items-center gap-2 text-sm">
+                <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{tag.tag}</code>
+                {tag.active && <Badge>active</Badge>}
+                {tag.content_hash && (
+                  <span className="text-xs text-muted-foreground">{tag.content_hash}</span>
+                )}
+                {tag.note && (
+                  <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                    {tag.note}
+                  </span>
+                )}
+                {!tag.active && (
+                  <button
+                    onClick={() => void rollback(tag.tag)}
+                    disabled={busy !== null}
+                    className="flex h-7 items-center gap-1 rounded-md border border-border px-2 text-xs hover:bg-accent disabled:opacity-40"
+                  >
+                    {busy === `rollback:${tag.tag}` ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RotateCcw className="h-3 w-3" />
+                    )}
+                    Roll back
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div>
+        <div className="mb-2 flex flex-wrap items-center gap-2 text-sm font-medium">
+          Logs
+          <select
+            value={logKind}
+            onChange={(event) => {
+              const kind = event.target.value as "pipeline" | "served";
+              setLogKind(kind);
+              void refreshLog(kind);
+            }}
+            className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+          >
+            <option value="pipeline">pipeline</option>
+            <option value="served">served</option>
+          </select>
+          <button
+            onClick={() => void refreshLog()}
+            disabled={busy !== null}
+            className="flex h-7 items-center gap-1 rounded-md border border-border px-2 text-xs hover:bg-accent disabled:opacity-40"
+          >
+            {busy === "log" ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3" />
+            )}
+            Refresh
+          </button>
+        </div>
+        <pre className="max-h-64 overflow-auto rounded-md bg-muted p-2 text-xs whitespace-pre-wrap">
+          {log?.text || "(no log yet)"}
+        </pre>
+        {log?.truncated && (
+          <p className="mt-1 text-xs text-muted-foreground">Showing the most recent tail.</p>
+        )}
+      </div>
+
+      <div>
+        <div className="mb-2 flex items-center gap-2 text-sm font-medium text-red-300">
+          <Trash2 className="h-4 w-4" />
+          Delete capability
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            value={confirm}
+            onChange={(event) => setConfirm(event.target.value)}
+            placeholder={`type ${cap.name} to confirm`}
+            className="h-8 min-w-56 flex-1 rounded-md border border-border bg-background px-2 text-sm"
+          />
+          <button
+            onClick={() => void remove()}
+            disabled={busy !== null || confirm !== cap.name}
+            className="flex h-8 items-center gap-1.5 rounded-md border border-red-500/40 px-2.5 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+          >
+            {busy === "delete" ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Trash2 className="h-3.5 w-3.5" />
+            )}
+            Delete
+          </button>
+        </div>
+      </div>
+
+      {error && <p className="text-xs text-red-300">{error}</p>}
+      {notice && <p className="text-xs text-muted-foreground">{notice}</p>}
+    </div>
   );
 }
 

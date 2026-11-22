@@ -45,6 +45,7 @@ PYTHON_REQUIRES = ">=3.14,<3.15"
 DEFAULT_RUN_TIMEOUT = 120
 DEFAULT_TEST_TIMEOUT = 300
 DEFAULT_INSTALL_TIMEOUT = 240
+DEFAULT_GIT_TIMEOUT = 300
 DEFAULT_SERVE_BOOT_TIMEOUT = 60
 DEFAULT_KEEP_TAGS = 5
 MAX_CAPTURE_BYTES = 256 * 1024
@@ -139,6 +140,16 @@ def test_timeout() -> int:
 
 def install_timeout() -> int:
     return _timeout("CAPFORGE_INSTALL_TIMEOUT", DEFAULT_INSTALL_TIMEOUT)
+
+
+def git_timeout() -> int:
+    """Budget for git CGI, pack transfer and archive extraction."""
+    return _timeout("CAPFORGE_GIT_TIMEOUT", DEFAULT_GIT_TIMEOUT)
+
+
+def mcp_token() -> str | None:
+    """Bearer token required by the HTTP MCP listener. Never passed to capabilities."""
+    return os.environ.get("CAPFORGE_MCP_TOKEN", "").strip() or None
 
 
 def serve_boot_timeout() -> int:

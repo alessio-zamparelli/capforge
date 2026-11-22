@@ -1,7 +1,8 @@
 """Talk to a running capforge server over real MCP HTTP, the way Open WebUI would.
 
-Exercises the git-authored loop: scaffold -> token -> clone -> commit -> push ->
-pipeline -> promoted -> run, plus one web capability start/proxy/restart/stop.
+Requires CAPFORGE_MCP_TOKEN and sends it as a Bearer header. Exercises the
+git-authored loop: scaffold -> token -> clone -> commit -> push -> pipeline ->
+promoted -> run, plus one web capability start/proxy/restart/stop.
 """
 
 import base64
@@ -105,8 +106,15 @@ def push(name: str, token: str, git_url: str, basic_username: str, edit) -> None
 
 
 def main() -> int:
+    token = os.environ.get("CAPFORGE_MCP_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("CAPFORGE_MCP_TOKEN is required for the HTTP MCP probe")
     client = httpx.Client(
-        timeout=180, headers={"Accept": "application/json, text/event-stream"}
+        timeout=180,
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {token}",
+        },
     )
     r = client.post(
         URL,

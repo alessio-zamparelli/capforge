@@ -188,7 +188,7 @@ def materialise(name: str, dest: Path) -> Path:
     try:
         code, out = _run(
             ["git", "-C", str(repo), "archive", "--format=tar", f"--output={tar_path}", "refs/heads/main"],
-            timeout=core.run_timeout(),
+            timeout=core.git_timeout(),
         )
         if code != 0:
             raise core.CapError(f"git archive failed for {name!r}: {out[-1200:]}")
@@ -223,20 +223,6 @@ def materialise(name: str, dest: Path) -> Path:
         return dest
     finally:
         tar_path.unlink(missing_ok=True)
-
-
-def repo_size(name: str) -> int:
-    repo = repo_path(name)
-    if not repo.is_dir():
-        return 0
-    total = 0
-    for path in repo.rglob("*"):
-        try:
-            if path.is_file() and not path.is_symlink():
-                total += path.stat().st_size
-        except OSError:
-            pass
-    return total
 
 
 def gc(name: str, timeout: int = 60) -> None:

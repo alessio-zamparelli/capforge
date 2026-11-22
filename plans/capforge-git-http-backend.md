@@ -1,5 +1,9 @@
 # capforge — git-authored capabilities (scaffold → clone → push)
 
+> Implementation note (0.6.0): the per-repo quota and the `CAPFORGE_MAX_PIPELINES`,
+> `CAPFORGE_MAX_PUSHES` and `CAPFORGE_MAX_CLONES` concurrency caps described below were never
+> implemented and are not current configuration. See [`docs/NEXT.md`](../docs/NEXT.md).
+
 Status: primary authoring transport after removing the shared caps directory. This supersedes the
 earlier receive-only draft: the model no longer edits the server's draft through a shared filesystem.
 `scaffold_capability` publishes a real git repository containing the base project; the model clones

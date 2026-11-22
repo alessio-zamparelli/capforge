@@ -1,6 +1,6 @@
 # Next
 
-Known limitations and deliberately deferred work for capforge 0.4.0. The design and current
+Known limitations and deliberately deferred work for capforge 0.6.0. The design and current
 guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Open items
@@ -17,8 +17,15 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   add Bubblewrap/nsjail (see the comparison in `plans/`).
 - **Git tokens.** One token grants clone and push for 600 s. There is no read-only scope and no
   revocation UI; minting a new token and waiting out the TTL is the current lever.
-- **Repository growth.** Per-repo quota (`CAPFORGE_REPO_QUOTA_BYTES`) and a post-promotion
-  `git gc` exist, but there is no operator dashboard or automatic orphan-repo cleanup.
+- **Pipeline queue and cancellation.** A push is refused with `409` while a pipeline runs, and a
+  long `uv sync` cannot be cancelled from the console or MCP. Coalescing to the latest push and a
+  cooperative cancel that kills the process group are deferred.
+- **Scaffold/template versioning.** Capabilities are frozen at scaffold time. A future contract
+  change needs an upgrade path for `AGENTS.md`, `deploy.py` and `pyproject.toml`.
+- **Backup/export.** State plus `versions/` is the only copy of every tag. There is no operator
+  export/import or backup command.
+- **Repository growth.** There is no per-repository quota or automatic orphan-repo cleanup. A
+  post-promotion `git gc` exists.
 - **Legacy tags.** The pip/`packages` runtime was removed in 0.4.0. Tags promoted by older
   releases are refused with a migration error; operators must re-promote them with
   `pyproject.toml`/`uv.lock` (or restore the code into a clone and push). There is no automatic
@@ -34,8 +41,12 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   can read them at runtime. See `docs/ARCHITECTURE.md` §10.
 - **Shared data.** `DATA = "shared"` is unversioned and unsynchronized. Overlapping CLI calls and a
   served web child can race; the capability must use SQLite/locks. Backups are the operator's job.
-- **Logs.** One rotated generation per pipeline/scaffold; served child logs rotate at 5 MB. There
-  is no log shipping, history, or console log endpoint yet.
+- **Logs.** One rotated generation per pipeline/scaffold; served child logs rotate at 5 MB. The
+  console exposes bounded tails, but there is no log shipping or history.
+- **Console and capability origin.** `/ui`, `/api`, `/git` and `/cap` share the web listener. A
+  served web capability's JavaScript can call the console API with the operator's session; the
+  proxy strips cookies/headers, but same-origin isolation requires serving `/cap` on a different
+  origin at the reverse proxy. Splitting the built-in listeners is deliberately deferred.
 - **Console.** The React bundle is served under `/ui/` and uses relative `/api` calls. It is not
   covered by a browser test; route/asset behaviour is tested through ASGI.
 - **Multi-replica.** State, locks and repos assume one host and a local filesystem. A shared

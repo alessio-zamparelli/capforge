@@ -43,7 +43,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           # Keep in sync with the uv image tag in the Dockerfile.
-          version: "0.12.24"
+          version: "0.13.6"
           python-version: "3.14"
           # Cache the uv download cache and the managed Python 3.14 install.
           # Keying on uv.lock (not pyproject.toml) avoids invalidation on
@@ -51,16 +51,6 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
           cache-python: true
-
-      # Capability venvs are built with pip by the test suite, outside uv.
-      # Cache the wheels those installs download (pytest, six, ...).
-      - name: Cache pip downloads for capability venvs
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Sync environment from lockfile
         run: uv sync --locked
@@ -72,7 +62,30 @@ jobs:
         run: uv run --locked mypy capforge
 
       - name: Run test suite
-        run: uv run --locked pytest -q
+        run: uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=71
+
+      - name: MCP and web round-trip probe
+        env:
+          CAPFORGE_MCP_TOKEN: ci-probe-token
+          CAPFORGE_CAPS_DIR: ${{ runner.temp }}/capforge-probe/caps
+          CAPFORGE_STATE_DIR: ${{ runner.temp }}/capforge-probe/state
+          CAPFORGE_PORT: "18099"
+          CAPFORGE_WEB_PORT: "18080"
+          CAPFORGE_SANDBOX: warn
+          CAPFORGE_PUBLIC_URL: http://127.0.0.1:18080
+        run: |
+          mkdir -p "$CAPFORGE_CAPS_DIR" "$CAPFORGE_STATE_DIR"
+          uv run --locked capforge serve > "$RUNNER_TEMP/capforge-probe.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18080/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/readyz
+          CAPFORGE_URL=http://127.0.0.1:18099/mcp \
+          CAPFORGE_WEB_PROBE_URL=http://127.0.0.1:18080 \
+            uv run --locked python tools/mcp_probe.py
 
   # The console bundle is part of the image; a broken build must not publish.
   ui:

@@ -22,6 +22,8 @@ Constraints that drive the design; do not "fix" them casually:
 5. **Capability code is semi-trusted.** Landlock confines filesystem access; network/CPU/memory
    are not confined. Do not add the hub's own secrets to a capability environment; operator-set
    values are opt-in per capability via `Env` fields in `deploy.py` and `<state>/secrets/`.
+6. **HTTP MCP requires `CAPFORGE_MCP_TOKEN`.** `/cap` and `/api` share the web origin, so treat
+   served web capabilities as trusted or expose `/cap` on a different origin at the reverse proxy.
 
 ## Layout
 
@@ -32,7 +34,7 @@ capforge/
                     tests, web boot probe, stray sweep, Landlock policy
     sandbox.py      Landlock ruleset + exec wrapper
     versioning.py   snapshot, promote, prune, rollback, list_tags, diff
-    gitremote.py    bare repo init/config/hook, archive materialisation, refs, gc/quota
+    gitremote.py    bare repo init/config/hook, archive materialisation, refs, gc
     scaffold.py     uv base project, uv lock, initial commit, publish main
     staging.py      git tokens, staging state, bounded logs, async push pipeline
     contract.py     CONTRACT text and the scaffolded AGENTS template (strings only)
@@ -147,7 +149,7 @@ confined. Do not broaden the allowlist to make a test pass without documenting w
   `_contained` before touching disk. Never build a path from unsanitised model input.
 - Log runs/promotions at INFO with stable `key=value` fields. Never log tokens, `Authorization`,
   environment values or capability output bodies beyond the bounded log.
-- Keep `__version__` and `[project].version` equal (0.4.0).
+- Keep `__version__` and `[project].version` equal (0.6.0).
 - Capabilities stay deterministic when `data: version`; shared data relaxes that by design.
 - Use `track_child()` for every direct git/pytest/uv child so a concurrent stray sweep cannot kill
   it.
@@ -159,12 +161,12 @@ Requires Python 3.14 and uv (`.python-version` pins 3.14).
 ```sh
 uv sync
 uv run pytest -q -m "not slow"
-uv run pytest -q --cov=capforge --cov-branch --cov-fail-under=69
+uv run pytest -q --cov=capforge --cov-branch --cov-fail-under=71
 uv run pytest -q            # full suite, real uv/git/uvicorn
 uv run ruff check .
 uv run mypy capforge
 uv run capforge doctor
-uv run capforge serve
+CAPFORGE_MCP_TOKEN=dev-token uv run capforge serve
 uv run capforge tools
 uv run capforge promote NAME [--tag T] [--note N] [--force]
 uv run capforge test NAME
@@ -183,12 +185,12 @@ the pipeline, promotes, rolls back, tests data isolation/shared data and Landloc
 process-group kills and console routes. Do not mock subprocesses or uv; every test owns a temp
 caps/state. `-n auto` is safe because each test has its own dirs and the sweep is per-process.
 
-Coverage floor is 69% (measured full suite 70.39%); ratchet it upward, never add blanket
+Coverage floor is 71% (measured full suite 72.38%); ratchet it upward, never add blanket
 `# pragma: no cover`.
 
 ## Definition of done
 
-- `uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=69` passes.
+- `uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=71` passes.
 - `uv run --locked ruff check .` and `uv run --locked mypy capforge` pass.
 - `uv run --locked capforge tools` reports exactly ten tools.
 - `uv run --locked capforge doctor` is clean; reports uv, git, Landlock, paths.

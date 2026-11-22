@@ -39,13 +39,16 @@ cd ui && bun install --frozen-lockfile && bun run build   # optional console
 ## Run
 
 ```sh
-uv run capforge doctor                  # paths, uv, git, Landlock, fastmcp, web
+export CAPFORGE_MCP_TOKEN="$(openssl rand -hex 32)"
+uv run capforge doctor                  # paths, uv, git, Landlock, fastmcp, listeners
 uv run capforge serve                   # MCP :8099/mcp + web :8080
-uv run capforge serve --transport stdio # local MCP client (no web listener)
+uv run capforge serve --transport stdio # local MCP client (no web listener, no token)
 uv run capforge tools                   # ten tool schemas
 ```
 
-The web listener is required for clone/push: `CAPFORGE_WEB_PORT=0` disables `/git/`.
+HTTP MCP requires `CAPFORGE_MCP_TOKEN`; clients send `Authorization: Bearer <token>`. The web
+listener is required for clone/push and the console: `CAPFORGE_WEB_PORT=0` disables `/ui/`, `/api/`,
+`/git/` and `/cap/`.
 
 ## Environment
 
@@ -53,22 +56,21 @@ The web listener is required for clone/push: `CAPFORGE_WEB_PORT=0` disables `/gi
 |---|---|---|
 | `CAPFORGE_CAPS_DIR` | `~/.agents/skills` | server-owned drafts; not shared with the terminal |
 | `CAPFORGE_STATE_DIR` | `~/.capforge` | versions, venvs, data, git repos, staging, logs, locks |
-| `CAPFORGE_PUBLIC_URL` | derived | externally reachable base, including any proxy prefix |
 | `CAPFORGE_KEEP_TAGS` | `5` | tags kept; the active tag is never pruned |
 | `CAPFORGE_RUN_TIMEOUT` | `120` | seconds per `run_capability` |
 | `CAPFORGE_TEST_TIMEOUT` | `300` | seconds per pipeline test |
 | `CAPFORGE_INSTALL_TIMEOUT` | `240` | seconds per `uv lock`/`uv sync` |
 | `CAPFORGE_SERVE_BOOT_TIMEOUT` | `60` | web boot budget |
-| `CAPFORGE_GIT_TIMEOUT` | `300` | git CGI/pack transfer budget |
+| `CAPFORGE_GIT_TIMEOUT` | `300` | git CGI, pack transfer and `git archive` budget |
 | `CAPFORGE_SANDBOX` | `require` | Landlock `require` / `warn` / `off` |
 | `CAPFORGE_GIT_TOKEN_TTL` | `600` | clone/push token lifetime |
 | `CAPFORGE_MAX_UPLOAD_BYTES` | 64 MiB | push spool / `receive.maxInputSize` |
-| `CAPFORGE_REPO_QUOTA_BYTES` | 512 MiB | per-repository on-disk quota |
-| `CAPFORGE_MAX_PIPELINES` / `_PUSHES` / `_CLONES` | `2` / `4` / `4` | concurrency caps |
 | `CAPFORGE_LOG_MAX_BYTES` / `_TAIL_BYTES` | 1 MiB / 64 KiB | log rotation and MCP tail |
-| `CAPFORGE_WEB_HOST` / `_WEB_PORT` | `0.0.0.0` / `8080` | web listener; `0` disables all of `/ui`, `/api`, `/git`, `/cap` |
+| `CAPFORGE_WEB_HOST` / `_WEB_PORT` | `0.0.0.0` / `8080` | web listener; `0` disables `/ui`, `/api`, `/git` and `/cap` |
+| `CAPFORGE_PUBLIC_URL` | derived | externally reachable base, including any proxy prefix |
 | `CAPFORGE_WEB_TOKEN` | unset | console/control token; unset disables `/api` |
 | `CAPFORGE_WEB_UI` / `_UI_DIR` | `1` / `ui/dist` | console bundle or JSON index |
+| `CAPFORGE_MCP_TOKEN` | required | bearer token for HTTP MCP (`stdio` exempt) |
 | `CAPFORGE_HOST` / `_PORT` / `_PATH` | `0.0.0.0` / `8099` / `/mcp` | MCP transport |
 | `CAPFORGE_LOG_LEVEL` | `INFO` | server log verbosity |
 | `PUID` / `PGID` | `10001` | container user remap |
@@ -100,20 +102,38 @@ placeholder (`capforge-test-placeholder`, `0`, `0.0`, `false`). The console vali
 type before storing. Changing a value restarts a running web instance. Capability code can still
 read the values it is given at runtime; only store credentials you trust that capability to use.
 
+## MCP authentication
+
+HTTP MCP requires a bearer token:
+
+```sh
+export CAPFORGE_MCP_TOKEN="$(openssl rand -hex 32)"
+uv run capforge serve
+```
+
+Open WebUI's MCP server entry must send `Authorization: Bearer <token>`. `--transport stdio` is
+local and does not need a token. The token is never passed to capability children.
+
+`/ui`, `/api`, `/git` and `/cap` share the web listener. The proxy strips cookies, authorization
+headers and upstream `Set-Cookie`. If you serve untrusted web capabilities, put `/cap` on a
+different origin at the reverse proxy; see `docs/NEXT.md`.
+
 ## Docker
 
 ```sh
 mkdir -p caps state
-PUID=$(id -u) PGID=$(id -g) docker compose up --build
+CAPFORGE_MCP_TOKEN=$(openssl rand -hex 32) \
+  PUID=$(id -u) PGID=$(id -g) docker compose up --build
 ```
 
-`docker-compose.yml` publishes `:8099` and `:8080`, and mounts:
+`docker-compose.yml` publishes `:8099` (MCP) and `:8080` (web), and mounts:
 
 - `./caps` → `/var/lib/capforge/caps` (server-owned drafts/repos)
 - `./state` → `/var/lib/capforge/state` (versions, venvs, data, git, staging, logs, locks)
 
 There is no terminal mount. The entrypoint remaps the user, chowns the mounts and drops privileges.
-With `--user`/rootless Docker, pre-chown the mounts.
+With `--user`/rootless Docker, pre-chown the mounts. The image healthcheck probes
+`http://127.0.0.1:8080/readyz`; override it if you set `CAPFORGE_WEB_PORT=0`.
 
 ## The ten tools
 
@@ -216,7 +236,7 @@ promotion record; there is no separate caps-root audit repo.
 
 ```sh
 uv run --locked pytest -q -m "not slow"
-uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=69
+uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=71
 uv run --locked ruff check .
 uv run --locked mypy capforge
 ```

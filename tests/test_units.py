@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -429,6 +432,180 @@ def test_console_unknown_cap_is_404(tmp_path, monkeypatch):
             assert redirect.status_code == 307
 
     anyio.run(run)
+
+
+def test_health_routes_are_public_and_console_is_gated(tmp_path, monkeypatch):
+    import anyio
+
+    import capforge.web as web
+
+    monkeypatch.delenv("CAPFORGE_WEB_TOKEN", raising=False)
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+
+    async def run() -> None:
+        async with _console_client(web.asgi_app()) as client:
+            assert (await client.get("/healthz")).status_code == 200
+            assert (await client.get("/api/caps")).status_code == 403
+            assert (await client.get("/ui/")).status_code == 404
+            assert (await client.get("/cap/demo/")).status_code == 404
+            assert (await client.get("/git/demo.git/info/refs")).status_code == 403
+
+    anyio.run(run)
+
+
+def test_health_and_readiness(tmp_path, monkeypatch):
+    import anyio
+
+    import capforge.web as web
+
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    monkeypatch.setenv("CAPFORGE_SANDBOX", "off")
+    (tmp_path / "state").mkdir()
+    web._ready_cache = None
+
+    async def healthy() -> tuple[int, int, dict]:
+        async with _console_client(web.asgi_app()) as client:
+            health = await client.get("/healthz")
+            ready = await client.get("/readyz")
+            return health.status_code, ready.status_code, ready.json()
+
+    statuses = anyio.run(healthy)
+    assert statuses[0] == 200 and statuses[1] == 200
+    assert statuses[2]["checks"]["state_dir"] is True
+
+    # A missing runtime tool makes readiness fail; liveness stays green.
+    import capforge.web as web_module
+
+    monkeypatch.setattr(
+        web_module.shutil,
+        "which",
+        lambda name: None if name == "uv" else f"/usr/bin/{name}",
+    )
+    web_module._ready_cache = None
+
+    async def unhealthy() -> tuple[int, int]:
+        async with _console_client(web_module.asgi_app()) as client:
+            return (
+                (await client.get("/healthz")).status_code,
+                (await client.get("/readyz")).status_code,
+            )
+
+    assert anyio.run(unhealthy) == (200, 503)
+
+
+def test_mcp_token_verifier():
+    import anyio
+
+    from capforge.server import _McpTokenVerifier
+
+    verifier = _McpTokenVerifier("correct-token")
+
+    async def check() -> tuple[bool, bool, bool]:
+        good = await verifier.verify_token("correct-token")
+        bad = await verifier.verify_token("wrong-token")
+        empty = await verifier.verify_token("")
+        return good is not None, bad is None, empty is None
+
+    assert anyio.run(check) == (True, True, True)
+
+
+def test_git_timeout_is_configurable(monkeypatch):
+    monkeypatch.setenv("CAPFORGE_GIT_TIMEOUT", "42")
+    assert core.git_timeout() == 42
+    monkeypatch.setenv("CAPFORGE_GIT_TIMEOUT", "not-a-number")
+    assert core.git_timeout() == core.DEFAULT_GIT_TIMEOUT
+
+
+def test_backup_cleanup_and_sweep(tmp_path, monkeypatch):
+    import capforge.staging as staging
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "caps").mkdir()
+    backups = tmp_path / "caps" / ".staging" / "backups"
+    backups.mkdir(parents=True)
+    live = backups / "demo-20260101-000000"
+    stale = backups / "demo-20250101-000000"
+    other = backups / "other-20250101-000000"
+    for entry in (live, stale, other):
+        entry.mkdir()
+
+    staging.cleanup_backups("demo")
+    assert not live.exists() and not stale.exists() and other.exists()
+
+    old = time.time() - 2 * 24 * 3600
+    os.utime(other, (old, old))
+    assert staging.sweep_backups() == ["other-20250101-000000"]
+    assert not other.exists()
+
+
+def test_push_state_check_and_start_are_under_the_push_lock(tmp_path, monkeypatch):
+    """A second push must see the first pipeline's state before running its CGI."""
+    import anyio
+    import httpx
+
+    import capforge.web as web
+    from capforge import gitremote, staging
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    (tmp_path / "caps").mkdir()
+    (tmp_path / "state").mkdir()
+
+    calls = {"cgi": 0}
+    in_cgi = threading.Event()
+    release = threading.Event()
+
+    monkeypatch.setattr(
+        web,
+        "_git_auth",
+        lambda request, name: {
+            "actor": {"id": "tester"},
+            "auth_method": "basic",
+            "basic_username": "tester",
+        },
+    )
+
+    async def fake_body(request, limit):
+        return b"push"
+
+    monkeypatch.setattr(web, "_read_limited_body", fake_body)
+
+    def fake_cgi(name, service, request, body, actor):
+        calls["cgi"] += 1
+        in_cgi.set()
+        release.wait(timeout=5)
+        return web.Response("ok", status_code=200)
+
+    monkeypatch.setattr(web, "_run_cgi", fake_cgi)
+    shas = iter(["before", "after"])
+    monkeypatch.setattr(gitremote, "rev_parse", lambda name: next(shas, "after"))
+
+    def fake_start(name, sha, *args, **kwargs):
+        staging.write_state(name, {"name": name, "state": "received", "sha": sha})
+        return {"ok": True}
+
+    monkeypatch.setattr(staging, "start", fake_start)
+
+    async def run() -> list[int]:
+        transport = httpx.ASGITransport(app=web.asgi_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://probe") as client:
+
+            async def push():
+                return await client.post("/git/demo.git/git-receive-pack", content=b"push")
+
+            first = asyncio.create_task(push())
+            await asyncio.to_thread(in_cgi.wait, 5)
+            second = asyncio.create_task(push())
+            await asyncio.sleep(0.1)
+            release.set()
+            responses = await asyncio.gather(first, second)
+            return [response.status_code for response in responses]
+
+    assert anyio.run(run) == [200, 409]
+    assert calls["cgi"] == 1
 
 
 # ------------------------------------------------------------------ nothing survives a call
@@ -856,6 +1033,8 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     (state / "state" / f"{name}.json").write_text("{}", encoding="utf-8")
     (state / "staging").mkdir(parents=True)
     (state / "staging" / f"{name}.json").write_text("{}", encoding="utf-8")
+    backup = caps / ".staging" / "backups" / f"{name}-20260101-000000"
+    backup.mkdir(parents=True)
     staging.mint(name, {"id": "actor-1"})
 
     assert server.delete_capability(name, "wrong")["ok"] is False
@@ -866,6 +1045,7 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     assert not (state / "git" / f"{name}.git").exists()
     assert not (state / "state" / f"{name}.json").exists()
     assert not (state / "staging" / f"{name}.json").exists()
+    assert not backup.exists()
     assert all(
         value.get("name") != name
         for value in staging._read_tokens().values()

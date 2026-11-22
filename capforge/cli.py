@@ -46,11 +46,21 @@ def _doctor() -> int:
         else:
             token = web.web_token()
             console = "token-gated" if token else "disabled (no CAPFORGE_WEB_TOKEN)"
-            print(f"web        {web.web_host()}:{web_port} console={console}")
+            print(f"web        {web.web_host()}:{web_port} ui+api+git+cap console={console}")
             for name, record in sorted(web.read_registry().items()):
                 print(f"  served {name:24} tag={record.get('tag')} desired={record.get('desired')}")
     except Exception as exc:  # a broken web install must not crash doctor
         problems.append(f"web serving is not usable: {exc}")
+
+    from .core import mcp_token
+
+    transport = os.environ.get("CAPFORGE_TRANSPORT", "http").strip().lower() or "http"
+    if mcp_token():
+        print("mcp auth   bearer token configured")
+    else:
+        print("mcp auth   MISSING (CAPFORGE_MCP_TOKEN)")
+        if transport != "stdio":
+            problems.append("CAPFORGE_MCP_TOKEN is required for HTTP MCP transport")
 
     if not root.is_dir():
         problems.append(f"caps dir does not exist: {root} (create it, or set CAPFORGE_CAPS_DIR)")
@@ -123,30 +133,35 @@ def _serve(args: argparse.Namespace) -> int:
         server_module.RUNTIME_TRANSPORT = "stdio"
         server_module.mcp.run(transport=cast(Transport, "stdio"))
         return 0
-    from . import web
+    from . import core, web
 
+    if core.mcp_token() is None:
+        print(
+            "CAPFORGE_MCP_TOKEN is required for HTTP MCP transport; "
+            "set it to a long random string (for example: openssl rand -hex 32).",
+            file=sys.stderr,
+        )
+        return 2
     # Detached grandchildren of capability calls re-parent here, so the stray
     # sweep can find and kill them (nothing survives a call).
     set_subreaper()
-    web.restore()
+    if web.web_port() != 0:
+        web.restore()
+    from . import staging
+
+    staging.sweep_backups()
     server_module.RUNTIME_TRANSPORT = "http"
-    _run_two_listeners(server_module.mcp, web, host, port, path)
+    _run_listeners(server_module.mcp, web, host, port, path)
     return 0
 
 
-def _run_two_listeners(mcp: Any, web: Any, host: str, port: int, mcp_path: str) -> None:
-    """FastMCP on :8099/mcp, the web app on :8080, one process, one signal set.
+def _run_listeners(mcp: Any, web: Any, host: str, port: int, mcp_path: str) -> None:
+    """FastMCP on :8099/mcp and the web app on :8080, one process, one signal set.
 
     Both uvicorn servers have their own signal capture disabled; ours sets
     should_exit on both and kills served children, so nothing is orphaned."""
     import anyio
     import uvicorn
-
-    mcp_app = mcp.http_app(path=mcp_path, transport="http")
-    web_port = web.web_port()
-    web_app = web.asgi_app() if web_port != 0 else None
-    if web_app is None:
-        log.info("web listener disabled (CAPFORGE_WEB_PORT=0)")
 
     class _QuietServer(uvicorn.Server):
         # Signal handling is owned by this function, not by either server.
@@ -154,33 +169,43 @@ def _run_two_listeners(mcp: Any, web: Any, host: str, port: int, mcp_path: str) 
         def capture_signals(self):
             yield
 
-    mcp_server = _QuietServer(
-        uvicorn.Config(mcp_app, host=host, port=port, log_level=_uvicorn_log_level())
-    )
-    web_server = (
+    servers = [
         _QuietServer(
             uvicorn.Config(
-                web_app, host=web.web_host(), port=web_port, log_level=_uvicorn_log_level()
+                mcp.http_app(path=mcp_path, transport="http"),
+                host=host,
+                port=port,
+                log_level=_uvicorn_log_level(),
             )
         )
-        if web_app is not None
-        else None
-    )
+    ]
+    web_port = web.web_port()
+    if web_port == 0:
+        log.info("web listener disabled (CAPFORGE_WEB_PORT=0)")
+    else:
+        servers.append(
+            _QuietServer(
+                uvicorn.Config(
+                    web.asgi_app(),
+                    host=web.web_host(),
+                    port=web_port,
+                    log_level=_uvicorn_log_level(),
+                )
+            )
+        )
 
     async def _handle_signals() -> None:
         with anyio.open_signal_receiver(signal.SIGINT, signal.SIGTERM) as signals:
             async for _sig in signals:
-                mcp_server.should_exit = True
-                if web_server is not None:
-                    web_server.should_exit = True
+                for server in servers:
+                    server.should_exit = True
                 web.shutdown()
                 break
 
     async def _main() -> None:
         async with anyio.create_task_group() as group:
-            group.start_soon(mcp_server.serve)
-            if web_server is not None:
-                group.start_soon(web_server.serve)
+            for server in servers:
+                group.start_soon(server.serve)
             group.start_soon(_handle_signals)
 
     anyio.run(_main)
