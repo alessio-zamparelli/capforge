@@ -122,12 +122,29 @@ def test_scaffold_lists_generated_files(env):
     assert "entrypoint:" not in (Path(made["path"]) / "SKILL.md").read_text(encoding="utf-8")
     test_source = (Path(made["path"]) / "tests" / "test_scaffold.py").read_text(encoding="utf-8")
     assert "anyio" not in test_source
+    assert "from main import handle" in test_source
+    assert "import main as entrypoint" in test_source
+    assert "runpy.run_path" in test_source
+    assert "test_process_boundary" in test_source
 
     web = s.scaffold_capability("webscaffold", "web", kind="web")
     assert web["ok"]
     web_test = (Path(web["path"]) / "tests" / "test_scaffold.py").read_text(encoding="utf-8")
     assert "anyio" not in web_test
     assert "asyncio" in web_test
+
+
+def test_scaffold_tests_measure_main_entrypoint(env):
+    _, s = env
+    made = s.scaffold_capability("covered", "Reports main.py coverage.")
+    assert made["ok"], made
+    result = s.test_capability("covered")
+    assert result["ok"], result
+    stdout = result["tests"]["stdout"]
+    main_line = next(
+        line for line in stdout.splitlines() if line.strip().startswith("main.py")
+    )
+    assert "100%" in main_line, stdout
 
 
 def test_web_pipeline_log_contains_pytest_and_boot(env):

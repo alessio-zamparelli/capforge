@@ -162,7 +162,7 @@ confined. Do not broaden the allowlist to make a test pass without documenting w
   `_contained` before touching disk. Never build a path from unsanitised model input.
 - Log runs/promotions at INFO with stable `key=value` fields. Never log tokens, `Authorization`,
   environment values or capability output bodies beyond the bounded log.
-- Keep `__version__` and `[project].version` equal (0.7.0).
+- Keep `__version__` and `[project].version` equal (0.7.1).
 - Capabilities stay deterministic when `data: version`; `DATA = "shared"` and `SHARES` relax that by
   design and leave concurrency/backup to the capability and operator.
 - Use `track_child()` for every direct git/pytest/uv child so a concurrent stray sweep cannot kill

@@ -274,6 +274,12 @@ Il frontmatter di `SKILL.md` contiene solo `name` e `description`; i campi di de
 stdout**, exit 0. La diagnostica va su stderr. `{"error": "..."}` è un fallimento gestito. Un exit
 non zero, un timeout o un output non parsabile sono una chiamata fallita.
 
+pytest-cov vede solo il processo pytest, quindi un sottoprocesso `python main.py` risulta allo 0%.
+I test dello scaffold chiamano `handle()` direttamente ed eseguono l'entrypoint reale in-process
+con `runpy.run_path(..., run_name="__main__")`, mantenendo un test di sottoprocesso per il
+contratto stdin/stdout. Il codice a livello di modulo deve essere privo di effetti collaterali,
+perché viene eseguito di nuovo da `runpy`.
+
 I file runtime vanno solo sotto `CAPFORGE_DATA_DIR` (per versione). Imposta `DATA = "shared"` in
 `deploy.py` per una `CAPFORGE_SHARED_DATA_DIR` stabile tra i tag; non è versionata e la capability è
 responsabile di concorrenza, migrazioni e backup. Gli alberi di codice non sono scrivibili. Landlock

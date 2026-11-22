@@ -100,32 +100,69 @@ TEST = '''\
 
 from __future__ import annotations
 
+import io
 import json
+import runpy
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+import main as entrypoint
+from main import handle
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(payload: dict) -> dict:
+def test_happy_path() -> None:
+    assert handle({{"text": "hello"}})["length"] == 5
+
+
+def test_rejects_bad_input() -> None:
+    assert "error" in handle({{"text": 42}})
+
+
+def test_main_rejects_invalid_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{{"))
+    assert entrypoint.main() == 2
+    assert "stdin must be a JSON object" in capsys.readouterr().err
+
+
+def test_main_rejects_non_object(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("[]"))
+    assert entrypoint.main() == 2
+    assert "stdin must be a JSON object" in capsys.readouterr().err
+
+
+def test_main_reports_handler_crash(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(entrypoint, "handle", lambda args: 1 / 0)
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{{"text": "hello"}}'))
+    assert entrypoint.main() == 1
+    assert "unhandled error: ZeroDivisionError" in capsys.readouterr().err
+
+
+def test_real_entrypoint_under_coverage(monkeypatch, capsys) -> None:
+    # runpy executes the real file, including the __main__ guard, in this process,
+    # so pytest-cov can measure main.py instead of a fresh, untraced interpreter.
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{{"text": "hello"}}'))
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
+    assert exc.value.code == 0
+    assert json.loads(capsys.readouterr().out)["length"] == 5
+
+
+def test_process_boundary() -> None:
+    # Separate process: proves stdin/stdout/exit-code behaviour, but is not traced.
     proc = subprocess.run(
         [sys.executable, str(ROOT / "main.py")],
-        input=json.dumps(payload),
+        input=json.dumps({{"text": "hello"}}),
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
-    return json.loads(proc.stdout.strip().splitlines()[-1])
-
-
-def test_happy_path() -> None:
-    assert run({{"text": "hello"}})["length"] == 5
-
-
-def test_rejects_bad_input() -> None:
-    assert "error" in run({{"text": 42}})
+    assert json.loads(proc.stdout.strip().splitlines()[-1])["length"] == 5
 '''
 
 APP = '''\

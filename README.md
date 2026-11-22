@@ -267,6 +267,11 @@ SHARES = {              # operator-approved cross-capability folders
 stdout**, exit 0. Diagnostics go to stderr. `{"error": "..."}` is a handled failure. A non-zero
 exit, timeout or unparseable output is a failed call.
 
+pytest-cov only sees the pytest process, so a raw `python main.py` subprocess reports 0% coverage.
+The scaffold tests `handle()` directly and executes the real entrypoint in-process with
+`runpy.run_path(..., run_name="__main__")`, then keeps one subprocess test for the stdin/stdout
+contract. Keep `main.py` module-level code side-effect free because it runs again under `runpy`.
+
 Runtime files go only under `CAPFORGE_DATA_DIR` (per version). Set `DATA = "shared"` in `deploy.py`
 for a stable `CAPFORGE_SHARED_DATA_DIR` across tags; it is unversioned, and the capability owns
 concurrency, migrations and backup. Code trees are not writable. Landlock denies state, tokens,

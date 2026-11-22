@@ -1,6 +1,6 @@
 # Architecture
 
-Status: describes capforge **0.7.0**, the git-authored architecture. If code and this document
+Status: describes capforge **0.7.1**, the git-authored architecture. If code and this document
 disagree, the code wins; update this file in the same change.
 
 Related: [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),

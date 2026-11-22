@@ -1,6 +1,6 @@
 # Next
 
-Known limitations and deliberately deferred work for capforge 0.7.0. The design and current
+Known limitations and deliberately deferred work for capforge 0.7.1. The design and current
 guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Open items
@@ -46,6 +46,9 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - **Shared-folder approvals.** Grants are per capability and survive promotions. There is no
   approval history beyond the stored timestamp, no expiry, and no read-only token scope. Revoking
   a grant restarts a desired-running web child but does not kill an in-flight CLI run.
+- **Coverage of child processes.** The CLI scaffold covers `main.py` by importing `handle()` and
+  executing the real entrypoint in-process with `runpy`; arbitrary subprocesses or threads spawned
+  by capability tests still need coverage process-startup instrumentation to be measured.
 - **Logs.** One rotated generation per pipeline/scaffold; served child logs rotate at 5 MB. The
   console exposes bounded tails, but there is no log shipping or history.
 - **Console and capability origin.** `/ui`, `/api`, `/git` and `/cap` share the web listener. A
