@@ -1,9 +1,27 @@
-# capforge
+<p align="center">
+  <a href="README.md">English</a> · <a href="README_it.md">Italiano</a>
+</p>
 
-Deterministic, versioned capabilities exposed over MCP, for Open WebUI + Open Terminal.
+<h1 align="center">capforge</h1>
 
-Design and internals: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Known limitations:
-[`docs/NEXT.md`](docs/NEXT.md).
+<p align="center">
+  <em>Deterministic, versioned capabilities exposed over MCP, for Open WebUI + Open Terminal.</em>
+</p>
+
+<p align="center">
+  <img alt="Python 3.14" src="https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white">
+  <img alt="MCP tools: 10" src="https://img.shields.io/badge/MCP%20tools-10-6f42c1">
+  <img alt="Built with uv" src="https://img.shields.io/badge/built%20with-uv-DE5FE9">
+  <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-green">
+</p>
+
+<p align="center">
+  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="docs/NEXT.md">Known limitations</a> ·
+  <a href="#publish-flow">Publish flow</a>
+</p>
+
+---
 
 The model scaffolds a capability as a **uv project**, publishes it as a git repository, clones it
 into its own workspace, edits, and pushes. Capforge tests the pushed tree in a state-owned uv
@@ -13,6 +31,27 @@ There is no shared filesystem between the terminal and the server.
 A capability with `KIND = "web"` in `deploy.py` is a long-lived ASGI service. It is
 reverse-proxied at `http://<host>:8080/cap/<name>/`; the console is `/ui/`, the control API is
 `/api/`, and the git smart-HTTP ingress is `/git/<name>.git`.
+
+> [!NOTE]
+> Capabilities are authored through git. The server owns drafts, versions, venvs and state; the
+> model only sees its clone (or `get_capability`).
+
+## Contents
+
+- [Publish flow](#publish-flow)
+- [Shape](#shape)
+- [Install](#install)
+- [Run](#run)
+- [Environment](#environment)
+- [Capability environment](#capability-environment)
+- [MCP authentication](#mcp-authentication)
+- [Docker](#docker)
+- [The ten tools](#the-ten-tools)
+- [Capability contract](#capability-contract)
+- [Git authentication](#git-authentication)
+- [Web capabilities](#web-capabilities)
+- [Storage](#storage)
+- [Tests](#tests)
 
 ## Publish flow
 
@@ -74,15 +113,16 @@ cd ui && bun install --frozen-lockfile && bun run build   # optional console
 
 ```sh
 export CAPFORGE_MCP_TOKEN="$(openssl rand -hex 32)"
-uv run capforge doctor                  # paths, uv, git, Landlock, fastmcp, listeners
-uv run capforge serve                   # MCP :8099/mcp + web :8080
-uv run capforge serve --transport stdio # local MCP client (no web listener, no token)
-uv run capforge tools                   # ten tool schemas
+uv run capforge doctor                   # paths, uv, git, Landlock, fastmcp, listeners
+uv run capforge serve                    # MCP :8099/mcp + web :8080
+uv run capforge serve --transport stdio  # local MCP client (no web listener, no token)
+uv run capforge tools                    # ten tool schemas
 ```
 
-HTTP MCP requires `CAPFORGE_MCP_TOKEN`; clients send `Authorization: Bearer <token>`. The web
-listener is required for clone/push and the console: `CAPFORGE_WEB_PORT=0` disables `/ui/`, `/api/`,
-`/git/` and `/cap/`.
+> [!IMPORTANT]
+> HTTP MCP requires `CAPFORGE_MCP_TOKEN`; clients send `Authorization: Bearer <token>`. The web
+> listener is required for clone/push and the console: `CAPFORGE_WEB_PORT=0` disables `/ui/`,
+> `/api/`, `/git/` and `/cap/`.
 
 ## Environment
 
@@ -135,6 +175,10 @@ declared default, and pipeline tests and the web boot probe receive the default 
 placeholder (`capforge-test-placeholder`, `0`, `0.0`, `false`). The console validates the declared
 type before storing. Changing a value restarts a running web instance. Capability code can still
 read the values it is given at runtime; only store credentials you trust that capability to use.
+
+> [!WARNING]
+> Values are available to the capability at runtime. Treat the `Env` model as a trust boundary
+> around operator-provided secrets, not as a sandbox around model-authored code.
 
 ## MCP authentication
 
