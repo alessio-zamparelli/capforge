@@ -59,6 +59,10 @@ export interface EnvInfo {
   declared: boolean;
   configured: boolean;
   updated_at: number;
+  type: "str" | "int" | "float" | "bool";
+  required: boolean;
+  default: string | null;
+  description: string;
 }
 
 export interface EnvChange {

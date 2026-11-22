@@ -53,6 +53,33 @@ def test_parse_skill_md_without_frontmatter():
     assert body == "hello"
 
 
+def _skill(path, description: str = "d") -> None:
+    (path / "SKILL.md").write_text(
+        f"---\ndescription: {description}\n---\n", encoding="utf-8"
+    )
+
+
+def _deploy(
+    path,
+    *,
+    kind: str = "cli",
+    entrypoint: str = "main.py",
+    app: str | None = None,
+    data: str = "version",
+    env: str = "",
+) -> None:
+    lines = ["from pydantic import BaseModel", "", "", "class Env(BaseModel):"]
+    if env:
+        lines.extend(f"    {line}" for line in env.strip().splitlines())
+    else:
+        lines.append("    pass")
+    lines.extend(["", "", f'KIND = "{kind}"', f'ENTRYPOINT = "{entrypoint}"'])
+    if app is not None:
+        lines.append(f'APP = "{app}"')
+    lines.append(f'DATA = "{data}"')
+    (path / "deploy.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def test_kind_parsing_and_validation(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()
@@ -61,19 +88,14 @@ def test_kind_parsing_and_validation(tmp_path):
         '[project]\nname="demo"\nversion="0.1.0"\nrequires-python=">=3.14,<3.15"\ndependencies=["uvicorn"]\n',
         encoding="utf-8",
     )
-    (cap / "SKILL.md").write_text(
-        "---\ndescription: d\nkind: web\nentrypoint: app.py\n---\n",
-        encoding="utf-8",
-    )
+    _skill(cap)
+    _deploy(cap, kind="web", entrypoint="app.py")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.kind == "web"
     assert loaded.app_name == "app"
     assert loaded.error is None
 
-    (cap / "SKILL.md").write_text(
-        "---\ndescription: d\nkind: worker\nentrypoint: app.py\n---\n",
-        encoding="utf-8",
-    )
+    _deploy(cap, kind="worker", entrypoint="app.py")
     assert "kind must be one of" in core.load_capability_at("demo", cap).error
 
 
@@ -81,10 +103,8 @@ def test_web_requires_uvicorn(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()
     (cap / "app.py").write_text("app = None\n", encoding="utf-8")
-    (cap / "SKILL.md").write_text(
-        "---\ndescription: d\nkind: web\nentrypoint: app.py\n---\n",
-        encoding="utf-8",
-    )
+    _skill(cap)
+    _deploy(cap, kind="web", entrypoint="app.py")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "uvicorn" in loaded.error
@@ -98,13 +118,83 @@ def test_web_rejects_non_identifier_app(tmp_path):
         '[project]\nname="demo"\nversion="0.1.0"\nrequires-python=">=3.14,<3.15"\ndependencies=["uvicorn"]\n',
         encoding="utf-8",
     )
+    _skill(cap)
+    _deploy(cap, kind="web", entrypoint="app.py", app="bad name")
+    loaded = core.load_capability_at("demo", cap)
+    assert loaded.error is not None
+    assert "identifier" in loaded.error
+
+
+def test_deploy_py_is_required(tmp_path):
+    cap = tmp_path / "demo"
+    cap.mkdir()
+    (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
+    _skill(cap)
+    loaded = core.load_capability_at("demo", cap)
+    assert loaded.error is not None
+    assert "deploy.py is missing" in loaded.error
+
+
+def test_legacy_frontmatter_is_refused(tmp_path):
+    cap = tmp_path / "demo"
+    cap.mkdir()
+    (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
     (cap / "SKILL.md").write_text(
-        "---\ndescription: d\nkind: web\nentrypoint: app.py\napp: 'bad name'\n---\n",
+        "---\ndescription: d\nentrypoint: main.py\nenv: [API_KEY]\n---\n",
         encoding="utf-8",
     )
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
-    assert "identifier" in loaded.error
+    assert "move entrypoint, env from SKILL.md to deploy.py" in loaded.error
+
+
+def test_deploy_py_parses_typed_env_fields():
+    spec = core.parse_deploy_py(
+        "from pydantic import BaseModel, Field\n\n"
+        "class Env(BaseModel):\n"
+        "    API_KEY: str = Field(min_length=3, max_length=40, description='key')\n"
+        "    TIMEOUT: int = 30\n"
+        "    DEBUG: bool = False\n"
+        "    RATIO: float = 0.5\n"
+        "    OPTIONAL: str | None = None\n"
+        "    RAW: bytes\n\n"
+        'KIND = "cli"\n'
+        'ENTRYPOINT = "main.py"\n'
+    )
+    by_name = {item.name: item for item in spec.env}
+    assert by_name["API_KEY"].type == "str"
+    assert by_name["API_KEY"].required is True
+    assert by_name["API_KEY"].min_length == 3
+    assert by_name["API_KEY"].max_length == 40
+    assert by_name["API_KEY"].description == "key"
+    assert by_name["TIMEOUT"].type == "int"
+    assert by_name["TIMEOUT"].default == "30"
+    assert by_name["TIMEOUT"].required is False
+    assert by_name["DEBUG"].default == "false"
+    assert by_name["RATIO"].default == "0.5"
+    assert by_name["OPTIONAL"].required is False
+    assert by_name["RAW"].type == "str"
+
+
+def test_deploy_py_rejects_bad_input():
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py("KIND = os.environ['KIND']\nENTRYPOINT = 'main.py'\n")
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py("def broken(:\n")
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py('ENTRYPOINT = "main.py"\n')
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py('KIND = "cli"\n')
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py('KIND = "cli"\nENTRYPOINT = "main.py"\nDATA = "forever"\n')
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py(
+            'KIND = "cli"\nENTRYPOINT = "main.py"\nclass Env:\n    PATH: str\n'
+        )
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py(
+            'KIND = "cli"\nENTRYPOINT = "main.py"\nclass Env:\n    KEY: str\n    KEY: int\n'
+        )
 
 
 def test_execute_refuses_web_capabilities(tmp_path, monkeypatch):
@@ -258,12 +348,14 @@ def test_console_env_api_is_write_only(tmp_path, monkeypatch):
 
             listed = await client.get("/api/caps/demo/env", headers=headers)
             assert listed.status_code == 200
-            assert listed.json()["env"][0] == {
-                "name": "API_KEY",
-                "declared": True,
-                "configured": False,
-                "updated_at": 0,
-            }
+            item = listed.json()["env"][0]
+            assert item["name"] == "API_KEY"
+            assert item["declared"] is True
+            assert item["configured"] is False
+            assert item["updated_at"] == 0
+            assert item["type"] == "str"
+            assert item["required"] is True
+            assert item["default"] is None
 
             # Writes need the CSRF header.
             missing_csrf = await client.post(
@@ -392,9 +484,8 @@ def test_entrypoint_cannot_escape_the_capability(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()
     (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
-    (cap / "SKILL.md").write_text(
-        "---\ndescription: d\nentrypoint: ../escape.py\n---\n", encoding="utf-8"
-    )
+    _skill(cap)
+    _deploy(cap, entrypoint="../escape.py")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "escapes" in loaded.error
@@ -403,9 +494,8 @@ def test_entrypoint_cannot_escape_the_capability(tmp_path):
 def test_absolute_entrypoint_is_rejected(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()
-    (cap / "SKILL.md").write_text(
-        "---\ndescription: d\nentrypoint: /etc/passwd\n---\n", encoding="utf-8"
-    )
+    _skill(cap)
+    _deploy(cap, entrypoint="/etc/passwd")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "escapes" in loaded.error
@@ -446,13 +536,16 @@ def test_data_dir_create_flag(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- capability env
 
 
-def _env_cap(root, name: str = "demo", env: str = "[API_KEY, SMTP_PASSWORD]"):
+def _env_cap(
+    root,
+    name: str = "demo",
+    fields: str = "API_KEY: str\nSMTP_PASSWORD: str",
+):
     cap = root / name
     cap.mkdir(parents=True)
     (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
-    (cap / "SKILL.md").write_text(
-        f"---\ndescription: d\nentrypoint: main.py\nenv: {env}\n---\n", encoding="utf-8"
-    )
+    _skill(cap)
+    _deploy(cap, env=fields)
     return core.load_capability_at(name, cap)
 
 
@@ -461,14 +554,11 @@ def test_env_declarations_are_parsed_and_validated(tmp_path):
     assert cap.error is None
     assert cap.env == ["API_KEY", "SMTP_PASSWORD"]
 
-    single = _env_cap(tmp_path, "single", "API_KEY")
+    single = _env_cap(tmp_path, "single", "API_KEY: str")
     assert single.env == ["API_KEY"]
 
-    reserved = _env_cap(tmp_path, "reserved", "[PATH]")
+    reserved = _env_cap(tmp_path, "reserved", "PATH: str")
     assert reserved.error is not None and "reserved" in reserved.error
-
-    invalid = _env_cap(tmp_path, "invalid", "[NOT VALID]")
-    assert invalid.error is not None and "Invalid environment" in invalid.error
 
 
 def test_env_store_is_private_and_shared_across_tags(tmp_path, monkeypatch):
@@ -476,10 +566,12 @@ def test_env_store_is_private_and_shared_across_tags(tmp_path, monkeypatch):
     cap = _env_cap(tmp_path / "caps")
 
     status = core.env_status("demo", [cap])
-    assert status == [
-        {"name": "API_KEY", "declared": True, "configured": False, "updated_at": 0},
-        {"name": "SMTP_PASSWORD", "declared": True, "configured": False, "updated_at": 0},
-    ]
+    assert [item["name"] for item in status] == ["API_KEY", "SMTP_PASSWORD"]
+    assert all(item["declared"] and not item["configured"] for item in status)
+    assert status[0]["type"] == "str"
+    assert status[0]["required"] is True
+    assert status[0]["default"] is None
+    assert status[0]["description"] == ""
 
     saved = core.set_cap_env("demo", "API_KEY", "sekrit-value")
     assert saved["configured"] is True
@@ -499,6 +591,7 @@ def test_env_store_is_private_and_shared_across_tags(tmp_path, monkeypatch):
 
 
 def test_env_values_are_injected_only_for_active_tags(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
     monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
     cap = _env_cap(tmp_path / "caps")
 
@@ -517,7 +610,61 @@ def test_env_values_are_injected_only_for_active_tags(tmp_path, monkeypatch):
     assert active_env == {"API_KEY": "sekrit-value", "SMTP_PASSWORD": "smtp-secret"}
 
 
+def test_typed_env_values_are_validated_and_defaults_injected(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    cap = _env_cap(
+        tmp_path / "caps",
+        "typed",
+        "API_KEY: str = Field(min_length=2, max_length=4)\n"
+        "TIMEOUT: int = 30\n"
+        "DEBUG: bool\n"
+        "RATIO: float\n"
+        "LEVEL: int = Field(default=2, ge=1, le=3)",
+    )
+    assert cap.error is None
+    assert core.cap_env_missing("typed", cap) == ["API_KEY", "DEBUG", "RATIO"]
+    assert core.cap_env_placeholders(cap) == {
+        "API_KEY": core.ENV_PLACEHOLDER,
+        "TIMEOUT": "30",
+        "DEBUG": "false",
+        "RATIO": "0.0",
+        "LEVEL": "2",
+    }
+
+    core.set_cap_env("typed", "API_KEY", "abcd")
+    core.set_cap_env("typed", "DEBUG", "yes")
+    core.set_cap_env("typed", "RATIO", "1.5")
+    assert core.cap_env_values("typed", cap) == {
+        "API_KEY": "abcd",
+        "TIMEOUT": "30",
+        "DEBUG": "true",
+        "RATIO": "1.5",
+        "LEVEL": "2",
+    }
+    for key, value in (
+        ("TIMEOUT", "soon"),
+        ("DEBUG", "maybe"),
+        ("API_KEY", "a"),
+        ("API_KEY", "abcde"),
+        ("LEVEL", "0"),
+        ("LEVEL", "4"),
+    ):
+        with pytest.raises(core.CapError):
+            core.set_cap_env("typed", key, value)
+
+
+def test_agents_example_matches_the_scaffold_template():
+    from pathlib import Path
+
+    from capforge import contract
+
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "AGENTS.md.example").read_text(encoding="utf-8") == contract.AGENTS_TEMPLATE
+
+
 def test_env_rejects_reserved_names_and_oversize_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
     monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
     _env_cap(tmp_path / "caps")
     for name in ("PATH", "HOME", "CAPFORGE_DATA_DIR", "PYTHONPATH", "LD_PRELOAD", "UV_INDEX"):

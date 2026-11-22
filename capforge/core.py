@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import ctypes
 import fcntl
 import hashlib
@@ -88,6 +89,8 @@ MAX_ENV_VALUE_BYTES = 16 * 1024
 # obvious placeholder so imports/settings objects still work without leaking secrets
 # into model-visible pipeline logs.
 ENV_PLACEHOLDER = "capforge-test-placeholder"
+# Type-aware placeholders keep a typed pydantic Env model usable in tests/drafts.
+ENV_PLACEHOLDERS = {"int": "0", "float": "0.0", "bool": "false"}
 
 # Keep in sync with versioning.SKIP.
 SKIP_PARTS = frozenset(
@@ -263,6 +266,208 @@ def parse_skill_md(text: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
+# ------------------------------------------------------------- deploy.py descriptor
+
+_DEPLOY_SCALARS = frozenset({"KIND", "ENTRYPOINT", "APP", "DATA"})
+_ENV_ANNOTATIONS = {
+    "str": "str",
+    "SecretStr": "str",
+    "HttpUrl": "str",
+    "AnyUrl": "str",
+    "EmailStr": "str",
+    "FilePath": "str",
+    "DirectoryPath": "str",
+    "int": "int",
+    "float": "float",
+    "bool": "bool",
+}
+_ENV_TYPES = frozenset({"str", "int", "float", "bool"})
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class EnvSpec:
+    """One field of the pydantic Env model in deploy.py, parsed statically."""
+
+    name: str
+    type: str = "str"
+    required: bool = True
+    default: str | None = None
+    description: str = ""
+    min_length: int | None = None
+    max_length: int | None = None
+    ge: float | None = None
+    le: float | None = None
+
+
+@dataclass
+class DeploySpec:
+    """The deployment descriptor read from deploy.py."""
+
+    kind: str = "cli"
+    entrypoint: str = "main.py"
+    app_name: str = "app"
+    data: str = "version"
+    env: list[EnvSpec] = field(default_factory=list)
+
+
+def _node_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _annotation_type(node: ast.expr) -> str | None:
+    """Map an annotation to str/int/float/bool; None means "skip this field"."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            node = ast.parse(node.value, mode="eval").body
+        except SyntaxError:
+            return "str"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        if isinstance(node.right, ast.Constant) and node.right.value is None:
+            return _annotation_type(node.left)
+        if isinstance(node.left, ast.Constant) and node.left.value is None:
+            return _annotation_type(node.right)
+        return "str"
+    if isinstance(node, ast.Subscript):
+        base = _node_name(node.value)
+        args = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if base == "Annotated":
+            return _annotation_type(args[0]) if args else "str"
+        if base == "Optional":
+            return _annotation_type(args[0]) if args else "str"
+        if base == "Union":
+            values = [arg for arg in args if not (isinstance(arg, ast.Constant) and arg.value is None)]
+            return _annotation_type(values[0]) if len(values) == 1 else "str"
+        if base == "ClassVar":
+            return None
+    return _ENV_ANNOTATIONS.get(_node_name(node), "str")
+
+
+def _literal_value(node: ast.AST, label: str) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError):
+        raise CapError(f"deploy.py: {label} must be a literal value") from None
+
+
+def _field_value(value: ast.expr | None) -> tuple[bool, Any, dict[str, Any]]:
+    """Return (has_default, default, Field kwargs) for one Env annotation."""
+    if value is None:
+        return False, None, {}
+    if isinstance(value, ast.Constant):
+        return True, value.value, {}
+    if isinstance(value, ast.Call) and _node_name(value.func) == "Field":
+        kwargs: dict[str, Any] = {}
+        for keyword in value.keywords:
+            if keyword.arg is None:
+                continue
+            try:
+                kwargs[keyword.arg] = ast.literal_eval(keyword.value)
+            except (ValueError, SyntaxError):
+                continue
+        default: Any = _MISSING
+        if value.args:
+            try:
+                default = ast.literal_eval(value.args[0])
+            except (ValueError, SyntaxError):
+                default = _MISSING
+        if "default" in kwargs:
+            default = kwargs["default"]
+        return default is not _MISSING, (None if default is _MISSING else default), kwargs
+    raise CapError("deploy.py: Env defaults must be literals or Field(...)")
+
+
+def _default_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    raise CapError("deploy.py: Env defaults must be scalar values")
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _float_or_none(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def parse_deploy_py(text: str) -> DeploySpec:
+    """Parse deploy.py with `ast`; never import capability code into the hub."""
+    try:
+        tree = ast.parse(text, filename="deploy.py")
+    except SyntaxError as exc:
+        raise CapError(f"deploy.py line {exc.lineno}: {exc.msg}") from None
+    values: dict[str, Any] = {}
+    env_node: ast.ClassDef | None = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+                if target in _DEPLOY_SCALARS:
+                    values[target] = _literal_value(node.value, target)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name) and node.target.id in _DEPLOY_SCALARS:
+                values[node.target.id] = _literal_value(node.value, node.target.id)
+        elif isinstance(node, ast.ClassDef) and node.name == "Env":
+            env_node = node
+    if "KIND" not in values:
+        raise CapError('deploy.py must define KIND = "cli" or KIND = "web"')
+    kind = str(values["KIND"]).strip().lower()
+    if kind not in WEB_KINDS:
+        raise CapError(f"kind must be one of {list(WEB_KINDS)}, got {kind!r}")
+    if "ENTRYPOINT" not in values:
+        raise CapError('deploy.py must define ENTRYPOINT (for example "main.py")')
+    entrypoint = str(values["ENTRYPOINT"]).strip()
+    if not entrypoint:
+        raise CapError("deploy.py: ENTRYPOINT must not be empty")
+    app_name = str(values.get("APP") or "app").strip() or "app"
+    data = str(values.get("DATA") or "version").strip().lower() or "version"
+    if data not in DATA_KINDS:
+        raise CapError(f"data must be one of {list(DATA_KINDS)}, got {data!r}")
+    specs: list[EnvSpec] = []
+    if env_node is not None:
+        seen: set[str] = set()
+        for stmt in env_node.body:
+            if not isinstance(stmt, ast.AnnAssign) or not isinstance(stmt.target, ast.Name):
+                continue
+            field = stmt.target.id
+            if field.startswith("_") or field == "model_config":
+                continue
+            type_name = _annotation_type(stmt.annotation)
+            if type_name is None:
+                continue
+            name = valid_env_name(field)
+            if name in seen:
+                raise CapError(f"deploy.py: duplicate Env field {name!r}")
+            seen.add(name)
+            has_default, default_value, field_args = _field_value(stmt.value)
+            description = field_args.get("description")
+            specs.append(
+                EnvSpec(
+                    name=name,
+                    type=type_name if type_name in _ENV_TYPES else "str",
+                    required=not has_default,
+                    default=_default_text(default_value) if has_default else None,
+                    description=description if isinstance(description, str) else "",
+                    min_length=_int_or_none(field_args.get("min_length")),
+                    max_length=_int_or_none(field_args.get("max_length")),
+                    ge=_float_or_none(field_args.get("ge")),
+                    le=_float_or_none(field_args.get("le")),
+                )
+            )
+    if len(specs) > MAX_ENV_VARS:
+        raise CapError(f"env declares {len(specs)} variables; the limit is {MAX_ENV_VARS}.")
+    return DeploySpec(kind=kind, entrypoint=entrypoint, app_name=app_name, data=data, env=specs)
+
+
 # ------------------------------------------------------------------------- manifests
 
 
@@ -277,6 +482,7 @@ class Capability:
     data: str = "version"
     app_name: str = "app"
     env: list[str] = field(default_factory=list)
+    env_specs: list[EnvSpec] = field(default_factory=list)
     body: str = ""
     error: str | None = None
 
@@ -318,22 +524,7 @@ def valid_env_name(name: str) -> str:
     return text
 
 
-def _env_declarations(meta: dict[str, Any]) -> list[str]:
-    """Normalise `env:` frontmatter (inline list, block list or single value)."""
-    raw = meta.get("env")
-    if raw is None:
-        return []
-    values = raw if isinstance(raw, list) else [raw]
-    names: list[str] = []
-    for value in values:
-        if not str(value).strip():
-            continue
-        name = valid_env_name(value)
-        if name not in names:
-            names.append(name)
-    if len(names) > MAX_ENV_VARS:
-        raise CapError(f"env declares {len(names)} variables; the limit is {MAX_ENV_VARS}.")
-    return names
+_LEGACY_FRONTMATTER = ("kind", "entrypoint", "app", "data", "env")
 
 
 def _load_from(name: str, path: Path) -> Capability:
@@ -345,7 +536,6 @@ def _load_from(name: str, path: Path) -> Capability:
         return cap
     meta, body = parse_skill_md(skill.read_text(encoding="utf-8", errors="replace"))
     cap.description = str(meta.get("description") or "").strip()
-    raw_entry = str(meta.get("entrypoint") or "main.py").strip() or "main.py"
     cap.body = body
     if not cap.description:
         cap.error = "SKILL.md frontmatter has no description"
@@ -353,33 +543,40 @@ def _load_from(name: str, path: Path) -> Capability:
     if meta.get("packages"):
         cap.error = "packages is no longer supported; declare dependencies in pyproject.toml"
         return cap
-    cap.kind = str(meta.get("kind") or "cli").strip().lower() or "cli"
-    if cap.kind not in WEB_KINDS:
-        cap.error = f"kind must be one of {list(WEB_KINDS)}, got {cap.kind!r}"
+    legacy = [key for key in _LEGACY_FRONTMATTER if meta.get(key)]
+    if legacy:
+        cap.error = (
+            f"move {', '.join(legacy)} from SKILL.md to deploy.py; deploy.py now declares "
+            "the app kind, entrypoint, data mode and environment"
+        )
         return cap
-    cap.data = str(meta.get("data") or "version").strip().lower() or "version"
-    if cap.data not in DATA_KINDS:
-        cap.error = f"data must be one of {list(DATA_KINDS)}, got {cap.data!r}"
+    deploy = path / "deploy.py"
+    if not deploy.is_file():
+        cap.error = "deploy.py is missing; it declares KIND, ENTRYPOINT, DATA and Env"
         return cap
     try:
-        cap.env = _env_declarations(meta)
+        spec = parse_deploy_py(deploy.read_text(encoding="utf-8", errors="replace"))
     except CapError as exc:
         cap.error = str(exc)
         return cap
+    cap.kind = spec.kind
+    cap.data = spec.data
+    cap.app_name = spec.app_name
+    cap.env_specs = spec.env
+    cap.env = [item.name for item in spec.env]
     if cap.kind == "web":
         deps = _dependency_names(path)
         if "uvicorn" not in deps:
             cap.error = "kind: web requires 'uvicorn' in [project].dependencies"
             return cap
-    cap.app_name = str(meta.get("app") or "app").strip() or "app"
     if cap.kind == "web" and not APP_NAME_RE.match(cap.app_name):
         cap.error = f"app must be a Python identifier, got {cap.app_name!r}"
         return cap
     try:
-        entry = _contained(path, path / raw_entry)
+        entry = _contained(path, path / spec.entrypoint)
         cap.entrypoint = entry.relative_to(path).as_posix()
     except (CapError, ValueError):
-        cap.error = f"entrypoint {raw_entry!r} escapes the capability folder"
+        cap.error = f"entrypoint {spec.entrypoint!r} escapes the capability folder"
         return cap
     if cap.kind == "web":
         stem = Path(cap.entrypoint).stem
@@ -558,6 +755,57 @@ def _write_cap_env(name: str, env: dict[str, dict[str, Any]]) -> None:
         raise
 
 
+def _env_spec_for(name: str, key: str) -> EnvSpec | None:
+    """Look up the declared Env field; undeclared names are accepted as strings."""
+    try:
+        cap = load_capability(name)
+    except CapError:
+        return None
+    for spec in cap.env_specs:
+        if spec.name == key:
+            return spec
+    return None
+
+
+def _validate_env_value(spec: EnvSpec | None, value: str) -> str:
+    """Validate and normalise one typed value before it reaches the secrets store."""
+    if spec is None:
+        return value
+    raw = value
+    if spec.type == "int":
+        try:
+            parsed_int = int(raw.strip())
+        except ValueError:
+            raise CapError(f"{spec.name} must be an integer") from None
+        if spec.ge is not None and parsed_int < spec.ge:
+            raise CapError(f"{spec.name} must be at least {spec.ge:g}")
+        if spec.le is not None and parsed_int > spec.le:
+            raise CapError(f"{spec.name} must be at most {spec.le:g}")
+        return str(parsed_int)
+    if spec.type == "float":
+        try:
+            parsed_float = float(raw.strip())
+        except ValueError:
+            raise CapError(f"{spec.name} must be a number") from None
+        if spec.ge is not None and parsed_float < spec.ge:
+            raise CapError(f"{spec.name} must be at least {spec.ge:g}")
+        if spec.le is not None and parsed_float > spec.le:
+            raise CapError(f"{spec.name} must be at most {spec.le:g}")
+        return str(parsed_float)
+    if spec.type == "bool":
+        lowered = raw.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return "true"
+        if lowered in {"false", "0", "no", "off"}:
+            return "false"
+        raise CapError(f"{spec.name} must be true or false")
+    if spec.min_length is not None and len(raw) < spec.min_length:
+        raise CapError(f"{spec.name} must be at least {spec.min_length} characters")
+    if spec.max_length is not None and len(raw) > spec.max_length:
+        raise CapError(f"{spec.name} must be at most {spec.max_length} characters")
+    return raw
+
+
 def set_cap_env(name: str, key: str, value: str) -> dict[str, Any]:
     """Set one operator-managed value. The model has no path to this function."""
     key = valid_env_name(key)
@@ -567,6 +815,7 @@ def set_cap_env(name: str, key: str, value: str) -> dict[str, Any]:
         raise CapError("Environment values cannot contain NUL bytes.")
     if len(value.encode("utf-8")) > MAX_ENV_VALUE_BYTES:
         raise CapError(f"Environment value is larger than {MAX_ENV_VALUE_BYTES} bytes.")
+    value = _validate_env_value(_env_spec_for(name, key), value)
     with cap_lock(name):
         env = read_cap_env(name)
         env[key] = {"value": value, "updated_at": int(time.time())}
@@ -588,39 +837,54 @@ def delete_cap_env(name: str, key: str) -> dict[str, Any]:
 
 
 def cap_env_values(name: str, cap: Capability) -> dict[str, str]:
-    """Configured values for exactly the names this version declares."""
+    """Configured values plus declared defaults for exactly this version's fields."""
     stored = read_cap_env(name)
-    return {key: stored[key]["value"] for key in cap.env if key in stored}
+    values: dict[str, str] = {}
+    for spec in cap.env_specs:
+        if spec.name in stored:
+            values[spec.name] = stored[spec.name]["value"]
+        elif spec.default is not None:
+            values[spec.name] = spec.default
+    return values
 
 
 def cap_env_missing(name: str, cap: Capability) -> list[str]:
+    """Only required fields without a declared default block a run."""
     stored = read_cap_env(name)
-    return [key for key in cap.env if key not in stored]
+    return [spec.name for spec in cap.env_specs if spec.required and spec.name not in stored]
 
 
 def cap_env_placeholders(cap: Capability) -> dict[str, str]:
-    return {key: ENV_PLACEHOLDER for key in cap.env}
+    """Non-secret values for tests/drafts: declared defaults or type-shaped placeholders."""
+    values = {spec.name: spec.default for spec in cap.env_specs if spec.default is not None}
+    for spec in cap.env_specs:
+        if spec.name not in values:
+            values[spec.name] = ENV_PLACEHOLDERS.get(spec.type, ENV_PLACEHOLDER)
+    return values
 
 
 def env_status(name: str, caps: Iterable[Capability]) -> list[dict[str, Any]]:
-    """Names + configured state (never values) for the console and MCP responses.
+    """Names, types and configured state (never values) for the console and MCP.
 
     Declarations from both the draft and the active tag are included, plus stored
     names the current code no longer declares so the operator can clean them up.
     """
     stored = read_cap_env(name)
-    declared: list[str] = []
+    specs: dict[str, EnvSpec] = {}
     for cap in caps:
-        for key in cap.env:
-            if key not in declared:
-                declared.append(key)
-    names = declared + [key for key in sorted(stored) if key not in declared]
+        for spec in cap.env_specs:
+            specs.setdefault(spec.name, spec)
+    names = list(specs) + [key for key in sorted(stored) if key not in specs]
     return [
         {
             "name": key,
-            "declared": key in declared,
+            "declared": key in specs,
             "configured": key in stored,
             "updated_at": stored.get(key, {}).get("updated_at") or 0,
+            "type": specs[key].type if key in specs else "str",
+            "required": specs[key].required if key in specs else True,
+            "default": specs[key].default if key in specs else None,
+            "description": specs[key].description if key in specs else "",
         }
         for key in names
     ]

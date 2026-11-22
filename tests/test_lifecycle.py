@@ -95,6 +95,7 @@ def test_scaffold_creates_uv_project_and_repo(env):
     assert res["ok"], res
     root = Path(res["path"])
     assert (root / "SKILL.md").is_file()
+    assert (root / "deploy.py").is_file()
     assert (root / "main.py").is_file()
     assert (root / "pyproject.toml").is_file()
     assert (root / "uv.lock").is_file()
@@ -110,8 +111,15 @@ def test_scaffold_lists_generated_files(env):
     made = s.scaffold_capability("hello", "d")
     assert made["ok"], made
     assert "tests/test_scaffold.py" in made["files"]
+    assert "deploy.py" in made["files"]
     detail = s.get_capability("hello")
     assert "tests/test_scaffold.py" in detail["files"]
+    assert "deploy.py" in detail["files"]
+    deploy = (Path(made["path"]) / "deploy.py").read_text(encoding="utf-8")
+    assert 'KIND = "cli"' in deploy
+    assert 'ENTRYPOINT = "main.py"' in deploy
+    assert "pydantic" in (Path(made["path"]) / "pyproject.toml").read_text(encoding="utf-8")
+    assert "entrypoint:" not in (Path(made["path"]) / "SKILL.md").read_text(encoding="utf-8")
     test_source = (Path(made["path"]) / "tests" / "test_scaffold.py").read_text(encoding="utf-8")
     assert "anyio" not in test_source
 
@@ -231,8 +239,10 @@ def test_staging_token_and_auth(env):
 def test_shared_data_survives_new_tag(env):
     root, s = env
     assert s.scaffold_capability("hello", "d")["ok"]
-    skill = root / "caps" / "hello" / "SKILL.md"
-    skill.write_text(skill.read_text().replace("data: version", "data: shared"), encoding="utf-8")
+    deploy = root / "caps" / "hello" / "deploy.py"
+    deploy.write_text(
+        deploy.read_text().replace('DATA = "version"', 'DATA = "shared"'), encoding="utf-8"
+    )
     main = root / "caps" / "hello" / "main.py"
     main.write_text(
         "import json, os, sys\n"
@@ -273,11 +283,9 @@ def test_operator_env_reaches_active_run_but_not_tests(env):
         "    assert os.environ.get('DEMO_KEY') == 'capforge-test-placeholder'\n",
         encoding="utf-8",
     )
-    skill = cap / "SKILL.md"
-    skill.write_text(
-        skill.read_text(encoding="utf-8").replace(
-            "# env: [API_KEY]", "env: [DEMO_KEY]"
-        ),
+    deploy = cap / "deploy.py"
+    deploy.write_text(
+        deploy.read_text(encoding="utf-8").replace("# API_KEY: str", "DEMO_KEY: str"),
         encoding="utf-8",
     )
     core.set_cap_env("envcap", "DEMO_KEY", "real-secret")

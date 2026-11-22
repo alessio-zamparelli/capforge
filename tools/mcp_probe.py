@@ -156,6 +156,7 @@ def main() -> int:
             {"name": CAP_NAME, "description": "Counts words in a text."},
         )
         print("scaffold ->", made["ok"], made["git_url"])
+        assert "deploy.py" in made["files"], made["files"]
 
         minted = call("staging", {"name": CAP_NAME, "action": "token"})
         print("token ->", minted["ok"], minted["ttl_s"], "s")

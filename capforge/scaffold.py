@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import core, gitremote
+from . import contract, core, gitremote
 
 MAIN = '''\
 """Entrypoint for {name}. One JSON object on stdin, one JSON value on stdout."""
@@ -52,6 +52,45 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+'''
+
+DEPLOY_CLI = '''\
+"""Deployment descriptor for {name}. Capforge reads this file; keep it declarative."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+
+class Env(BaseModel):
+    """Operator-set values, injected only into the active tag."""
+
+    # API_KEY: str
+
+
+KIND = "cli"
+ENTRYPOINT = "main.py"
+DATA = "version"
+'''
+
+DEPLOY_WEB = '''\
+"""Deployment descriptor for {name}. Capforge reads this file; keep it declarative."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+
+class Env(BaseModel):
+    """Operator-set values, injected only into the active tag."""
+
+    # API_KEY: str
+
+
+KIND = "web"
+ENTRYPOINT = "app.py"
+APP = "app"
+DATA = "version"
 '''
 
 TEST = '''\
@@ -142,41 +181,11 @@ def test_health() -> None:
     asyncio.run(run())
 '''
 
-AGENTS = '''\
-# {name}
-
-This capability is authored in a git repository. Capforge does not share its
-capability directory with your terminal; you work in a clone.
-
-## Loop
-
-1. `staging("{name}", action="token")` returns a short-lived token and `git_url`.
-2. Clone the repository with that token (credential helper or `GIT_CONFIG_*`).
-3. Edit the uv project. Add dependencies with `uv add`; always run `uv lock`.
-4. `git commit` and `git push origin HEAD:main`.
-5. Poll `staging("{name}", action="latest")`; read `staging("{name}", action="logs")`
-   if the pipeline failed.
-
-Promotion is automatic after a green pipeline test. There is no manual promotion
-tool. Runtime files belong under `CAPFORGE_DATA_DIR`; add `data: shared` to
-`SKILL.md` only if state must survive a new tag.
-
-## Environment
-
-Declare every variable you read as `env: [NAME, ...]` in `SKILL.md`. The operator
-sets the values in the console; you cannot read or write them and must never commit
-them. Values are shared across tags and injected only into the active tag. Tests
-and the web boot probe get `capforge-test-placeholder`, so never require a real
-secret at import time.
-'''
-
 SKILL = """\
 ---
 name: {name}
 description: {description}
-entrypoint: {entrypoint}
-# env: [API_KEY]
-{extra}---
+---
 
 # {name}
 
@@ -217,32 +226,32 @@ def _valid_description(description: str) -> str:
 
 def _write_project(root: Path, name: str, description: str, kind: str) -> None:
     web = kind == "web"
-    deps = '["fastapi", "uvicorn", "httpx"]' if web else "[]"
+    deps = '["fastapi", "uvicorn", "httpx", "pydantic"]' if web else '["pydantic"]'
     (root / "pyproject.toml").write_text(
         PYPROJECT.format(name=name, dependencies=deps), encoding="utf-8"
     )
     (root / ".python-version").write_text("3.14\n", encoding="utf-8")
     (root / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
-    (root / "AGENTS.md").write_text(AGENTS.format(name=name), encoding="utf-8")
+    (root / "AGENTS.md").write_text(
+        contract.AGENTS_TEMPLATE.replace("__CAPABILITY__", name), encoding="utf-8"
+    )
+    (root / "deploy.py").write_text(
+        (DEPLOY_WEB if web else DEPLOY_CLI).format(name=name), encoding="utf-8"
+    )
     if web:
         (root / "app.py").write_text(APP.format(name=name), encoding="utf-8")
         (root / "tests").mkdir()
         (root / "tests" / "test_scaffold.py").write_text(
             TEST_WEB.format(name=name), encoding="utf-8"
         )
-        extra = "kind: web\n"
-        entry = "app.py"
     else:
         (root / "main.py").write_text(MAIN.format(name=name), encoding="utf-8")
         (root / "tests").mkdir()
         (root / "tests" / "test_scaffold.py").write_text(
             TEST.format(name=name), encoding="utf-8"
         )
-        extra = "data: version\n"
-        entry = "main.py"
     (root / "SKILL.md").write_text(
-        SKILL.format(name=name, description=description, entrypoint=entry, extra=extra),
-        encoding="utf-8",
+        SKILL.format(name=name, description=description), encoding="utf-8"
     )
 
 

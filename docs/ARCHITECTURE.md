@@ -73,8 +73,8 @@ logic stays in the modules.
 ## 5. Authoring flow
 
 1. `scaffold_capability(name, description, kind)`:
-   - builds a uv project (`pyproject.toml`, `.python-version`, `SKILL.md`, entrypoint, tests,
-     `AGENTS.md`, `.gitignore`);
+   - builds a uv project (`pyproject.toml`, `.python-version`, `SKILL.md`, `deploy.py`, entrypoint,
+     tests, `AGENTS.md`, `.gitignore`);
    - runs `uv lock`;
    - commits and publishes `main` in `<state>/git/<name>.git` via a local fetch (no receive hook);
    - materialises the same tree as the server draft. An existing name/repo is refused; there is no
@@ -109,8 +109,10 @@ received -> extracting -> validating -> testing -> promoted | unchanged | failed
 - **Extracting.** `git archive refs/heads/main` into `<caps>/.staging/<name>-<id>/tree`, with
   guards: no symlinks/hardlinks/devices, no absolute/`..` members, no `.git`/`.venv`/
   `__pycache__`, bounded members/bytes/path length.
-- **Validating.** `SKILL.md`, `pyproject.toml`, `uv.lock`, `.python-version`, entrypoint
-  containment, `kind`, optional `data`; `packages` is rejected.
+- **Validating.** `SKILL.md` (name/description), `deploy.py`, `pyproject.toml`, `uv.lock`,
+  `.python-version`, entrypoint containment, `KIND`, optional `DATA`/`APP` and the `Env` model.
+  `deploy.py` is parsed with `ast`, never imported. Legacy frontmatter `kind`/`entrypoint`/`app`/
+  `data`/`env`/`packages` is rejected with a migration message.
 - **Testing.** `uv sync --frozen --group dev` into the test venv, pytest with capability coverage,
   then a prod smoke run (or web boot probe). Red leaves the draft/active untouched.
 - **Swapping/promoting.** One `cap_lock` critical section: verify hash, archive old draft with
@@ -131,17 +133,19 @@ and runs one subprocess:
 
 - JSON on stdin, JSON on stdout; bounded tails;
 - filtered environment (`PATH`, locale, TLS; no `*_KEY`/`*_TOKEN`/`*_SECRET`, no index credentials);
-- values for the names a version declares under `env:` in `SKILL.md`, read from
-  `<state>/secrets/<name>.json`; only the active tag receives real values;
-- `CAPFORGE_DATA_DIR` per version, `CAPFORGE_SHARED_DATA_DIR` when `data: shared`,
+- values for the `Env` fields a version declares in `deploy.py`, read from
+  `<state>/secrets/<name>.json`; optional fields fall back to their declared default, and only the
+  active tag receives real values;
+- `CAPFORGE_DATA_DIR` per version, `CAPFORGE_SHARED_DATA_DIR` when `DATA = "shared"`,
   `CAPFORGE_VERSION`, venv-first `PATH`;
 - hard timeout on the process group; the group is killed after wait; detached strays are swept;
 - Landlock allowlist for filesystem access.
 
 A draft is used only before the first promotion, with a warning. Web capabilities are refused by
-`run_capability` and served instead. Tests and the web boot probe receive
-`capforge-test-placeholder` for declared env names, so real values never enter model-visible
-pipeline logs. A missing active value fails the run/serve with the missing names.
+`run_capability` and served instead. Tests and the web boot probe receive the declared default or a
+type-shaped placeholder (`capforge-test-placeholder`, `0`, `0.0`, `false`) for env fields, so real
+values never enter model-visible pipeline logs. A missing required active value fails the
+run/serve with the missing names.
 
 ## 8. Data
 
@@ -185,11 +189,12 @@ history and state plus `refs/capforge/processed` is the promotion record.
 - `/api` needs the console token and CSRF on writes. `/ui` is public. `/cap` is public by design.
 - `/git` needs a per-capability TTL token; one token grants clone and push; Basic only. Tokens are hashed,
   request/byte-capped, never logged, and Basic usernames are bound to the actor; Bearer is not accepted.
-- Capability environments are filtered; index settings are installer-only. Declared env values
-  live under `<state>/secrets/` (mode `0600`) and are write-only through `/api`; they are shared
-  across a capability's tags and injected only into its active run/serve process. Capability code
-  can read what it is given at runtime, so this is a trust boundary around the operator-provided
-  values, not a sandbox around model-authored code.
+- Capability environments are filtered; index settings are installer-only. Declared `Env` fields
+  live under `<state>/secrets/` (mode `0600`) and are write-only through `/api`; the console
+  validates the declared type before storing. They are shared across a capability's tags and
+  injected only into its active run/serve process. Capability code can read what it is given at
+  runtime, so this is a trust boundary around the operator-provided values, not a sandbox around
+  model-authored code.
 - Landlock (`CAPFORGE_SANDBOX=require`) denies state, tokens, other capabilities, home, `/proc`,
   `/sys`, `/tmp` and anything else not explicitly allowed. It is filesystem-only; network, CPU,
   memory and ptrace are not confined.

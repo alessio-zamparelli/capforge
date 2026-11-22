@@ -123,7 +123,7 @@ function CapRow({
   const expandable = hasEndpoints || cap.env.length > 0;
   const running = served?.status === "running";
   const envSet = cap.env.filter((item) => item.configured).length;
-  const envMissing = cap.env.length - envSet;
+  const envMissing = cap.env.filter((item) => item.required && !item.configured).length;
 
   return (
     <li className="rounded-lg border border-border bg-card text-card-foreground">
@@ -307,44 +307,83 @@ function EnvPanel({
         returned by the console. Only store credentials you trust it to use.
       </p>
       <ul className="space-y-2">
-        {cap.env.map((item) => (
-          <li key={item.name} className="flex flex-wrap items-center gap-2 text-sm">
-            <code className="min-w-40 rounded bg-muted px-1.5 py-0.5 text-xs">
-              {item.name}
-            </code>
-            <Badge warn={!item.configured}>{item.configured ? "set" : "missing"}</Badge>
-            {!item.declared && (
-              <span className="text-xs text-muted-foreground">(not declared)</span>
-            )}
-            <input
-              type="password"
-              autoComplete="new-password"
-              value={drafts[item.name] ?? ""}
-              onChange={(event) =>
-                setDrafts((current) => ({ ...current, [item.name]: event.target.value }))
-              }
-              placeholder={item.configured ? "replace value" : "value"}
-              className="h-8 min-w-48 flex-1 rounded-md border border-border bg-background px-2 text-sm"
-            />
-            <button
-              onClick={() => void save(item.name)}
-              disabled={busy !== null || !(drafts[item.name] ?? "")}
-              className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-sm hover:bg-accent disabled:opacity-40"
-            >
-              {busy === item.name ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : null}
-              Save
-            </button>
-            <button
-              onClick={() => void clear(item.name)}
-              disabled={busy !== null || !item.configured}
-              className="h-8 rounded-md border border-border px-2.5 text-sm text-muted-foreground hover:bg-accent disabled:opacity-40"
-            >
-              Clear
-            </button>
-          </li>
-        ))}
+        {cap.env.map((item) => {
+          const fieldClass =
+            "h-8 min-w-48 flex-1 rounded-md border border-border bg-background px-2 text-sm";
+          const placeholder = item.configured
+            ? "replace value"
+            : item.default !== null
+              ? `default: ${item.default}`
+              : "value";
+          return (
+            <li key={item.name} className="space-y-1 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <code className="min-w-40 rounded bg-muted px-1.5 py-0.5 text-xs">
+                  {item.name}
+                </code>
+                <span className="text-xs text-muted-foreground">{item.type}</span>
+                <Badge warn={item.required && !item.configured}>
+                  {item.configured ? "set" : item.required ? "missing" : "optional"}
+                </Badge>
+                {!item.declared && (
+                  <span className="text-xs text-muted-foreground">(not declared)</span>
+                )}
+                {item.default !== null && (
+                  <span className="text-xs text-muted-foreground">
+                    default: <code>{item.default}</code>
+                  </span>
+                )}
+              </div>
+              {item.description && (
+                <p className="text-xs text-muted-foreground">{item.description}</p>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                {item.type === "bool" ? (
+                  <select
+                    value={drafts[item.name] ?? ""}
+                    onChange={(event) =>
+                      setDrafts((current) => ({ ...current, [item.name]: event.target.value }))
+                    }
+                    className={fieldClass}
+                  >
+                    <option value="">{item.configured ? "replace value" : "choose..."}</option>
+                    <option value="true">true</option>
+                    <option value="false">false</option>
+                  </select>
+                ) : (
+                  <input
+                    type={item.type === "int" || item.type === "float" ? "number" : "password"}
+                    step={item.type === "int" ? "1" : item.type === "float" ? "any" : undefined}
+                    autoComplete="new-password"
+                    value={drafts[item.name] ?? ""}
+                    onChange={(event) =>
+                      setDrafts((current) => ({ ...current, [item.name]: event.target.value }))
+                    }
+                    placeholder={placeholder}
+                    className={fieldClass}
+                  />
+                )}
+                <button
+                  onClick={() => void save(item.name)}
+                  disabled={busy !== null || !(drafts[item.name] ?? "")}
+                  className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-sm hover:bg-accent disabled:opacity-40"
+                >
+                  {busy === item.name ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  Save
+                </button>
+                <button
+                  onClick={() => void clear(item.name)}
+                  disabled={busy !== null || !item.configured}
+                  className="h-8 rounded-md border border-border px-2.5 text-sm text-muted-foreground hover:bg-accent disabled:opacity-40"
+                >
+                  Clear
+                </button>
+              </div>
+            </li>
+          );
+        })}
       </ul>
       {error && <p className="mt-2 text-xs text-red-300">{error}</p>}
       {notice && <p className="mt-2 text-xs text-muted-foreground">{notice}</p>}

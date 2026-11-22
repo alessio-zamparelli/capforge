@@ -1,17 +1,17 @@
-# Capability workspace
+# __CAPABILITY__
 
-This repository is the source for one capforge capability. The server owns its caps directory; you
-work in a clone, commit, and push. There is no shared terminal mount.
+This repository is the source for one capforge capability. The server owns the capability
+directory; you work in a clone, commit, and push. There is no shared terminal mount.
 
 ## The loop
 
 1. `get_contract()` once.
 2. `list_capabilities()` for names, active tags and repository URLs.
 3. `scaffold_capability(name, description)`; pass `kind="web"` for an HTTP service.
-4. `staging(name, action="token")` returns a short-lived token and `git_url`.
-5. Clone the repository and work in that clone. Use Basic auth with username
-   `basic_username` and the token as password;
-   `git --no-pager log` or `GIT_PAGER=cat` avoids the pager hanging a terminal.
+4. `staging(name, action="token")` returns a short-lived token, `git_url`, `basic_username` and
+   `auth: "basic"`.
+5. Clone the repository and work in that clone. Use Basic auth with username `basic_username` and
+   the token as the password. `git --no-pager` or `GIT_PAGER=cat` avoids the pager.
 6. Edit the uv project; add dependencies with `uv add`, then `uv lock`; commit.
 7. `git push origin HEAD:main`.
 8. Poll `staging(name, action="latest")`; read `staging(name, action="logs")` on failure.
@@ -22,8 +22,8 @@ Promotion is automatic on a green pipeline. `install_packages`, `test_capability
 
 ## Layout
 
-    SKILL.md            name, description, entrypoint, kind, optional data: shared,
-                        env: [NAME, ...] for operator-set values
+    SKILL.md            name, description and instructions; no deployment fields
+    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA and Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
@@ -31,40 +31,69 @@ Promotion is automatic on a green pipeline. `install_packages`, `test_capability
     tests/              pytest; dev group also has pytest-cov
     AGENTS.md           this file
 
+## deploy.py
+
+`deploy.py` is the machine-readable contract. Capforge parses it statically, so keep the
+assignments literal:
+
+    KIND = "cli"            # "cli" or "web"
+    ENTRYPOINT = "main.py"  # app.py for web
+    DATA = "version"        # "version" or "shared"
+    APP = "app"             # web only; the ASGI object
+
+Environment variables are fields of a pydantic model:
+
+    from pydantic import BaseModel, Field
+
+    class Env(BaseModel):
+        API_KEY: str = Field(min_length=1, description="Weather API key")
+        TIMEOUT_SECONDS: int = 30
+
+Capforge reads field names, types and defaults; it never imports deploy.py. Annotate with
+`str`, `int`, `float` or `bool`; other annotations are treated as `str`. A field without a default
+is required. The operator sets values in the console (`/ui/`); you cannot read or write them and
+must never commit them.
+
 ## Process contract (CLI)
 
-- stdin: one JSON object with the call arguments. Never argv or environment variables.
+- stdin: one JSON object with the call arguments. Never argv.
 - stdout: one JSON value; the whole output or its last non-empty line.
 - stderr: diagnostics, shown to the caller on failure.
 - exit 0: success; any other exit is a failure.
 - Return `{"error": "..."}` for a handled failure the model should read; raise only for bugs.
 
-## Rules
-
-- Validate every argument; it came from a language model.
-- Write runtime files only under `CAPFORGE_DATA_DIR` (per version).
-- Add `data: shared` to `SKILL.md` for a stable `CAPFORGE_SHARED_DATA_DIR` across tags. It is
-  unversioned; you own concurrency, schema migrations and backup expectations.
-- Never write beside `main.py`/`app.py`; the tag is an immutable snapshot and the draft is derived.
-- Credentials: declare every variable you read as `env: [NAME, ...]` in `SKILL.md`. The operator
-  sets the values in the console; you cannot read or write them and must never commit them.
-  Values are shared across tags and injected only into the active tag. Tests and the web boot
-  probe get `capforge-test-placeholder`, so never require a real secret at import time.
-- Be fast: calls time out (default 120s).
-- Be deterministic for `data: version`: same args plus the same data, same result.
-- Leave nothing running; a resident service is `kind: web` served with `serve_capability`.
-- Landlock confines filesystem access to your code/venv, system libraries and your data dirs;
-  network/CPU/memory are not confined.
-
 ## Web
 
-`kind: web` requires `uvicorn` in `[project].dependencies` and an ASGI object (`entrypoint: app.py`,
-`app: app`). After promotion, `serve_capability(name, action="start")` exposes it at
-`/cap/<name>/`. A later promotion does not restart it; use `restart`. Validate every request:
-anyone who can reach the proxy is a caller.
+`KIND = "web"` requires `uvicorn` in `[project].dependencies` and an ASGI object
+(`ENTRYPOINT = "app.py"`, `APP = "app"`). After promotion,
+`serve_capability(name, action="start")` exposes it at `/cap/<name>/`. A later promotion does not
+restart it; use `restart`. Validate every request: anyone who can reach the proxy is a caller.
+
+## Data
+
+Write runtime files only under `CAPFORGE_DATA_DIR` (per version). Set `DATA = "shared"` in
+`deploy.py` for a stable `CAPFORGE_SHARED_DATA_DIR` across tags. It is unversioned; you own
+concurrency, schema migrations and backup expectations. Never write beside `main.py`/`app.py`;
+the tag is an immutable snapshot and the draft is derived.
+
+## Testing
+
+`tests/` runs with pytest before promotion. Tests and the web boot probe receive non-secret
+placeholders: the declared default, or `capforge-test-placeholder`, `0`, `0.0` or `false` by type.
+Never require a real secret at import time.
 
 ## Versioning
 
 A green push is snapshotted into an immutable tag and made active. Older tags are pruned beyond
 the keep limit, with their per-version data and unused venvs. `rollback_capability` moves the
 pointer without touching the draft or repository. The push pipeline is the only promotion path.
+
+## Rules
+
+- Validate every argument; it came from a language model.
+- No network by default; declare a real need in `SKILL.md`.
+- Be fast: calls time out (default 120s).
+- Be deterministic for `DATA = "version"`: same args plus the same data, same result.
+- Leave nothing running; a resident service is `KIND = "web"` served with `serve_capability`.
+- Landlock confines filesystem access to your code/venv, system libraries and your data dirs;
+  network/CPU/memory are not confined.

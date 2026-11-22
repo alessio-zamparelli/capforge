@@ -35,7 +35,7 @@ capforge/
     gitremote.py    bare repo init/config/hook, archive materialisation, refs, gc/quota
     scaffold.py     uv base project, uv lock, initial commit, publish main
     staging.py      git tokens, staging state, bounded logs, async push pipeline
-    contract.py     CONTRACT text (strings only)
+    contract.py     CONTRACT text and the scaffolded AGENTS template (strings only)
     web.py          :8080 /ui /api /git /cap, console, git CGI bridge, serve engine
     server.py       FastMCP instance and the ten tools
     cli.py          serve | doctor | tools | promote | test
@@ -68,22 +68,27 @@ never let `CapError` escape to MCP.
 
 ```text
 <caps>/<name>/
-    SKILL.md            frontmatter + instructions; env: [NAME, ...] declares
-                        operator-set values; no packages field
+    SKILL.md            name, description and instructions; no deployment fields
+    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA and
+                        Env (pydantic) fields; parsed with ast, never imported
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed
     .python-version     3.14
-    main.py | app.py    entrypoint (`entrypoint:`), ASGI app (`kind: web`, `app:`)
+    main.py | app.py    entrypoint (`ENTRYPOINT`), ASGI app (`KIND = "web"`, `APP`)
     tests/              optional; pytest runs when test_*.py exists
                         (the scaffold writes tests/test_scaffold.py)
-    AGENTS.md           the loop for the model
+    AGENTS.md           the full loop for the model; covers CLI and web
 ```
 
-Frontmatter that matters: `name`, `description`, `entrypoint`, `kind`, `app`, optional
-`data: shared`, optional `env: [NAME, ...]` for operator-set values. There is no `packages` field;
-dependencies are in `pyproject.toml`. The parser in `core.parse_skill_md` is deliberately tolerant
-and does not use a YAML library. Env names are validated by `valid_env_name`; runtime-owned names
-(`PATH`, `HOME`, `CAPFORGE_*`, `PYTHON*`, `LD_*`, `UV_*`, …) are refused.
+`SKILL.md` frontmatter is `name` + `description`; the body is instructions. `deploy.py` is the
+machine-readable contract: literal `KIND` (`"cli"`/`"web"`), `ENTRYPOINT`, optional `APP` and
+`DATA` (`"version"`/`"shared"`), plus an optional pydantic `Env` model whose fields declare
+operator-set variables. `core.parse_deploy_py` parses it with `ast` (no import, no execution);
+supported annotations are `str`, `int`, `float`, `bool` (unknown → `str`), and `Field(...)` may
+add `description`, `min_length`, `max_length`, `ge`, `le`. A field without a default is required.
+Frontmatter `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is refused with a migration error.
+Env names are validated by `valid_env_name`; runtime-owned names (`PATH`, `HOME`, `CAPFORGE_*`,
+`PYTHON*`, `LD_*`, `UV_*`, …) are refused.
 
 Execution rules (`core.execute`):
 
@@ -92,8 +97,9 @@ Execution rules (`core.execute`):
 - diagnostics on stderr; bounded capture (256 KiB tail);
 - filtered environment (`ENV_ALLOWLIST`), `CAPFORGE_DATA_DIR`, `CAPFORGE_VERSION`,
   `CAPFORGE_SHARED_DATA_DIR` when enabled, venv-first `PATH`;
-- declared `env:` names injected only for the active tag (`cap_env_values`); tests, drafts and the
-  web boot probe get `ENV_PLACEHOLDER` so real values never enter model-visible logs;
+- `Env` fields declared in `deploy.py` injected only for the active tag (`cap_env_values`); optional
+  fields fall back to their declared default; tests, drafts and the web boot probe get defaults or
+  type-shaped placeholders (`capforge-test-placeholder`, `0`, `0.0`, `false`), never real values;
 - a hard timeout on the process group; nothing survives the call; detached strays are swept;
 - Landlock: system/own-code/venv read, own data read/write, everything else denied.
 

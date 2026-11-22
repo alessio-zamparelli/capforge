@@ -399,9 +399,9 @@ def test_env_change_restarts_running_web_cap(env, monkeypatch):
         ),
         encoding="utf-8",
     )
-    skill = cap / "SKILL.md"
-    skill.write_text(
-        skill.read_text(encoding="utf-8").replace("# env: [API_KEY]", "env: [DEMO_KEY]"),
+    deploy = cap / "deploy.py"
+    deploy.write_text(
+        deploy.read_text(encoding="utf-8").replace("# API_KEY: str", "DEMO_KEY: str"),
         encoding="utf-8",
     )
     core.set_cap_env("envweb", "DEMO_KEY", "one")
@@ -436,6 +436,53 @@ def test_env_change_restarts_running_web_cap(env, monkeypatch):
     code, body = _asgi_get(web, "/cap/envweb/key")
     assert code == 200 and '"key":"two"' in body.replace(" ", ""), body
     server.serve_capability("envweb", action="stop")
+
+
+def test_env_api_validates_declared_types(env, monkeypatch):
+    _, server, web, _core = env
+    made = server.scaffold_capability("typedenv", "Typed env.", kind="web")
+    assert made["ok"], made
+    deploy = Path(made["path"]) / "deploy.py"
+    deploy.write_text(
+        deploy.read_text(encoding="utf-8").replace(
+            "# API_KEY: str", "TIMEOUT: int = 30\n    DEBUG: bool"
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CAPFORGE_WEB_TOKEN", "typed-token")
+    import anyio
+    import httpx
+
+    async def run() -> None:
+        transport = httpx.ASGITransport(app=web.asgi_app(), client=("127.0.0.1", 41001))
+        async with httpx.AsyncClient(transport=transport, base_url="http://x") as client:
+            login = await client.post("/api/login", json={"token": "typed-token"})
+            assert login.status_code == 200
+            headers = {
+                "X-CSRF": "1",
+                "cookie": f"capforge_session={login.cookies['capforge_session']}",
+            }
+            for key, value in (("TIMEOUT", "soon"), ("DEBUG", "maybe")):
+                bad = await client.post(
+                    "/api/caps/typedenv/env",
+                    headers=headers,
+                    json={"name": key, "value": value},
+                )
+                assert bad.status_code == 400, bad.text
+            saved = await client.post(
+                "/api/caps/typedenv/env",
+                headers=headers,
+                json={"name": "DEBUG", "value": "yes"},
+            )
+            assert saved.status_code == 200, saved.text
+            items = {item["name"]: item for item in saved.json()["env"]}
+            assert items["DEBUG"]["type"] == "bool"
+            assert items["DEBUG"]["configured"] is True
+            assert items["TIMEOUT"]["type"] == "int"
+            assert items["TIMEOUT"]["required"] is False
+
+    anyio.run(run)
 
 
 def test_served_venv_survives_venv_gc(env):

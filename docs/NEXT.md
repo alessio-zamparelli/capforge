@@ -23,6 +23,9 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   releases are refused with a migration error; operators must re-promote them with
   `pyproject.toml`/`uv.lock` (or restore the code into a clone and push). There is no automatic
   converter.
+- **`deploy.py` migration.** The 0.5.0 hard cut requires `deploy.py`; tags created by 0.4.x have
+  no descriptor and are refused, so they cannot be rolled back to. Re-push the capability with a
+  `deploy.py` and promote a new tag to migrate it.
 - **Capability deletion.** `delete_capability(name, confirm)` and `capforge delete` remove a
   capability and its state; there is no undo/archive, and scaffold overwrite does not exist.
 - **Secrets.** Operator-managed env values are plaintext JSON with mode `0600` under

@@ -75,19 +75,30 @@ The web listener is required for clone/push: `CAPFORGE_WEB_PORT=0` disables `/gi
 
 ## Capability environment
 
-A capability declares the variables it reads in `SKILL.md`:
+A capability declares the variables it reads as fields of a pydantic `Env` model in `deploy.py`:
 
-```yaml
-env: [WEATHER_API_KEY, SMTP_PASSWORD]
+```python
+from pydantic import BaseModel, Field
+
+
+class Env(BaseModel):
+    WEATHER_API_KEY: str
+    TIMEOUT_SECONDS: int = 30
+    # SMTP_PASSWORD: str = Field(min_length=1, description="SMTP password")
 ```
+
+Fields may be `str`, `int`, `float` or `bool`; unknown annotations are treated as `str`. A field
+without a default is required. `Field(...)` can add `description`, `min_length`/`max_length` and
+`ge`/`le`. Capforge parses `deploy.py` statically (`ast`), never by importing it.
 
 The model can only declare names. The operator sets values in the console (`/ui/`), which
 requires `CAPFORGE_WEB_TOKEN`. Values live in `<state>/secrets/<name>.json` (mode `0600`),
 are never returned by `/api`, and are shared across that capability's tags. Only declared
-names are injected, and only into the active tag's process; pipeline tests and the web boot
-probe receive `capforge-test-placeholder`. Changing a value restarts a running web instance.
-Capability code can still read the values it is given at runtime; only store credentials you
-trust that capability to use.
+names are injected, and only into the active tag's process; optional fields fall back to their
+declared default, and pipeline tests and the web boot probe receive the default or a type-shaped
+placeholder (`capforge-test-placeholder`, `0`, `0.0`, `false`). The console validates the declared
+type before storing. Changing a value restarts a running web instance. Capability code can still
+read the values it is given at runtime; only store credentials you trust that capability to use.
 
 ## Docker
 
@@ -126,21 +137,32 @@ commands; they are not MCP tools.
 
 ```text
 <name>/
-    SKILL.md            name, description, entrypoint, kind, optional data: shared
+    SKILL.md            name, description and instructions
+    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA, Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
     main.py | app.py    entrypoint / ASGI app
     tests/              pytest; the dev group also has pytest-cov
-    AGENTS.md           the clone/edit/push loop
+    AGENTS.md           the clone/edit/push loop (CLI and web)
 ```
 
-The CLI entrypoint reads **one JSON object on stdin** and writes **one JSON value on stdout**,
-exit 0. Diagnostics go to stderr. `{"error": "..."}` is a handled failure. A non-zero exit, timeout
-or unparseable output is a failed call.
+`deploy.py` is the machine-readable contract:
 
-Runtime files go only under `CAPFORGE_DATA_DIR` (per version). Add `data: shared` to `SKILL.md` for
-a stable `CAPFORGE_SHARED_DATA_DIR` across tags; it is unversioned, and the capability owns
+```python
+KIND = "cli"            # "cli" or "web"
+ENTRYPOINT = "main.py"  # app.py for web
+DATA = "version"        # "version" or "shared"
+APP = "app"             # web only; the ASGI object
+```
+
+`SKILL.md` frontmatter carries only `name` and `description`; the deployment fields live in
+`deploy.py`. The CLI entrypoint reads **one JSON object on stdin** and writes **one JSON value on
+stdout**, exit 0. Diagnostics go to stderr. `{"error": "..."}` is a handled failure. A non-zero
+exit, timeout or unparseable output is a failed call.
+
+Runtime files go only under `CAPFORGE_DATA_DIR` (per version). Set `DATA = "shared"` in `deploy.py`
+for a stable `CAPFORGE_SHARED_DATA_DIR` across tags; it is unversioned, and the capability owns
 concurrency, migrations and backup. Code trees are not writable. Landlock denies state, tokens,
 other capabilities, home, `/proc`, `/sys` and everything not explicitly allowed. Network, CPU and
 memory are not confined.
