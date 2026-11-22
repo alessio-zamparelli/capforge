@@ -181,7 +181,7 @@ def test_versioning_promote_and_rollback(env):
 
 
 def test_pipeline_push_promotes_on_green(env):
-    _, s = env
+    root, s = env
     assert s.scaffold_capability("hello", "d")["ok"]
 
     def mutate(work: Path) -> None:
@@ -201,6 +201,8 @@ def test_pipeline_push_promotes_on_green(env):
     assert s.run_capability("hello", {"text": "abc"})["result"] == {"text": "abc", "length": 3}
     logs = s.staging("hello", action="logs")
     assert logs["ok"] and logs["text"]
+    backups = root / "caps" / ".staging" / "backups"
+    assert not list(backups.glob("hello-*")), "a successful promotion must not leak a draft backup"
 
 
 def test_pipeline_red_tests_leave_active_untouched(env):

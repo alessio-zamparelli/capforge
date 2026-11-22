@@ -320,6 +320,63 @@ def test_console_control_round_trip(env, monkeypatch):
     server.serve_capability("consolecap", action="stop")
 
 
+def test_console_detail_logs_rollback_and_delete(env, monkeypatch):
+    _, server, web, _core = env
+    monkeypatch.setenv("CAPFORGE_WEB_TOKEN", "ops-token")
+    assert server.scaffold_capability("ops", "An operator cap.")["ok"]
+    from capforge import versioning
+
+    versioning.promote("ops", tag="v1")
+    main = Path(server.get_capability("ops")["path"]) / "main.py"
+    main.write_text(main.read_text(encoding="utf-8") + "\n# v2\n", encoding="utf-8")
+    versioning.promote("ops", tag="v2")
+
+    import anyio
+    import httpx
+
+    async def run() -> None:
+        transport = httpx.ASGITransport(app=web.asgi_app(), client=("127.0.0.1", 41000))
+        async with httpx.AsyncClient(transport=transport, base_url="http://x") as client:
+            login = await client.post("/api/login", json={"token": "ops-token"})
+            assert login.status_code == 200
+            headers = {
+                "x-csrf": "1",
+                "cookie": f"capforge_session={login.cookies['capforge_session']}",
+            }
+            detail = await client.get("/api/caps/ops", headers=headers)
+            assert detail.status_code == 200, detail.text
+            body = detail.json()
+            assert body["active"] == "v2"
+            assert [tag["tag"] for tag in body["tags"]] == ["v1", "v2"]
+            assert body["pipeline"]["state"] is None
+
+            logs = await client.get("/api/caps/ops/logs?kind=pipeline", headers=headers)
+            assert logs.status_code == 200, logs.text
+            assert logs.json()["kind"] == "pipeline"
+
+            bad = await client.post(
+                "/api/caps/ops/rollback", headers=headers, json={"tag": "nope"}
+            )
+            assert bad.status_code == 400
+            rollback = await client.post(
+                "/api/caps/ops/rollback", headers=headers, json={"tag": "v1"}
+            )
+            assert rollback.status_code == 200, rollback.text
+            assert versioning.read_state("ops")["active"]["tag"] == "v1"
+
+            wrong = await client.post(
+                "/api/caps/ops/delete", headers=headers, json={"confirm": "wrong"}
+            )
+            assert wrong.status_code == 400
+            deleted = await client.post(
+                "/api/caps/ops/delete", headers=headers, json={"confirm": "ops"}
+            )
+            assert deleted.status_code == 200, deleted.text
+            assert server.get_capability("ops")["ok"] is False
+
+    anyio.run(run)
+
+
 def test_console_json_index_and_disabled_console(env, monkeypatch):
     _, server, web, _core = env
     _make_web_cap(env, "indexcap")
@@ -353,11 +410,22 @@ def test_console_json_index_and_disabled_console(env, monkeypatch):
 def test_proxy_passes_through_methods_and_headers(env):
     root, server, web, _core = env
     extra = (
-        "from fastapi import Request\n\n\n"
+        "from fastapi import Request, Response\n\n\n"
         '@app.post("/echo")\n'
         "async def echo(request: Request) -> dict:\n"
         "    body = await request.json()\n"
-        '    return {"echo": body, "marker": request.headers.get("x-marker")}\n'
+        "    return {\n"
+        '        "echo": body,\n'
+        '        "marker": request.headers.get("x-marker"),\n'
+        '        "cookie": request.headers.get("cookie"),\n'
+        '        "authorization": request.headers.get("authorization"),\n'
+        '        "version": request.headers.get("x-capforge-version"),\n'
+        "    }\n\n\n"
+        '@app.get("/setcookie")\n'
+        "def setcookie() -> Response:\n"
+        '    response = Response("ok")\n'
+        '    response.set_cookie("evil", "1")\n'
+        "    return response\n"
     )
     _make_web_cap(env, "echocap", extra=extra)
     started = server.serve_capability("echocap", action="start")
@@ -372,11 +440,28 @@ def test_proxy_passes_through_methods_and_headers(env):
             big = "x" * (33 * 1024 * 1024)
             too_big = await client.post("/cap/echocap/echo", content=big.encode())
             assert too_big.status_code == 413
+            client.cookies.set("capforge_session", "should-not-forward")
             ok = await client.post(
-                "/cap/echocap/echo", json={"a": 1}, headers={"x-marker": "yes"}
+                "/cap/echocap/echo",
+                json={"a": 1},
+                headers={
+                    "x-marker": "yes",
+                    "authorization": "Bearer should-not-forward",
+                    "x-capforge-version": "spoofed",
+                },
             )
+            client.cookies.clear()
             assert ok.status_code == 200, ok.text
-            assert ok.json() == {"echo": {"a": 1}, "marker": "yes"}
+            assert ok.json() == {
+                "echo": {"a": 1},
+                "marker": "yes",
+                "cookie": None,
+                "authorization": None,
+                "version": "v1",
+            }
+            set_cookie = await client.get("/cap/echocap/setcookie")
+            assert set_cookie.status_code == 200
+            assert "set-cookie" not in {key.lower() for key in set_cookie.headers}
             not_found = await client.get("/cap/echocap/nope")
             assert not_found.status_code == 404
             docs = await client.get("/cap/echocap/docs")

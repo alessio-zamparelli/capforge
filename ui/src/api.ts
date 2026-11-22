@@ -84,9 +84,80 @@ export interface CapInfo {
   env: EnvInfo[];
 }
 
+export interface TagInfo {
+  tag: string;
+  created_at?: number;
+  content_hash?: string;
+  note?: string;
+  entrypoint?: string;
+  active?: boolean;
+}
+
+export interface PipelineInfo {
+  state: string | null;
+  staging_id: string | null;
+  sha: string | null;
+  tag: string | null;
+  updated: number | null;
+  error: string | null;
+}
+
+export interface LogTail {
+  text: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+export interface CapDetail extends CapInfo {
+  data: "version" | "shared";
+  active_content_hash: string;
+  tags: TagInfo[];
+  pruned: string[];
+  pipeline: PipelineInfo;
+  log: LogTail | null;
+}
+
 export async function caps(): Promise<CapInfo[]> {
   const body = (await jsonOrThrow(await fetch("../api/caps"))) as { caps: CapInfo[] };
   return body.caps;
+}
+
+export async function capDetail(name: string): Promise<CapDetail> {
+  return (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}`)
+  )) as CapDetail;
+}
+
+export async function logs(
+  name: string,
+  kind: "pipeline" | "scaffold" | "served",
+  tail?: number
+): Promise<LogTail & { kind: string }> {
+  const query = new URLSearchParams({ kind });
+  if (tail !== undefined) query.set("tail", String(tail));
+  return (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/logs?${query.toString()}`)
+  )) as LogTail & { kind: string };
+}
+
+export async function rollback(name: string, tag: string): Promise<unknown> {
+  return jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/rollback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ tag }),
+    })
+  );
+}
+
+export async function remove(name: string, confirm: string): Promise<unknown> {
+  return jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ confirm }),
+    })
+  );
 }
 
 export async function control(

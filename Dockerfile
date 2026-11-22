@@ -33,8 +33,8 @@ COPY --from=uv /uv /uvx /bin/
 WORKDIR /app
 
 # Dependency layer: only invalidated by pyproject.toml or uv.lock changes.
-# `--no-dev` keeps pytest/httpx out of the runtime image. --locked makes a
-# stale lockfile a build failure.
+# `--no-dev` drops the dev group (pytest, ruff, mypy); httpx is a runtime
+# dependency. --locked makes a stale lockfile a build failure.
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
@@ -73,10 +73,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 EXPOSE 8099 8080
 
-# TCP check only: MCP requires a POST with protocol headers, so a plain HTTP
-# probe would report a healthy server as down.
+# MCP requires a POST with protocol headers; use the web listener's
+# unauthenticated readiness probe instead.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ['CAPFORGE_PORT'])), 3).close()"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)"
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["capforge", "serve"]

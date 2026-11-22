@@ -1,6 +1,6 @@
 # Architecture
 
-Status: describes capforge **0.4.0**, the git-authored architecture. If code and this document
+Status: describes capforge **0.6.0**, the git-authored architecture. If code and this document
 disagree, the code wins; update this file in the same change.
 
 Related: [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),
@@ -31,23 +31,34 @@ cannot read state, tokens, venvs or other capabilities through a filesystem path
 
 Two uvicorn servers in one process, one signal set:
 
-- **` :8099/mcp`** — FastMCP, the ten tools.
-- **`:8080`** — starlette:
+- **`:8099/mcp`** — FastMCP, the ten tools, bearer-authenticated with
+  `CAPFORGE_MCP_TOKEN`.
+- **`:8080`** — the web starlette app: console, API, git and capability proxy.
 
 | path | handler |
 |---|---|
-| `/ui/` | static React console (public) |
+| `/ui/` | static React console (public, token-gated API) |
 | `/api/*` | console + control API (session + CSRF; `CAPFORGE_WEB_TOKEN` gates it) |
+| `/api/caps/<name>` | detail: tags, pipeline, served state, env status |
+| `/api/caps/<name>/logs` | bounded pipeline/scaffold/served log tail |
+| `/api/caps/<name>/rollback` | move the active tag |
+| `/api/caps/<name>/delete` | delete the capability (exact-name confirm) |
 | `/api/caps/<name>/env` | env status (GET) / set one value (POST, write-only) |
 | `/git/<name>.git/info/refs` | git advertisement (upload-pack or receive-pack) |
 | `/git/<name>.git/git-upload-pack` | clone/fetch |
 | `/git/<name>.git/git-receive-pack` | push |
 | `/cap/<name>/` | reverse proxy to the served uvicorn child |
+| `/healthz` / `/readyz` | liveness / readiness |
 | `/` | `308` to `/ui/`, or JSON index when the UI is disabled |
 
-No root `/{name}` catch-all. `CAPFORGE_PUBLIC_URL` is the externally reachable base used to build
-clone/cap/UI URLs; a path-prefix proxy must strip the prefix before forwarding. TLS must terminate
-in front for git tokens.
+No root `/{name}` catch-all. `CAPFORGE_PUBLIC_URL` is the externally reachable base for clone,
+capability and console URLs; a path-prefix proxy must strip the prefix before forwarding. TLS must
+terminate in front for git tokens and the console.
+
+`/cap` and `/api` share this origin. A served web capability's JavaScript can therefore reach the
+console API with the operator's session. The proxy strips `Cookie`, `Authorization`, `X-CSRF` and
+upstream `Set-Cookie`, but that is not a same-origin boundary: deployments that serve untrusted web
+capabilities should expose `/cap` on a different origin at the reverse proxy (see `NEXT.md`).
 
 ## 4. Modules
 
@@ -56,7 +67,7 @@ core.py        paths, validation, state JSON, hashing, locks, processes, uv venv
                tests, data dirs, web boot probe, stray sweep, Landlock policy
 sandbox.py     Landlock ruleset + exec wrapper
 versioning.py  snapshot, promote, prune, rollback, list_tags, diff
-gitremote.py   bare repo init/config/managed hook, archive extraction, refs, gc/quota
+gitremote.py   bare repo init/config/managed hook, archive extraction, refs, gc
 scaffold.py    base uv project, uv lock, initial commit, publish main
 staging.py     git tokens, staging state, bounded logs, async push pipeline
 contract.py    CONTRACT text only
@@ -190,8 +201,13 @@ history and state plus `refs/capforge/processed` is the promotion record.
 
 ## 10. Security
 
-- MCP `:8099` is unauthenticated by default; treat it as perimeter-only.
+- MCP `:8099` requires `CAPFORGE_MCP_TOKEN` for HTTP transport; clients send
+  `Authorization: Bearer <token>`. `--transport stdio` is local and does not need it.
 - `/api` needs the console token and CSRF on writes. `/ui` is public. `/cap` is public by design.
+- `/cap` and `/api` share an origin. The proxy strips `Cookie`, `Authorization`, `X-CSRF`, incoming
+  `x-capforge-*` and upstream `Set-Cookie`, but a served capability's own JavaScript can still call
+  `/api` with the operator's session. Treat web capabilities as trusted, or expose `/cap` on a
+  distinct origin at the reverse proxy.
 - `/git` needs a per-capability TTL token; one token grants clone and push; Basic only. Tokens are hashed,
   request/byte-capped, never logged, and Basic usernames are bound to the actor; Bearer is not accepted.
 - Capability environments are filtered; index settings are installer-only. Declared `Env` fields
@@ -217,5 +233,5 @@ history and state plus `refs/capforge/processed` is the promotion record.
   isolation/shared data, Landlock denial, prune.
 - `test_web.py` slow: real uvicorn children, `/cap` proxy, restart/prune/restore, process-group
   kills, console.
-- CI/DoD: full suite with coverage floor 69% (measured 70.39%), ruff, mypy, ten-tool surface.
+- CI/DoD: full suite with coverage floor 71% (measured 72.38%), ruff, mypy, ten-tool surface.
   `tools/mcp_probe.py` exercises real MCP HTTP plus clone/push and the web round trip.

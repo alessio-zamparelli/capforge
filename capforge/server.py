@@ -1,13 +1,15 @@
-"""MCP surface: nine stable tools; capabilities live behind a git repository."""
+"""MCP surface: ten stable tools; capabilities live behind a git repository."""
 
 from __future__ import annotations
 
+import hmac
 import logging
 import shutil
 from pathlib import Path
 from typing import Any
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth import AccessToken, TokenVerifier
 
 from . import __version__, core, scaffold, versioning
 from . import staging as staging_service
@@ -20,6 +22,7 @@ from .core import (
     data_dir,
     env_status,
     execute,
+    git_timeout,
     install_timeout,
     keep_tags,
     list_files,
@@ -53,12 +56,32 @@ TOOL_NAMES = [
     "list_tags",
 ]
 
+
+class _McpTokenVerifier(TokenVerifier):
+    """Constant-time bearer check for the HTTP MCP listener.
+
+    The token is read once at import; the CLI refuses to start HTTP without
+    one. It is never part of a capability environment.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not token or not hmac.compare_digest(token.encode(), self._token.encode()):
+            return None
+        return AccessToken(token=token, client_id="capforge", scopes=[])
+
+
+_mcp_token = core.mcp_token()
 mcp = FastMCP(
     "capforge",
     instructions=(
         "Git-authored capabilities. Scaffold a uv project, clone its repository, edit, "
         "push, and poll staging(latest). The pipeline tests and promotes on green."
     ),
+    auth=_McpTokenVerifier(_mcp_token) if _mcp_token else None,
 )
 
 
@@ -136,6 +159,7 @@ def get_contract() -> dict:
             "run_timeout_s": run_timeout(),
             "test_timeout_s": test_timeout(),
             "install_timeout_s": install_timeout(),
+            "git_timeout_s": git_timeout(),
             "serve_boot_timeout_s": serve_boot_timeout(),
             "log_max_bytes": log_max_bytes(),
             "log_tail_bytes": log_tail_bytes(),
@@ -148,6 +172,10 @@ def get_contract() -> dict:
             "api": f"{web.public_base()}/api/",
             "git": f"{web.public_base()}/git/<name>.git",
             "cap": f"{web.public_base()}/cap/<name>/",
+        },
+        "mcp": {
+            "transport": RUNTIME_TRANSPORT,
+            "auth": "bearer" if core.mcp_token() else "stdio-or-unconfigured",
         },
         "loop": (
             "scaffold_capability -> staging(action='token') -> git clone -> edit/uv add/uv lock "
@@ -474,6 +502,7 @@ def delete_capability(name: str, confirm: str) -> dict:
             stopped = True
             with core.cap_lock(validated):
                 staging_service.forget(validated)
+                staging_service.cleanup_backups(validated)
                 for target in targets:
                     if target.is_dir():
                         shutil.rmtree(target, ignore_errors=True)

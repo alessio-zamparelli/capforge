@@ -1,9 +1,14 @@
 """Serving engine and web listener for web (`KIND = "web"`) capabilities.
 
 One instance per capability, pinned to its active tag, spawned as a uvicorn
-child bound to 127.0.0.1 and reverse-proxied at `http://<host>:<web port>/<name>/<path>`.
+child bound to 127.0.0.1 and reverse-proxied at `http://<host>:<web port>/cap/<name>/`.
 A persisted registry records the desired state so a restarted server can
-restore instances. The same listener hosts the token-gated console API.
+restore instances.
+
+One web listener hosts `/ui`, `/api`, `/git` and `/cap`. The capability proxy
+and the operator console therefore share an origin; deployments that serve
+untrusted web capabilities should put `/cap` on a distinct origin at the
+reverse proxy (see docs/NEXT.md).
 
 Non-stdlib imports (starlette, httpx) are confined to this module: core,
 versioning and contract stay stdlib-only, and versioning imports back into
@@ -37,7 +42,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response, Stream
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import core, versioning
+from . import __version__, core, versioning
 from .core import CapError
 
 log = logging.getLogger("capforge")
@@ -62,6 +67,10 @@ HOP_BY_HOP = {
     "transfer-encoding",
     "upgrade",
 }
+# Headers that belong to the console/API and must never reach capability code.
+PROXY_DROP_REQUEST = HOP_BY_HOP | {"cookie", "authorization", "x-csrf"}
+# Cookies and cache controls set by a capability must not escape the proxy origin.
+PROXY_DROP_RESPONSE = HOP_BY_HOP | {"content-length", "set-cookie", "clear-site-data"}
 
 SESSION_COOKIE = "capforge_session"
 CSRF_HEADER = "x-csrf"
@@ -82,7 +91,7 @@ def web_host() -> str:
 
 
 def web_port() -> int:
-    """0 disables the whole listener: no proxy, no console, no serving."""
+    """0 disables the whole listener: no proxy, console, clone/push or serving."""
     try:
         return int(os.environ.get("CAPFORGE_WEB_PORT", DEFAULT_WEB_PORT))
     except (TypeError, ValueError):
@@ -108,11 +117,11 @@ def ui_enabled() -> bool:
     return ui_dir() is not None
 
 
-def _display_host() -> str:
-    host = web_host()
-    if host in ("0.0.0.0", "::", ""):
+def _display_host(host: str | None = None) -> str:
+    resolved = host if host is not None else web_host()
+    if resolved in ("0.0.0.0", "::", ""):
         return "127.0.0.1"
-    return host
+    return resolved
 
 
 def public_base() -> str:
@@ -756,6 +765,48 @@ def served_summaries() -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- health
+
+_ready_cache: tuple[float, dict[str, Any]] | None = None
+_ready_lock = threading.Lock()
+READY_TTL = 5.0
+
+
+async def healthz(request: Request) -> Response:
+    """Liveness: the process is serving. No auth and no disk access."""
+    return JSONResponse({"ok": True, "service": "capforge", "version": __version__})
+
+
+def _readiness() -> dict[str, Any]:
+    global _ready_cache
+    now = time.monotonic()
+    with _ready_lock:
+        if _ready_cache is not None and now - _ready_cache[0] < READY_TTL:
+            return _ready_cache[1]
+    from . import sandbox
+
+    state = core.state_dir()
+    checks = {
+        "state_dir": state.is_dir() and os.access(state, os.W_OK),
+        "uv": shutil.which("uv") is not None,
+        "git": shutil.which("git") is not None,
+        "landlock": sandbox.abi_version() is not None,
+    }
+    ok = checks["state_dir"] and checks["uv"] and checks["git"]
+    if core.sandbox_mode() == "require":
+        ok = ok and checks["landlock"]
+    payload = {"ok": ok, "service": "capforge", "version": __version__, "checks": checks}
+    with _ready_lock:
+        _ready_cache = (now, payload)
+    return payload
+
+
+async def readyz(request: Request) -> Response:
+    """Readiness: state is writable and the runtime tools are usable."""
+    payload = await run_in_threadpool(_readiness)
+    return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
+
+
 # --------------------------------------------------------------------------- auth
 
 
@@ -1021,6 +1072,140 @@ async def api_env_var(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
+def _bounded_tail(value: str | None) -> int:
+    try:
+        requested = int(value) if value is not None else core.log_tail_bytes()
+    except (TypeError, ValueError):
+        requested = core.log_tail_bytes()
+    return max(1, min(requested, core.log_tail_bytes()))
+
+
+async def api_cap_detail(request: Request) -> Response:
+    """Full operator view of one capability: tags, pipeline, served state and env."""
+    denied = _console_denied(request, write=False)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+
+    def build() -> dict[str, Any]:
+        from . import staging
+
+        core.cap_path(name)
+        cap = core.load_capability(name)
+        state = versioning.read_state(name)
+        active = state.get("active") or {}
+        record = _registry_record(name)
+        served = None
+        if record is not None:
+            info = _status_of(name)
+            served = {
+                "status": info["status"],
+                "url": info["url"],
+                "version": info["version"],
+                "stale": info["stale"],
+                "desired": info["desired"],
+                "endpoints": info["endpoints"],
+            }
+        pipeline = staging.read_state(name)
+        log = staging.read_log(name, "pipeline", core.log_tail_bytes()) if pipeline else None
+        return {
+            "ok": True,
+            "name": name,
+            "description": cap.description,
+            "kind": cap.kind,
+            "data": cap.data,
+            "active": active.get("tag"),
+            "active_content_hash": (active.get("content_hash") or "")[:12],
+            "draft_ready": cap.draft_ready,
+            "draft_error": cap.error,
+            "draft_changed": bool(
+                active.get("content_hash")
+                and cap.draft_ready
+                and active["content_hash"] != core.tree_hash(cap.path)
+            ),
+            "tags": state.get("tags") or [],
+            "pruned": state.get("pruned") or [],
+            "pipeline": {
+                "state": pipeline.get("state"),
+                "staging_id": pipeline.get("staging_id"),
+                "sha": pipeline.get("sha"),
+                "tag": pipeline.get("tag"),
+                "updated": pipeline.get("updated"),
+                "error": pipeline.get("error"),
+            },
+            "log": log,
+            "served": served,
+            "env": core.env_status(name, _env_caps_for(name)),
+        }
+
+    try:
+        payload = await run_in_threadpool(build)
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    return JSONResponse(payload)
+
+
+async def api_logs(request: Request) -> Response:
+    """Bounded pipeline, scaffold or served log tail."""
+    denied = _console_denied(request, write=False)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    kind = str(request.query_params.get("kind") or "pipeline").strip().lower()
+    if kind not in ("pipeline", "scaffold", "served"):
+        return JSONResponse(
+            {"ok": False, "error": "kind must be pipeline, scaffold or served"}, status_code=400
+        )
+    tail = _bounded_tail(request.query_params.get("tail"))
+    try:
+        if kind == "served":
+            payload = await run_in_threadpool(logs, name, tail)
+        else:
+            from . import staging
+
+            payload = await run_in_threadpool(staging.read_log, name, kind, tail)
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse({**payload, "ok": True, "name": name, "kind": kind})
+
+
+async def api_rollback(request: Request) -> Response:
+    """Move the active pointer to an existing tag; no draft or repo change."""
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    tag = str(payload.get("tag") or "")
+    if not core.TAG_RE.match(tag):
+        return JSONResponse({"ok": False, "error": "a valid tag is required"}, status_code=400)
+    try:
+        result = await run_in_threadpool(versioning.rollback, name, tag)
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse({**result, "ok": True})
+
+
+async def api_delete(request: Request) -> Response:
+    """Delete a capability and all of its server state. Confirm with the exact name."""
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    confirm = str(payload.get("confirm") or "")
+    from . import server as server_module
+
+    result = await run_in_threadpool(server_module.delete_capability, name, confirm)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
 # ----------------------------------------------------------------------------- git
 
 
@@ -1057,6 +1242,32 @@ def _unauthorized(name: str) -> Response:
         headers={"WWW-Authenticate": f'Basic realm="capforge/{name}"'},
         media_type="text/plain",
     )
+
+
+def _max_upload_bytes() -> int:
+    try:
+        return max(1, int(os.environ.get("CAPFORGE_MAX_UPLOAD_BYTES", 64 * 1024 * 1024)))
+    except (TypeError, ValueError):
+        return 64 * 1024 * 1024
+
+
+async def _read_limited_body(request: Request, limit: int) -> bytes | None:
+    """Read a request body without trusting Content-Length or buffering past the cap."""
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > limit:
+                return None
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str) -> Response:
@@ -1108,7 +1319,7 @@ def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str)
         )
         try:
             with core.track_child(proc.pid):
-                out, err = proc.communicate(body, timeout=core.run_timeout())
+                out, err = proc.communicate(body, timeout=core.git_timeout())
         except subprocess.TimeoutExpired:
             core._kill_group(proc)
             out, err = proc.communicate()
@@ -1184,38 +1395,37 @@ async def git_service(request: Request) -> Response:
     record = _git_auth(request, name)
     if record is None:
         return _unauthorized(name)
-    body = await request.body()
-    if len(body) > int(os.environ.get("CAPFORGE_MAX_UPLOAD_BYTES", 64 * 1024 * 1024)):
+    body = await _read_limited_body(request, _max_upload_bytes())
+    if body is None:
         return Response("push too large\n", status_code=413, media_type="text/plain")
     actor = str((record.get("actor") or {}).get("id") or "")
     if service == "git-upload-pack":
         return await run_in_threadpool(_run_cgi, name, service, request, body, actor)
 
     def push() -> Response:
-        before = gitremote.rev_parse(name)
-        current = staging.read_state(name)
-        if current.get("state") and current.get("state") not in {
-            "promoted",
-            "unchanged",
-            "failed",
-            "interrupted",
-        }:
-            return Response("pipeline busy\n", status_code=409, media_type="text/plain")
+        # The state check and the pipeline start are one critical section with
+        # the CGI call: otherwise a second push can pass the check while the
+        # first is between _run_cgi and staging.start(), and one tree is dropped
+        # or promoted under another push's sha.
         with staging.push_lock(name):
+            current = staging.read_state(name)
+            if current.get("state") and current.get("state") not in staging.TERMINAL_STATES:
+                return Response("pipeline busy\n", status_code=409, media_type="text/plain")
+            before = gitremote.rev_parse(name)
             response = _run_cgi(name, service, request, body, actor)
-        after = gitremote.rev_parse(name)
-        if response.status_code == 200 and after and after != before:
-            try:
-                staging.start(
-                    name,
-                    after,
-                    record.get("actor") or {},
-                    gitremote.commit_subject(name, after),
-                    auth_method=str(record.get("auth_method") or "basic"),
-                    basic_username=str(record.get("basic_username") or ""),
-                )
-            except core.CapError as exc:
-                log.warning("pipeline start failed cap=%s: %s", name, exc)
+            after = gitremote.rev_parse(name)
+            if response.status_code == 200 and after and after != before:
+                try:
+                    staging.start(
+                        name,
+                        after,
+                        record.get("actor") or {},
+                        gitremote.commit_subject(name, after),
+                        auth_method=str(record.get("auth_method") or "basic"),
+                        basic_username=str(record.get("basic_username") or ""),
+                    )
+                except core.CapError as exc:
+                    log.warning("pipeline start failed cap=%s: %s", name, exc)
         return response
 
     return await run_in_threadpool(push)
@@ -1248,13 +1458,15 @@ async def proxy(request: Request) -> Response:
             },
             status_code=404,
         )
-    body = await request.body()
-    if len(body) > MAX_PROXY_BODY:
+    body = await _read_limited_body(request, MAX_PROXY_BODY)
+    if body is None:
         return JSONResponse({"error": "request body too large"}, status_code=413)
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key not in HOP_BY_HOP and key != "host"
+        if key not in PROXY_DROP_REQUEST
+        and key != "host"
+        and not key.startswith("x-capforge-")
     }
     headers["host"] = f"127.0.0.1:{instance.port}"
     headers["x-capforge-capability"] = name
@@ -1280,8 +1492,9 @@ async def proxy(request: Request) -> Response:
     response_headers = {
         key: value
         for key, value in upstream_response.headers.items()
-        if key not in HOP_BY_HOP and key != "content-length"
+        if key not in PROXY_DROP_RESPONSE
     }
+    response_headers["x-content-type-options"] = "nosniff"
     return StreamingResponse(
         upstream_response.aiter_raw(),
         status_code=upstream_response.status_code,
@@ -1308,16 +1521,24 @@ async def ui_redirect(request: Request) -> Response:
 
 
 def asgi_app() -> Starlette:
-    """The :8080 application: /ui, /api, /git and /cap.
+    """The :8080 application: /ui, /api, /git, /cap and health probes.
 
-    There is no root /{name} catch-all. Route order is API, git, UI, cap, root.
+    There is no root /{name} catch-all. Route order is health, API, git, UI,
+    cap, root. The console and capability proxy share this origin; see
+    docs/NEXT.md for the reverse-proxy isolation option.
     """
     routes: list[Any] = [
+        Route("/healthz", healthz, methods=["GET"]),
+        Route("/readyz", readyz, methods=["GET"]),
         Route("/api/login", api_login, methods=["POST"]),
         Route("/api/session", api_session, methods=["GET"]),
         Route("/api/caps", api_caps, methods=["GET"]),
         Route("/api/caps/{name}/env", api_env, methods=["GET", "POST"]),
         Route("/api/caps/{name}/env/{var}", api_env_var, methods=["DELETE"]),
+        Route("/api/caps/{name}/logs", api_logs, methods=["GET"]),
+        Route("/api/caps/{name}/rollback", api_rollback, methods=["POST"]),
+        Route("/api/caps/{name}/delete", api_delete, methods=["POST"]),
+        Route("/api/caps/{name}", api_cap_detail, methods=["GET"]),
         Route("/api/caps/{name}/{action}", api_control, methods=["POST"]),
         Route("/git/{name}.git/info/refs", git_info_refs, methods=["GET"]),
         Route("/git/{name}.git/{service}", git_service, methods=["POST"]),

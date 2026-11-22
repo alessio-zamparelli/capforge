@@ -26,6 +26,8 @@ MAX_TOKENS_PER_NAME = 20
 MAX_TOKENS = 500
 MAX_REQUESTS = 10_000
 _TERMINAL = {"promoted", "unchanged", "failed", "interrupted"}
+# Public alias for callers (web push route) that gate on pipeline activity.
+TERMINAL_STATES = frozenset(_TERMINAL)
 
 
 # --------------------------------------------------------------------------- paths
@@ -257,6 +259,40 @@ def forget(name: str) -> None:
     shutil.rmtree(core.state_dir() / "logs" / name, ignore_errors=True)
 
 
+def _backups_dir(name: str) -> Path:
+    return core.cap_path(name).parent / ".staging" / "backups"
+
+
+def cleanup_backups(name: str) -> None:
+    """Remove every draft backup left for one capability (delete/restore safety)."""
+    directory = _backups_dir(name)
+    if not directory.is_dir():
+        return
+    for entry in directory.glob(f"{name}-*"):
+        shutil.rmtree(entry, ignore_errors=True)
+
+
+def sweep_backups(max_age_seconds: int = 24 * 3600) -> list[str]:
+    """Drop stale draft backups that survived a crash; best effort at startup."""
+    caps = core.caps_dir()
+    directory = caps / ".staging" / "backups"
+    if not directory.is_dir():
+        return []
+    now = time.time()
+    removed: list[str] = []
+    for entry in directory.iterdir():
+        try:
+            if now - entry.stat().st_mtime < max_age_seconds:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(entry.name)
+    if removed:
+        log.info("swept %d stale staging backup(s)", len(removed))
+    return removed
+
+
 # ------------------------------------------------------------------------ pipeline
 
 
@@ -375,6 +411,11 @@ def _run_pipeline(
                     if backup is not None and backup.exists():
                         os.replace(backup, draft)
                     raise
+                else:
+                    # The swap and promotion succeeded; the backup is no longer
+                    # needed and would otherwise grow the caps directory forever.
+                    if backup is not None:
+                        shutil.rmtree(backup, ignore_errors=True)
             if result.get("promoted"):
                 _set(name, staging_id, "promoted", sha=sha, tag=result.get("tag"))
             else:
