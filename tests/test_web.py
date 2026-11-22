@@ -379,6 +379,9 @@ def test_proxy_passes_through_methods_and_headers(env):
             assert ok.json() == {"echo": {"a": 1}, "marker": "yes"}
             not_found = await client.get("/cap/echocap/nope")
             assert not_found.status_code == 404
+            docs = await client.get("/cap/echocap/docs")
+            assert docs.status_code == 200, docs.text
+            assert "/cap/echocap/openapi.json" in docs.text
 
     anyio.run(run)
     server.serve_capability("echocap", action="stop")

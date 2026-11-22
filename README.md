@@ -167,6 +167,10 @@ concurrency, migrations and backup. Code trees are not writable. Landlock denies
 other capabilities, home, `/proc`, `/sys` and everything not explicitly allowed. Network, CPU and
 memory are not confined.
 
+Served web apps are booted with uvicorn `--root-path /cap/<name>` and receive
+`CAPFORGE_ROOT_PATH`. Do not pass `root_path=` to `FastAPI(...)`; it is deprecated. Read the env
+value when code needs the prefix for absolute links.
+
 ## Git authentication
 
 `staging(name, action="token")` returns a short-lived token and `basic_username`. Authentication is

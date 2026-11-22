@@ -147,6 +147,11 @@ type-shaped placeholder (`capforge-test-placeholder`, `0`, `0.0`, `false`) for e
 values never enter model-visible pipeline logs. A missing required active value fails the
 run/serve with the missing names.
 
+Web children are booted with uvicorn `--root-path /cap/<name>` and `CAPFORGE_ROOT_PATH`; the proxy
+strips the prefix before forwarding, so app routes stay unprefixed. This replaces the deprecated
+`FastAPI(root_path=...)` parameter: FastAPI derives `/docs` and `/openapi.json` URLs from the ASGI
+scope instead.
+
 ## 8. Data
 
 - `CAPFORGE_DATA_DIR=<state>/data/<name>/<tag>/` (or `draft`/`test`): writable per-version data,

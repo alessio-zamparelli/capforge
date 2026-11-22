@@ -140,6 +140,8 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+# The server boots uvicorn with --root-path /cap/{name} and exports
+# CAPFORGE_ROOT_PATH. Do not pass root_path= to FastAPI; it is deprecated.
 app = FastAPI(title="{name}")
 
 

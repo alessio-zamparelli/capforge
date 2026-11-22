@@ -109,6 +109,10 @@ names the ASGI module; `APP` selects the object (default `app`). After promotion
 `serve_capability` boots the active tag at `/cap/<name>/`; a promotion does not restart it until
 `restart`.
 
+The server boots the app with uvicorn `--root-path /cap/<name>` and exports
+`CAPFORGE_ROOT_PATH`. Do not pass `root_path=` to `FastAPI(...)`; it is deprecated. Use
+`CAPFORGE_ROOT_PATH` if the code needs the prefix to build absolute links.
+
 ## Versioning
 
 The pushed tree is tested before the draft swap. A green tree is snapshotted into an immutable tag,
@@ -189,6 +193,10 @@ must never commit them.
 (`ENTRYPOINT = "app.py"`, `APP = "app"`). After promotion,
 `serve_capability(name, action="start")` exposes it at `/cap/<name>/`. A later promotion does not
 restart it; use `restart`. Validate every request: anyone who can reach the proxy is a caller.
+
+The server boots uvicorn with `--root-path /cap/<name>` and exports `CAPFORGE_ROOT_PATH`. Do not
+pass `root_path=` to `FastAPI(...)`; it is deprecated. Read the env value if code needs the
+prefix for absolute links.
 
 ## Data
 

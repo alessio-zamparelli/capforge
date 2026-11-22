@@ -125,7 +125,7 @@ def public_base() -> str:
 
 def public_url(name: str) -> str:
     """Caller-facing URL of a served capability under /cap/<name>/."""
-    return f"{public_base()}/cap/{name}/"
+    return f"{public_base()}{core.cap_root_path(name)}/"
 
 
 def git_url(name: str) -> str:

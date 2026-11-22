@@ -125,6 +125,15 @@ def test_web_rejects_non_identifier_app(tmp_path):
     assert "identifier" in loaded.error
 
 
+def test_web_child_carries_the_public_root_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    cap = core.Capability(name="demo", path=tmp_path, kind="web", app_name="app")
+    argv = core.web_child_argv(cap, tmp_path, 1234)
+    assert argv[argv.index("--root-path") + 1] == "/cap/demo"
+    env = core.web_child_env(cap, tag="v1", venv=tmp_path, port=1234)
+    assert env["CAPFORGE_ROOT_PATH"] == "/cap/demo"
+
+
 def test_deploy_py_is_required(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()

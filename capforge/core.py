@@ -1613,9 +1613,16 @@ def _http_probe(port: int, deadline: float) -> tuple[bool, str]:
         time.sleep(0.1)
 
 
+def cap_root_path(name: str) -> str:
+    """Public path prefix of a served capability; the proxy strips it before forwarding."""
+    return f"/cap/{name}"
+
+
 def web_child_argv(cap: Capability, source: Path, port: int) -> list[str]:
     """uvicorn arguments for a web capability's ASGI app. `--app-dir` keeps
-    nested entrypoints importable; children always bind 127.0.0.1."""
+    nested entrypoints importable; `--root-path` lets FastAPI build prefixed URLs
+    without the deprecated `FastAPI(root_path=...)` parameter. Children always
+    bind 127.0.0.1."""
     module = Path(cap.entrypoint).stem
     app_dir = (source / cap.entrypoint).parent
     return [
@@ -1626,6 +1633,8 @@ def web_child_argv(cap: Capability, source: Path, port: int) -> list[str]:
         "127.0.0.1",
         "--port",
         str(port),
+        "--root-path",
+        cap_root_path(cap.name),
         "--app-dir",
         str(app_dir),
         "--log-level",
@@ -1656,6 +1665,7 @@ def web_child_env(
     env["TMPDIR"] = str(scratch)
     env["HOME"] = str(scratch)
     env["CAPFORGE_SERVE_PORT"] = str(port)
+    env["CAPFORGE_ROOT_PATH"] = cap_root_path(cap.name)
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
     if public_url:
