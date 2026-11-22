@@ -70,6 +70,13 @@ The CLI entrypoint is executed as a fresh subprocess, once per call:
 
 Return `{"error": "..."}` for a handled failure the model should read. Raise only for bugs.
 
+## Testing
+
+`tests/` runs with pytest before promotion. pytest-cov traces the test process; a test that runs
+`main.py` as a subprocess cannot be measured, so a coverage report may show `main.py` at 0% even
+though the test exercised it. That is expected. Modules imported by the tests (including
+`deploy.py`) are measured normally.
+
 ## Environment
 
 Declare every variable your code reads as a field of `Env` in `deploy.py`:
@@ -207,9 +214,13 @@ the tag is an immutable snapshot and the draft is derived.
 
 ## Testing
 
-`tests/` runs with pytest before promotion. Tests and the web boot probe receive non-secret
-placeholders: the declared default, or `capforge-test-placeholder`, `0`, `0.0` or `false` by type.
-Never require a real secret at import time.
+`tests/` runs with pytest before promotion. pytest-cov traces the test process, so a test that
+runs `main.py` as a subprocess cannot be measured: `main.py` may show 0% coverage even though it
+ran. That is expected; modules the tests import (including `deploy.py`) are measured normally.
+
+Tests and the web boot probe receive non-secret placeholders: the declared default, or
+`capforge-test-placeholder`, `0`, `0.0` or `false` by type. Never require a real secret at import
+time.
 
 ## Versioning
 
