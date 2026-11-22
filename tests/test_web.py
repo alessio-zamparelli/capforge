@@ -94,10 +94,10 @@ def test_web_lifecycle_proxy_and_restart(env):
     started = server.serve_capability("websvc", action="start")
     assert started["ok"], started
     assert started["status"] == "running"
-    assert started["url"].endswith("/websvc/")
+    assert started["url"].endswith("/cap/websvc/")
     assert {e["path"] for e in started["endpoints"]} == {"/", "/health"}
 
-    code, body = _asgi_get(web, "/websvc/health")
+    code, body = _asgi_get(web, "/cap/websvc/health")
     assert code == 200 and '"healthy":true' in body.replace(" ", ""), body
     assert web._registry_record("websvc")["desired"] == "start"
 
@@ -129,6 +129,20 @@ def test_web_lifecycle_proxy_and_restart(env):
     assert web._INSTANCES == {}
 
 
+def test_delete_capability_stops_served_child(env):
+    root, server, web, _core = env
+    _make_web_cap(env, "deleted")
+    started = server.serve_capability("deleted", action="start")
+    assert started["status"] == "running"
+    result = server.delete_capability("deleted", "deleted")
+    assert result["ok"], result
+    assert result["deleted"] is True
+    assert server.get_capability("deleted")["ok"] is False
+    assert "deleted" not in web._INSTANCES
+    assert web._registry_record("deleted") is None
+    assert not (root / "caps" / "deleted").exists()
+
+
 def test_serve_refuses_draft_and_cli(env):
     _, server, _, _ = env
     # A CLI capability is refused even after promotion: kind is a tag property.
@@ -150,7 +164,7 @@ def test_boot_probe_blocks_promotion_of_dead_app(env):
     assert made["ok"]
     app_py = Path(made["path"]) / "app.py"
     app_py.write_text("import nonexistent_module_xyz\napp = None\n", encoding="utf-8")
-    (Path(made["path"]) / "tests" / "test_main.py").unlink()
+    (Path(made["path"]) / "tests" / "test_scaffold.py").unlink()
     tested = server.test_capability("deadweb")
     assert tested["ok"] is False
     assert "boot" in str(tested.get("tests", {}).get("stderr", "")).lower()
@@ -191,9 +205,9 @@ def test_call_leaves_no_daemon_behind(env):
         "if os.fork() > 0:\n"
         "    os._exit(0)\n"
         "os.setsid()\n"
-        "sys.stdin.close()\n"
-        "sys.stdout = open(os.devnull, 'w')\n"
-        "sys.stderr = open(os.devnull, 'w')\n"
+        "null = os.open(os.devnull, os.O_RDWR)\n"
+        "os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)\n"
+        "if null > 2: os.close(null)\n"
         "import time\n"
         "time.sleep(600)\n",
         encoding="utf-8",
@@ -329,7 +343,7 @@ def test_console_json_index_and_disabled_console(env, monkeypatch):
                     "version": "v1",
                 }
             ]
-            assert (await client.get("/indexcap/health")).status_code == 200
+            assert (await client.get("/cap/indexcap/health")).status_code == 200
             assert (await client.post("/api/login", json={"token": "x"})).status_code == 403
 
     anyio.run(run)
@@ -356,18 +370,72 @@ def test_proxy_passes_through_methods_and_headers(env):
         transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 41000))
         async with httpx.AsyncClient(transport=transport, base_url="http://x") as client:
             big = "x" * (33 * 1024 * 1024)
-            too_big = await client.post("/echocap/echo", content=big.encode())
+            too_big = await client.post("/cap/echocap/echo", content=big.encode())
             assert too_big.status_code == 413
             ok = await client.post(
-                "/echocap/echo", json={"a": 1}, headers={"x-marker": "yes"}
+                "/cap/echocap/echo", json={"a": 1}, headers={"x-marker": "yes"}
             )
             assert ok.status_code == 200, ok.text
             assert ok.json() == {"echo": {"a": 1}, "marker": "yes"}
-            not_found = await client.get("/echocap/nope")
+            not_found = await client.get("/cap/echocap/nope")
             assert not_found.status_code == 404
 
     anyio.run(run)
     server.serve_capability("echocap", action="stop")
+
+
+def test_env_change_restarts_running_web_cap(env, monkeypatch):
+    root, server, web, core = env
+    made = server.scaffold_capability("envweb", "Reads an operator env value.", kind="web")
+    assert made["ok"], made
+    cap = root / "caps" / "envweb"
+    (cap / "app.py").write_text(
+        _web_cap_source(
+            "envweb",
+            "import os\n\n\n"
+            '@app.get("/key")\n'
+            "def key() -> dict:\n"
+            '    return {"key": os.environ.get("DEMO_KEY")}\n',
+        ),
+        encoding="utf-8",
+    )
+    skill = cap / "SKILL.md"
+    skill.write_text(
+        skill.read_text(encoding="utf-8").replace("# env: [API_KEY]", "env: [DEMO_KEY]"),
+        encoding="utf-8",
+    )
+    core.set_cap_env("envweb", "DEMO_KEY", "one")
+
+    assert server.test_capability("envweb")["ok"]
+    assert server.promote_capability("envweb", tag="v1")["ok"]
+    started = server.serve_capability("envweb", action="start")
+    assert started["status"] == "running"
+    code, body = _asgi_get(web, "/cap/envweb/key")
+    assert code == 200 and '"key":"one"' in body.replace(" ", ""), body
+
+    monkeypatch.setenv("CAPFORGE_WEB_TOKEN", "round-trip-token")
+    import anyio
+    import httpx
+
+    async def run() -> None:
+        transport = httpx.ASGITransport(app=web.asgi_app(), client=("127.0.0.1", 41000))
+        async with httpx.AsyncClient(transport=transport, base_url="http://x") as client:
+            login = await client.post("/api/login", json={"token": "round-trip-token"})
+            assert login.status_code == 200
+            headers = {"X-CSRF": "1", "cookie": f"capforge_session={login.cookies['capforge_session']}"}
+            saved = await client.post(
+                "/api/caps/envweb/env",
+                headers=headers,
+                json={"name": "DEMO_KEY", "value": "two"},
+            )
+            assert saved.status_code == 200, saved.text
+            assert saved.json()["restarted"] is True, saved.text
+            assert "two" not in saved.text
+
+    anyio.run(run)
+    code, body = _asgi_get(web, "/cap/envweb/key")
+    assert code == 200 and '"key":"two"' in body.replace(" ", ""), body
+    server.serve_capability("envweb", action="stop")
 
 
 def test_served_venv_survives_venv_gc(env):

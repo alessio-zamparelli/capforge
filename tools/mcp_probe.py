@@ -1,15 +1,17 @@
-"""Talk to the running capforge server over real MCP HTTP, the way Open WebUI would.
+"""Talk to a running capforge server over real MCP HTTP, the way Open WebUI would.
 
-The probe uses unique capability names and removes them, their tags, venvs, data, locks
-and serve-registry entries afterwards when the caps/state directories are visible from
-this process. It also drives one `kind: web` capability through the full serving round
-trip (start -> proxy -> restart -> stop) against the web listener on :8080.
+Exercises the git-authored loop: scaffold -> token -> clone -> commit -> push ->
+pipeline -> promoted -> run, plus one web capability start/proxy/restart/stop.
 """
 
+import base64
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -18,6 +20,18 @@ URL = os.environ.get("CAPFORGE_URL", "http://127.0.0.1:8099/mcp")
 WEB_URL = os.environ.get("CAPFORGE_WEB_PROBE_URL", "http://127.0.0.1:8080")
 CAP_NAME = f"probe_{os.getpid()}"
 WEB_NAME = f"webprobe_{os.getpid()}"
+TOOLS = [
+    "get_contract",
+    "list_capabilities",
+    "get_capability",
+    "scaffold_capability",
+    "run_capability",
+    "serve_capability",
+    "staging",
+    "delete_capability",
+    "rollback_capability",
+    "list_tags",
+]
 
 
 def parse(resp: httpx.Response):
@@ -31,25 +45,63 @@ def cleanup(contract: dict, name: str) -> None:
     caps = Path(contract["caps_dir"])
     state = Path(contract["state_dir"])
     shutil.rmtree(caps / name, ignore_errors=True)
-    for sub in ("versions", "venvs", "data", "backups"):
+    for sub in ("versions", "venvs", "data", "backups", "staging", "logs"):
         shutil.rmtree(state / sub / name, ignore_errors=True)
+    shutil.rmtree(state / "git" / f"{name}.git", ignore_errors=True)
     shutil.rmtree(state / "served" / name, ignore_errors=True)
     (state / "state" / f"{name}.json").unlink(missing_ok=True)
-    (state / "locks" / f"{name}.lock").unlink(missing_ok=True)
-    for lock in (state / "locks").glob(f"{name}-*.lock"):
+    (state / "staging" / f"{name}.json").unlink(missing_ok=True)
+    for leftover in (caps / ".staging").glob(f"{name}-*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    for leftover in (caps / ".staging" / "backups").glob(f"{name}-*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    shutil.rmtree(state / "git" / f"{name}.git", ignore_errors=True)
+    for lock in (state / "locks").glob(f"{name}*.lock"):
         lock.unlink(missing_ok=True)
-    # A served instance must not survive the probe: stop it through the MCP
-    # surface first (the caller does that), then drop its registry entry.
-    registry = state / "served" / "registry.json"
+
+
+def push(name: str, token: str, git_url: str, basic_username: str, edit) -> None:
+    work = Path(tempfile.mkdtemp(prefix=f"{name}-probe-"))
     try:
-        data = json.loads(registry.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if isinstance(data, dict) and name in data:
-        data.pop(name, None)
-        tmp = registry.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(registry)
+        encoded = base64.b64encode(f"{basic_username}:{token}".encode()).decode()
+        env = dict(os.environ)
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": f"Authorization: Basic {encoded}",
+            }
+        )
+        proc = subprocess.run(
+            ["git", "clone", "-q", git_url, str(work)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        edit(work)
+        for args in (
+            ["git", "-C", str(work), "add", "-A"],
+            [
+                "git",
+                "-C",
+                str(work),
+                "-c",
+                "user.email=probe@example.test",
+                "-c",
+                "user.name=probe",
+                "commit",
+                "-q",
+                "-m",
+                "probe update",
+            ],
+            ["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"],
+        ):
+            proc = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
+            assert proc.returncode == 0, proc.stderr
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def main() -> int:
@@ -65,23 +117,21 @@ def main() -> int:
             "params": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": {"name": "probe", "version": "1"},
+                "clientInfo": {"name": "probe", "version": "2"},
             },
         },
     )
     sid = r.headers["mcp-session-id"]
     print("session", sid[:8], "->", parse(r)["result"]["serverInfo"])
     client.headers["mcp-session-id"] = sid
-
     client.post(URL, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     listed = parse(client.post(URL, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
     names = [t["name"] for t in listed["result"]["tools"]]
     print("tools/list ->", names)
-    assert len(names) == 11, names
-    assert "serve_capability" in names, names
+    assert names == TOOLS, names
 
-    def call(name, args):
+    def call(name: str, args: dict) -> dict:
         resp = parse(
             client.post(
                 URL,
@@ -95,8 +145,7 @@ def main() -> int:
         )
         if "error" in resp:
             raise SystemExit(f"{name} -> protocol error {resp['error']}")
-        content = resp["result"]["content"]
-        text = next(c["text"] for c in content if c["type"] == "text")
+        text = next(c["text"] for c in resp["result"]["content"] if c["type"] == "text")
         return json.loads(text)
 
     contract = call("get_contract", {})
@@ -106,47 +155,65 @@ def main() -> int:
             "scaffold_capability",
             {"name": CAP_NAME, "description": "Counts words in a text."},
         )
-        print("scaffold ->", made["ok"], made.get("files"))
+        print("scaffold ->", made["ok"], made["git_url"])
 
-        tested = call("test_capability", {"name": CAP_NAME, "args": {"text": "one two three"}})
-        print("test ->", tested["ok"], tested.get("run", {}).get("result"))
+        minted = call("staging", {"name": CAP_NAME, "action": "token"})
+        print("token ->", minted["ok"], minted["ttl_s"], "s")
+        push(
+            CAP_NAME,
+            minted["token"],
+            minted["git_url"],
+            minted["basic_username"],
+            lambda work: (work / "main.py").write_text(
+                (work / "main.py").read_text() + "\n# probe\n", encoding="utf-8"
+            ),
+        )
 
-        promo = call("promote_capability", {"name": CAP_NAME, "tag": "v1", "note": "initial"})
-        print("promote ->", promo["ok"], promo.get("tag"), promo.get("git_commit"))
+        state = {}
+        for _ in range(180):
+            state = call("staging", {"name": CAP_NAME, "action": "latest"})
+            print("pipeline ->", state.get("state"), state.get("tag"))
+            if state.get("state") in {"promoted", "unchanged", "failed", "interrupted"}:
+                break
+            time.sleep(1)
+        assert state.get("state") == "promoted", state
+        logs = call("staging", {"name": CAP_NAME, "action": "logs"})
+        print("logs ->", len(logs["text"]), "bytes")
 
         ran = call("run_capability", {"name": CAP_NAME, "args": {"text": "a b"}})
         print("run ->", ran["ok"], ran["version"], ran["result"])
+        assert ran["result"] == {"text": "a b", "length": 3}
 
-        tags = call("list_tags", {"name": CAP_NAME, "diff_against_active": True})
+        tags = call("list_tags", {"name": CAP_NAME})
         print("tags ->", [t["tag"] for t in tags["tags"]], "active", tags["active"])
-
         listed = call("list_capabilities", {})
-        print(
-            "list ->",
-            [(c["name"], c["active"], c["draft_changed"]) for c in listed["capabilities"]],
-        )
-
-        installed = call("install_packages", {"name": CAP_NAME, "packages": ["six"]})
-        print("install ->", installed["ok"], installed.get("packages"), installed.get("error", "")[:80])
-
+        print("list ->", [(c["name"], c["active"]) for c in listed["capabilities"]])
         missing = call("run_capability", {"name": "does_not_exist", "args": {}})
         print("bad name ->", missing["ok"], missing["error"][:70])
 
-        # ---- kind: web round trip: scaffold -> test (boot probe) -> promote -> serve
         web_made = call(
             "scaffold_capability",
             {"name": WEB_NAME, "description": "Probe web service.", "kind": "web"},
         )
-        print("web scaffold ->", web_made["ok"], web_made.get("kind"), web_made.get("files"))
-
-        web_tested = call("test_capability", {"name": WEB_NAME})
-        print("web test (boot probe) ->", web_tested["ok"])
-
-        web_promo = call("promote_capability", {"name": WEB_NAME, "tag": "v1", "note": "web"})
-        print("web promote ->", web_promo["ok"], web_promo.get("tag"))
-
-        refused = call("run_capability", {"name": WEB_NAME, "args": {}})
-        print("run on web cap refused ->", refused["ok"] is False, refused.get("error", "")[:60])
+        print("web scaffold ->", web_made["ok"], web_made["git_url"])
+        web_minted = call("staging", {"name": WEB_NAME, "action": "token"})
+        push(
+            WEB_NAME,
+            web_minted["token"],
+            web_minted["git_url"],
+            web_minted["basic_username"],
+            lambda work: (work / "AGENTS.md").write_text(
+                (work / "AGENTS.md").read_text() + "\n", encoding="utf-8"
+            ),
+        )
+        web_state = {}
+        for _ in range(180):
+            web_state = call("staging", {"name": WEB_NAME, "action": "latest"})
+            print("web pipeline ->", web_state.get("state"), web_state.get("tag"))
+            if web_state.get("state") in {"promoted", "unchanged", "failed", "interrupted"}:
+                break
+            time.sleep(1)
+        assert web_state.get("state") == "promoted", web_state
 
         started = call("serve_capability", {"name": WEB_NAME, "action": "start"})
         print("serve start ->", started["ok"], started.get("status"), started.get("url"))
@@ -156,16 +223,14 @@ def main() -> int:
             health = web_client.get(f"{prefix}/health")
             print("proxy /health ->", health.status_code, health.text[:60])
             assert health.status_code == 200
-            bare = web_client.get(f"{WEB_URL}/{WEB_NAME}", follow_redirects=False)
-            print("bare /<name> ->", bare.status_code, bare.headers.get("location"))
+            bare = web_client.get(f"{WEB_URL}/cap/{WEB_NAME}", follow_redirects=False)
+            print("bare /cap/<name> ->", bare.status_code, bare.headers.get("location"))
             assert bare.status_code == 307
-            unserved = web_client.get(f"{WEB_URL}/no_such_probe_cap/health")
+            unserved = web_client.get(f"{WEB_URL}/cap/no_such_probe_cap/health")
             print("unserved ->", unserved.status_code)
             assert unserved.status_code == 404
-
         restarted = call("serve_capability", {"name": WEB_NAME, "action": "restart"})
         print("serve restart ->", restarted["ok"], restarted.get("status"))
-
         stopped = call("serve_capability", {"name": WEB_NAME, "action": "stop"})
         print("serve stop ->", stopped["ok"], stopped.get("status"))
         assert stopped.get("status") == "stopped", stopped

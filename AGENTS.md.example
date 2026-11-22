@@ -1,66 +1,70 @@
-# AGENTS.md — capability workspace
+# Capability workspace
 
-This folder holds capabilities: small programs exposed to the model as tools through the
-`capforge` MCP server. The same folder is readable here, so you can write, run and repair a
-capability yourself.
+This repository is the source for one capforge capability. The server owns its caps directory; you
+work in a clone, commit, and push. There is no shared terminal mount.
 
 ## The loop
 
-1. `get_contract()` once, if you have not seen it.
-2. `scaffold_capability(name, description)` — never start from an empty file. Pass
-   `kind="web"` for a long-lived HTTP service (FastAPI app) instead of a CLI.
-3. Edit `<caps>/<name>/SKILL.md` and `main.py` (or `app.py`) with the file tools.
-4. `test_capability(name, args={...})` — this runs `tests/` with pytest, then one real run.
-   For `kind: web` it also boots the app once and probes it over HTTP.
-5. `promote_capability(name, tag="v2", note="what changed")` — tests must pass; it snapshots
-   the folder, commits it, and makes that tag the version `run_capability` executes.
-6. `run_capability(name, args)` — always the promoted tag, never the half-edited draft.
-7. For `kind: web`: `serve_capability(name, action="start")` runs the active tag as a
-   long-lived server at `http://<host>:8080/<name>/` (actions: start | stop | restart |
-   status). `run_capability` refuses web capabilities.
-8. `rollback_capability(name, tag)` if the new version misbehaves. A running instance keeps
-   the old tag until you `serve_capability(name, action="restart")`.
+1. `get_contract()` once.
+2. `list_capabilities()` for names, active tags and repository URLs.
+3. `scaffold_capability(name, description)`; pass `kind="web"` for an HTTP service.
+4. `staging(name, action="token")` returns a short-lived token and `git_url`.
+5. Clone the repository and work in that clone. Use Basic auth with username
+   `basic_username` and the token as password;
+   `git --no-pager log` or `GIT_PAGER=cat` avoids the pager hanging a terminal.
+6. Edit the uv project; add dependencies with `uv add`, then `uv lock`; commit.
+7. `git push origin HEAD:main`.
+8. Poll `staging(name, action="latest")`; read `staging(name, action="logs")` on failure.
+9. On `promoted`, call `run_capability(name, args)` or `serve_capability(name, action="start")`.
 
-You can also run a CLI capability directly from the shell while iterating:
+Promotion is automatic on a green pipeline. `install_packages`, `test_capability` and
+`promote_capability` are not MCP tools. `capforge promote`/`test` are operator recovery commands.
 
-    cd ~/.agents/skills/<name>
-    echo '{"text": "hello"}' | python3 main.py
+## Layout
 
-## The contract, in one paragraph
+    SKILL.md            name, description, entrypoint, kind, optional data: shared,
+                        env: [NAME, ...] for operator-set values
+    pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
+    uv.lock             committed; uv sync --frozen is the only install path
+    .python-version     3.14
+    main.py | app.py    CLI entrypoint / ASGI app
+    tests/              pytest; dev group also has pytest-cov
+    AGENTS.md           this file
 
-The entrypoint reads **one JSON object on stdin** and writes **one JSON value on stdout**,
-exit 0. The value may be the whole output or the last non-empty line, so diagnostics on
-stdout are tolerated; keep them on stderr anyway. Arguments never arrive as argv. Return
-`{"error": "..."}` for a handled failure with a message meant for the model. Validate every
-argument: it came from a language model, and a specific complaint ("start_date must be
-YYYY-MM-DD") is worth more than a traceback.
+## Process contract (CLI)
 
-A `kind: web` capability is a FastAPI (or any ASGI) app instead: `entrypoint` names the file
-holding the `app` object, `uvicorn` must be in `packages`, and there is no stdin/stdout
-contract. After promotion it runs as a public HTTP endpoint under `http://<host>:8080/<name>/`;
-anyone who can reach the port is a caller, not just the model.
+- stdin: one JSON object with the call arguments. Never argv or environment variables.
+- stdout: one JSON value; the whole output or its last non-empty line.
+- stderr: diagnostics, shown to the caller on failure.
+- exit 0: success; any other exit is a failure.
+- Return `{"error": "..."}` for a handled failure the model should read; raise only for bugs.
 
 ## Rules
 
-* Validate every argument. It came from a language model; name the field and the expected format.
-* Write only under `$CAPFORGE_DATA_DIR`. It is per capability and per version.
-* Assume no network. If you need a package, list it in `packages:` in SKILL.md or call
-  `install_packages`; each capability gets its own venv. Specs are plain requirements
-  (`pypdf>=5`): no spaces, commas, URLs or leading `-`.
-* No secrets: the environment is filtered and there is nowhere to put a key.
-* Be fast. Calls time out at 120s by default; long work belongs in a polled subprocess.
-* Same args plus same data directory must give the same result. Sort, pin formats, do not
-  invent timestamps.
-* Leave nothing running. Anything forked inside a call that outlives it is killed. A resident
-  service is `kind: web` served with `serve_capability`, not a detached daemon.
+- Validate every argument; it came from a language model.
+- Write runtime files only under `CAPFORGE_DATA_DIR` (per version).
+- Add `data: shared` to `SKILL.md` for a stable `CAPFORGE_SHARED_DATA_DIR` across tags. It is
+  unversioned; you own concurrency, schema migrations and backup expectations.
+- Never write beside `main.py`/`app.py`; the tag is an immutable snapshot and the draft is derived.
+- Credentials: declare every variable you read as `env: [NAME, ...]` in `SKILL.md`. The operator
+  sets the values in the console; you cannot read or write them and must never commit them.
+  Values are shared across tags and injected only into the active tag. Tests and the web boot
+  probe get `capforge-test-placeholder`, so never require a real secret at import time.
+- Be fast: calls time out (default 120s).
+- Be deterministic for `data: version`: same args plus the same data, same result.
+- Leave nothing running; a resident service is `kind: web` served with `serve_capability`.
+- Landlock confines filesystem access to your code/venv, system libraries and your data dirs;
+  network/CPU/memory are not confined.
 
-Web services are public: validate every input, return no secrets, and expect the boot probe
-(a promotion needs a successful HTTP probe of the real app).
+## Web
+
+`kind: web` requires `uvicorn` in `[project].dependencies` and an ASGI object (`entrypoint: app.py`,
+`app: app`). After promotion, `serve_capability(name, action="start")` exposes it at
+`/cap/<name>/`. A later promotion does not restart it; use `restart`. Validate every request:
+anyone who can reach the proxy is a caller.
 
 ## Versioning
 
-The folder is always the draft. Tags are immutable copies kept outside it, N per capability
-(default 5), the active one never pruned. Each tag runs its own SKILL.md, so editing the
-draft afterwards never changes the live version. `list_tags(name, diff_against_active=true)`
-shows how the draft differs from what is live. A served instance stays pinned to its tag;
-`serve_capability(action="restart")` moves it to the newly promoted one.
+A green push is snapshotted into an immutable tag and made active. Older tags are pruned beyond
+the keep limit, with their per-version data and unused venvs. `rollback_capability` moves the
+pointer without touching the draft or repository. The push pipeline is the only promotion path.

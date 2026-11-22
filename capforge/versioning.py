@@ -11,20 +11,21 @@ import re
 import shutil
 import subprocess
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from .core import (
+    PYTHON_VERSION,
     CapError,
     cap_lock,
     cap_path,
     data_dir,
     keep_tags,
+    lock_hash,
     read_state,
-    requirements_hash,
     state_dir,
     tree_hash,
-    validate_packages,
     version_path,
     write_state,
 )
@@ -54,41 +55,6 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or proc.stderr).strip()
 
 
-def _ensure_git(root: Path) -> None:
-    """Make the caps tree a git repo, if it is not one already. Best effort, never fatal."""
-    if not root.is_dir():
-        return
-    if (root / ".git").exists():
-        return
-    code, _ = _git("init", "-q", cwd=root)
-    if code != 0:
-        log.warning("could not initialise git in %s; audit trail disabled", root)
-        return
-    _git("config", "user.email", "capforge@localhost", cwd=root)
-    _git("config", "user.name", "capforge", cwd=root)
-    ignore = root / ".gitignore"
-    if not ignore.exists():
-        ignore.write_text(
-            "__pycache__/\n*.pyc\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n.venv/\n",
-            encoding="utf-8",
-        )
-
-
-def git_commit(name: str, tag: str) -> str | None:
-    """Commit the capability folder as the audit record for `tag`. Returns the commit sha."""
-    root = cap_path(name).parent
-    _ensure_git(root)
-    if not (root / ".git").exists():
-        return None
-    _git("add", "-A", name, cwd=root)
-    code, out = _git("commit", "-q", "-m", f"{name}@{tag}", cwd=root)
-    if code != 0 and "nothing to commit" not in out:
-        log.warning("git commit for %s@%s failed: %s", name, tag, out[-400:])
-        return None
-    code, sha = _git("rev-parse", "--short", "HEAD", cwd=root)
-    return sha if code == 0 else None
-
-
 def snapshot(name: str, tag: str) -> dict[str, Any]:
     """Copy the current working copy into an immutable version folder."""
     src = cap_path(name)
@@ -111,12 +77,18 @@ def promote(
     name: str,
     tag: str | None,
     *,
-    packages: list[str] | None = None,
     force: bool = False,
     dry_run: bool = False,
     note: str = "",
+    git_source: dict[str, Any] | None = None,
+    pushed_by: str | None = None,
+    locked: bool = False,
 ) -> dict[str, Any]:
-    """Tag the draft and make it the active version. Refuses on an unchanged draft."""
+    """Tag the draft and make it the active version. Refuses on an unchanged draft.
+
+    `locked=True` is for the git worker, which already holds `cap_lock` across the
+    draft swap; reacquiring it would deadlock. The public/CLI path leaves it false.
+    """
     from .core import load_capability
 
     cap = load_capability(name)
@@ -124,11 +96,10 @@ def promote(
         raise CapError(f"Cannot promote {name!r}: {cap.error}")
     if not cap.draft_ready:
         raise CapError(f"Cannot promote {name!r}: entrypoint {cap.entrypoint!r} is missing")
-    if packages is not None:
-        packages = validate_packages(packages)
 
-    with cap_lock(name):
+    with (nullcontext() if locked else cap_lock(name)):
         draft_hash = tree_hash(cap.path)
+        lock = lock_hash(cap.path)
         state = read_state(name)
         active = state.get("active")
         tags = list(state.get("tags") or [])
@@ -150,23 +121,21 @@ def promote(
 
         if dry_run:
             result["content_hash"] = draft_hash
-            result["packages"] = packages if packages is not None else cap.packages
+            result["env"] = "uv"
+            result["lock_hash"] = lock
             result["would_prune"] = _would_prune(
                 tags, keep_tags(), active_tag=(active or {}).get("tag")
             )
             return result
 
-        # Record the packages before snapshotting, so the tag carries the frontmatter its venv is built from.
-        if packages is not None and list(packages) != list(cap.packages):
-            write_packages(name, packages)
-            cap.packages = list(packages)
-            draft_hash = tree_hash(cap.path)
-
         snap = snapshot(name, final_tag)
-        snap["packages"] = list(cap.packages)
+        snap["env"] = "uv"
+        snap["lock_hash"] = lock
+        snap["python"] = PYTHON_VERSION
         snap["entrypoint"] = cap.entrypoint
-        snap["requirements_hash"] = requirements_hash(snap["packages"])
         snap["note"] = note
+        snap["git_source"] = git_source
+        snap["pushed_by"] = pushed_by
         snap["promoted_at"] = int(time.time())
         snap["previous"] = active.get("tag") if active else None
 
@@ -176,55 +145,25 @@ def promote(
         pruned = _prune(state, keep_tags())
         write_state(name, state)
 
-        sha = git_commit(name, final_tag)
     result.update(
         {
             "content_hash": snap["content_hash"],
-            "packages": snap["packages"],
+            "env": snap["env"],
+            "lock_hash": snap["lock_hash"],
             "entrypoint": snap["entrypoint"],
             "previous": snap["previous"],
             "pruned": pruned,
-            "git_commit": sha,
             "version_path": snap["path"],
         }
     )
     log.info(
-        "promote cap=%s tag=%s previous=%s pruned=%s commit=%s",
+        "promote cap=%s tag=%s previous=%s pruned=%s",
         name,
         final_tag,
         snap["previous"],
         pruned,
-        sha,
     )
     return result
-
-
-def write_packages(name: str, packages: list[str]) -> None:
-    """Persist the package list into SKILL.md so the draft records what it needs.
-
-    Callers must hold cap_lock(name); the write is a read-modify-write of the draft.
-    """
-    clean = validate_packages(packages)
-    path = cap_path(name) / "SKILL.md"
-    if not path.is_file():
-        raise CapError(f"SKILL.md is missing for {name!r}")
-    text = path.read_text(encoding="utf-8")
-    block = "packages: [" + ", ".join(clean) + "]"
-    if "\npackages:" in text:
-        out, replaced = [], False
-        for line in text.splitlines():
-            if line.startswith("packages:") and not replaced:
-                out.append(block)
-                replaced = True
-            else:
-                out.append(line)
-        text = "\n".join(out) + ("\n" if text.endswith("\n") else "")
-    else:
-        head, sep, rest = text.partition("\n---")
-        if not sep:
-            raise CapError(f"SKILL.md for {name!r} has no frontmatter block")
-        text = f"{head}\n{block}{sep}{rest}"
-    path.write_text(text, encoding="utf-8")
 
 
 def _would_prune(
@@ -241,33 +180,31 @@ def _would_prune(
 
 
 def _gc_venvs(name: str, tags: list[dict[str, Any]]) -> None:
-    """Drop venvs no surviving tag (or its pytest twin) can use. Best effort."""
+    """Drop uv venvs no surviving tag (or its test twin) can use. Best effort."""
     base = state_dir() / "venvs" / name
     if not base.is_dir():
         return
     live: set[str] = set()
     for tag in tags:
-        pkgs = tag.get("packages") or []
-        if isinstance(pkgs, list):
-            specs = [str(p) for p in pkgs]
-            live.add(requirements_hash(specs))
-            live.add(requirements_hash([*specs, "pytest"]))
-    # A served web instance runs from its venv right now; its requirement set is
-    # live even if no surviving tag references it. Lazy import: web.py needs
-    # starlette, and versioning must stay importable without it.
+        lock = str(tag.get("lock_hash") or "")
+        if lock:
+            live.add(f"{lock}-py314")
+            live.add(f"{lock}-py314-test")
     try:
         from . import web
 
-        live.update(web.running_requirements_hashes(name))
+        live.update(web.running_venv_names(name))
     except Exception:  # best effort; web.py may be absent or broken
         log.debug("venv GC could not consult the serve registry for %s", name, exc_info=True)
     for entry in sorted(base.iterdir()):
         if not entry.is_dir() or entry.name in live:
             continue
-        if re.fullmatch(r"[0-9a-f]{16}", entry.name) or entry.name.endswith(".building"):
+        if re.fullmatch(r"[0-9a-f]{16}-py314(?:-test)?", entry.name) or entry.name.endswith(
+            ".building"
+        ):
             shutil.rmtree(entry, ignore_errors=True)
-            for lock in (state_dir() / "locks").glob(f"{name}-venv-{entry.name}.lock"):
-                lock.unlink(missing_ok=True)
+            for lock_file in (state_dir() / "locks").glob(f"{name}-venv-{entry.name}.lock"):
+                lock_file.unlink(missing_ok=True)
             log.info("pruned venv cap=%s path=%s", name, entry)
 
 

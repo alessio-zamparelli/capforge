@@ -12,3 +12,9 @@ ui/node_modules/
 .env
 .env.*
 !.env.example
+
+.coverage
+.coverage.*
+htmlcov/
+
+.codegraph/

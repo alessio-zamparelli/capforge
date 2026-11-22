@@ -12,12 +12,14 @@ this module only lazily, inside prune/venv-GC.
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -113,14 +115,21 @@ def _display_host() -> str:
     return host
 
 
-def public_url(name: str) -> str:
-    """Caller-facing URL of a served capability. CAPFORGE_PUBLIC_URL, when set,
-    replaces the host:port part (for deployments behind another reverse proxy
-    or TLS terminator); otherwise it is derived from the web listener config."""
+def public_base() -> str:
+    """Externally reachable base; CAPFORGE_PUBLIC_URL overrides host:port."""
     base = os.environ.get("CAPFORGE_PUBLIC_URL", "").strip().rstrip("/")
     if base:
-        return f"{base}/{name}/"
-    return f"http://{_display_host()}:{web_port()}/{name}/"
+        return base
+    return f"http://{_display_host()}:{web_port()}"
+
+
+def public_url(name: str) -> str:
+    """Caller-facing URL of a served capability under /cap/<name>/."""
+    return f"{public_base()}/cap/{name}/"
+
+
+def git_url(name: str) -> str:
+    return f"{public_base()}/git/{name}.git"
 
 
 # --------------------------------------------------------------------------- registry
@@ -310,8 +319,7 @@ def _active_or_raise(name: str) -> tuple[str, dict[str, Any], Any]:
             f"{name!r} is not a web capability (kind: {cap.kind}). "
             "Only kind: web capabilities can be served."
         )
-    packages = active["packages"] if "packages" in active else cap.packages
-    return tag, {"packages": packages, "entrypoint": cap.entrypoint, "app": cap.app_name}, source
+    return tag, {"entrypoint": cap.entrypoint, "app": cap.app_name}, source
 
 
 def _spawn(
@@ -319,7 +327,6 @@ def _spawn(
     tag: str,
     entrypoint: str,
     app_name: str,
-    packages: list[str],
     *,
     public_url: str | None = None,
 ) -> _Instance:
@@ -333,7 +340,7 @@ def _spawn(
         raise CapError(f"Version {tag!r} is not runnable: {cap.error}")
     if cap.kind != "web":
         raise CapError(f"Version {tag!r} is not a web capability (kind: {cap.kind})")
-    venv = core.ensure_venv(name, packages)
+    venv = core.ensure_venv(name, source, "prod")
     port = core._free_port()
     log_file = _log_path(name, tag)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +349,13 @@ def _spawn(
         cap, tag=tag, venv=venv, port=port, public_url=public_url or public_url_of(name)
     )
     env["CAPFORGE_SERVE"] = "1"
-    cmd = [str(venv / "bin" / "python"), *core.web_child_argv(cap, source, port)]
+    data = core.data_dir(name, tag)
+    shared = core.shared_data_dir(name) if cap.data == "shared" else None
+    cmd = core._sandbox_command(
+        [str(venv / "bin" / "python"), *core.web_child_argv(cap, source, port)],
+        core._sandbox_policy(source, venv, data, shared=shared),
+        name,
+    )
     log.info("starting web cap=%s tag=%s port=%d", name, tag, port)
     handle = log_file.open("ab")
     try:
@@ -364,7 +377,7 @@ def _spawn(
         tag=tag,
         entrypoint=entrypoint,
         app_name=app_name,
-        packages=list(packages),
+        packages=[],
         proc=proc,
         port=port,
         log_handle=handle,
@@ -428,6 +441,19 @@ def public_url_of(name: str) -> str:
     return public_url(name)
 
 
+def forget(name: str) -> dict[str, Any]:
+    """Stop a served instance and remove its registry/log entry for deletion."""
+    stopped = False
+    try:
+        result = stop(name)
+        stopped = bool(result.get("status") == "stopped")
+    except CapError:
+        pass
+    _persist_record(name, None)
+    shutil.rmtree(core.state_dir() / "served" / name, ignore_errors=True)
+    return {"stopped": stopped}
+
+
 def _stop_instance(instance: _Instance) -> None:
     """SIGTERM the group, then SIGKILL after a grace period. Reaps the child and
     sweeps anything the instance had already re-parented to us, so nothing of it
@@ -464,9 +490,7 @@ def _start_locked(name: str) -> dict[str, Any]:
         raise CapError(
             "web serving is disabled: CAPFORGE_WEB_PORT=0 turns off the reverse proxy"
         )
-    instance = _spawn(
-        name, tag, meta["entrypoint"], meta["app"], list(meta["packages"])
-    )
+    instance = _spawn(name, tag, meta["entrypoint"], meta["app"])
     _persist_record(name, instance.record())
     return _status_of(name)
 
@@ -625,7 +649,6 @@ def restore() -> int:
                     tag,
                     str(record.get("entrypoint") or "app.py"),
                     str(record.get("app") or "app"),
-                    [str(p) for p in record.get("packages") or []],
                     public_url=public_url(name),
                 )
             restored += 1
@@ -666,20 +689,55 @@ def shutdown() -> None:
         _INSTANCES.clear()
 
 
-def running_requirements_hashes(name: str) -> set[str]:
-    """Requirement sets a live (or desired) instance needs its venv for."""
-    hashes: set[str] = set()
+def running_venv_names(name: str) -> set[str]:
+    """Venv directory names a live (or desired) instance needs to keep."""
+    names: set[str] = set()
     with _engine_lock:
         instances = [inst for inst in _INSTANCES.values() if inst.name == name]
     for instance in instances:
         if instance.proc.poll() is None:
-            hashes.add(core.requirements_hash(instance.packages))
+            source = versioning.version_path(name, instance.tag)
+            try:
+                names.add(core.venv_path(name, source, "prod").name)
+            except core.CapError:
+                pass
     record = _registry_record(name)
     if record is not None and record.get("desired") == "start":
-        hashes.add(
-            core.requirements_hash([str(p) for p in record.get("packages") or []])
-        )
-    return hashes
+        source = versioning.version_path(name, str(record.get("tag") or ""))
+        try:
+            names.add(core.venv_path(name, source, "prod").name)
+        except core.CapError:
+            pass
+    return names
+
+
+def logs(name: str, tail: int | None = None) -> dict[str, Any]:
+    """Served-child log tail for the active tag, without exposing filesystem paths."""
+    core.cap_path(name)
+    state = versioning.read_state(name)
+    tag = (state.get("active") or {}).get("tag")
+    if not tag:
+        raise CapError(f"{name!r} has no active version to read logs for")
+    path = _log_path(name, str(tag))
+    from . import staging
+
+    data = staging.read_log(name, "pipeline") if not path.is_file() else None
+    if data is None:
+        limit = max(1, min(int(tail or core.log_tail_bytes()), core.log_tail_bytes()))
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                if size > limit:
+                    handle.seek(size - limit)
+                raw = handle.read()
+        except OSError:
+            raw, size = b"", 0
+        data = {
+            "text": raw.decode("utf-8", errors="replace"),
+            "bytes": size,
+            "truncated": size > limit,
+        }
+    return {**data, "kind": "served", "tag": tag}
 
 
 def served_summaries() -> list[dict[str, Any]]:
@@ -792,6 +850,48 @@ async def api_session(request: Request) -> Response:
     )
 
 
+def _console_denied(request: Request, *, write: bool) -> Response | None:
+    if web_token() is None:
+        return JSONResponse(
+            {"ok": False, "error": "console disabled: set CAPFORGE_WEB_TOKEN"}, status_code=403
+        )
+    if not _authenticated(request):
+        return JSONResponse({"ok": False, "error": "not authenticated"}, status_code=401)
+    if write and not _csrf_ok(request):
+        return JSONResponse(
+            {"ok": False, "error": f"missing {CSRF_HEADER} header"}, status_code=403
+        )
+    return None
+
+
+def _env_caps_for(name: str) -> list[core.Capability]:
+    """Draft plus active-tag declarations; values are never read here."""
+    caps = [core.load_capability(name)]
+    tag = (versioning.read_state(name).get("active") or {}).get("tag")
+    if tag:
+        source = versioning.version_path(name, tag)
+        if source.is_dir():
+            active = core.load_capability_at(name, source)
+            if not active.error:
+                caps.append(active)
+    return caps
+
+
+def _restart_after_env(name: str) -> dict[str, Any]:
+    """Restart a running (or desired-running) web instance after an env change."""
+    caps = _env_caps_for(name)
+    if not any(cap.kind == "web" for cap in caps):
+        return {"restarted": False}
+    status = _status_of(name)
+    if status.get("status") != "running" and status.get("desired") != "start":
+        return {"restarted": False}
+    try:
+        served = restart(name)
+    except CapError as exc:
+        return {"restarted": False, "restart_error": str(exc)}
+    return {"restarted": True, "served": served}
+
+
 async def api_caps(request: Request) -> Response:
     if web_token() is None:
         return JSONResponse(
@@ -832,6 +932,7 @@ async def api_caps(request: Request) -> Response:
                         and state["active"]["content_hash"] != core.tree_hash(cap.path)
                     ),
                     "served": served,
+                    "env": core.env_status(cap.name, _env_caps_for(cap.name)),
                 }
             )
         return out
@@ -870,12 +971,262 @@ async def api_control(request: Request) -> Response:
     return JSONResponse({**result, "ok": True, "action": action})
 
 
+async def api_env(request: Request) -> Response:
+    """Read env status or set one value. Values are write-only: never returned."""
+    denied = _console_denied(request, write=request.method != "GET")
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    try:
+        if request.method == "GET":
+            caps = await run_in_threadpool(_env_caps_for, name)
+            return JSONResponse({"ok": True, "name": name, "env": core.env_status(name, caps)})
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        key = str(payload.get("name") or "")
+        value = payload.get("value")
+        if not isinstance(value, str):
+            return JSONResponse(
+                {"ok": False, "error": "value must be a string"}, status_code=400
+            )
+        core.load_capability(name)
+        result = await run_in_threadpool(core.set_cap_env, name, key, value)
+        restart_info = await run_in_threadpool(_restart_after_env, name)
+        caps = await run_in_threadpool(_env_caps_for, name)
+        return JSONResponse(
+            {**result, **restart_info, "ok": True, "env": core.env_status(name, caps)}
+        )
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_env_var(request: Request) -> Response:
+    """Delete one operator-managed value."""
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    key = request.path_params["var"]
+    try:
+        core.load_capability(name)
+        result = await run_in_threadpool(core.delete_cap_env, name, key)
+        restart_info = await run_in_threadpool(_restart_after_env, name)
+        caps = await run_in_threadpool(_env_caps_for, name)
+        return JSONResponse(
+            {**result, **restart_info, "ok": True, "env": core.env_status(name, caps)}
+        )
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+# ----------------------------------------------------------------------------- git
+
+
+def _git_auth(request: Request, name: str) -> dict[str, Any] | None:
+    from . import staging
+
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("basic "):
+        return None
+    try:
+        raw = base64.b64decode(header.split(" ", 1)[1], validate=True).decode("utf-8")
+        username, _, token = raw.partition(":")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not token:
+        return None
+    record = staging.verify(token, name)
+    if record is None:
+        return None
+    actor = record.get("actor") or {}
+    if actor.get("id") and os.environ.get("CAPFORGE_GIT_CHECK_USER", "1") == "1":
+        if username != actor.get("id"):
+            return None
+    result = dict(record)
+    result["auth_method"] = "basic"
+    result["basic_username"] = username
+    return result
+
+
+def _unauthorized(name: str) -> Response:
+    return Response(
+        "authentication required\n",
+        status_code=401,
+        headers={"WWW-Authenticate": f'Basic realm="capforge/{name}"'},
+        media_type="text/plain",
+    )
+
+
+def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str) -> Response:
+    """Run one git http-backend request. Called in a threadpool."""
+    from . import gitremote
+
+    repo = gitremote.repo_path(name)
+    if not (repo / "HEAD").is_file():
+        return Response("repository not found\n", status_code=404, media_type="text/plain")
+    root = core.state_dir() / "git"
+    env = core._base_env()
+    env.update(
+        {
+            "GIT_PROJECT_ROOT": str(root),
+            "GIT_HTTP_EXPORT_ALL": "1",
+            "PATH_INFO": (
+                f"/{name}.git/info/refs"
+                if request.method == "GET"
+                else f"/{name}.git/{service}"
+            ),
+            "QUERY_STRING": request.url.query,
+            "REQUEST_METHOD": request.method,
+            "CONTENT_TYPE": request.headers.get("content-type", ""),
+            "CONTENT_LENGTH": str(len(body)),
+            "REMOTE_USER": actor or "git",
+            "REMOTE_ADDR": request.client.host if request.client else "?",
+            "GIT_PROTOCOL": request.headers.get("git-protocol", ""),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_TEMPLATE_DIR": str(root / "empty-template"),
+            "CAPFORGE_PIPELINE_LOCK": str(core.state_dir() / "locks" / f"{name}-pipeline.lock"),
+        }
+    )
+    scratch = core.state_dir() / "tmp" / f"git-{name}-{time.time_ns()}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(scratch)
+    env["HOME"] = str(scratch)
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            ["git", "http-backend"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=str(root),
+            start_new_session=True,
+        )
+        try:
+            with core.track_child(proc.pid):
+                out, err = proc.communicate(body, timeout=core.run_timeout())
+        except subprocess.TimeoutExpired:
+            core._kill_group(proc)
+            out, err = proc.communicate()
+            return Response("git backend timed out\n", status_code=502, media_type="text/plain")
+    except OSError as exc:
+        return Response(f"git backend failed: {exc}\n", status_code=502, media_type="text/plain")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if proc.returncode != 0 and not out:
+        return Response("git backend failed\n", status_code=502, media_type="text/plain")
+    header, _, payload = out.partition(b"\r\n\r\n")
+    if not header:
+        header, _, payload = out.partition(b"\n\n")
+    status = 200
+    headers: dict[str, str] = {}
+    for raw in header.replace(b"\r\n", b"\n").split(b"\n"):
+        line = raw.decode("latin-1").strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if key.lower() == "status":
+            try:
+                status = int(value.split()[0])
+            except (ValueError, IndexError):
+                status = 200
+        elif key.lower() in {"content-type", "cache-control", "expires", "pragma"}:
+            headers[key] = value
+    if "content-type" not in {k.lower() for k in headers}:
+        headers["Content-Type"] = "application/x-git-receive-pack-result"
+    headers["Cache-Control"] = "no-store"
+    headers["X-Content-Type-Options"] = "nosniff"
+    log.info(
+        "git cap=%s service=%s status=%d duration_ms=%d bytes=%d",
+        name,
+        service,
+        status,
+        int((time.monotonic() - started) * 1000),
+        len(payload),
+    )
+    return Response(payload, status_code=status, headers=headers)
+
+
+async def git_info_refs(request: Request) -> Response:
+    name = request.path_params["name"]
+    if not core.NAME_RE.match(name or ""):
+        return Response("not found\n", status_code=404, media_type="text/plain")
+    service = request.query_params.get("service", "")
+    if service not in {"git-upload-pack", "git-receive-pack"}:
+        return Response("smart HTTP only\n", status_code=403, media_type="text/plain")
+    record = _git_auth(request, name)
+    if record is None:
+        return _unauthorized(name)
+    return await run_in_threadpool(
+        _run_cgi,
+        name,
+        service,
+        request,
+        b"",
+        str((record.get("actor") or {}).get("id") or ""),
+    )
+
+
+async def git_service(request: Request) -> Response:
+    from . import gitremote, staging
+
+    name = request.path_params["name"]
+    service = request.path_params["service"]
+    if not core.NAME_RE.match(name or ""):
+        return Response("not found\n", status_code=404, media_type="text/plain")
+    if service not in {"git-upload-pack", "git-receive-pack"}:
+        return Response("unknown service\n", status_code=404, media_type="text/plain")
+    record = _git_auth(request, name)
+    if record is None:
+        return _unauthorized(name)
+    body = await request.body()
+    if len(body) > int(os.environ.get("CAPFORGE_MAX_UPLOAD_BYTES", 64 * 1024 * 1024)):
+        return Response("push too large\n", status_code=413, media_type="text/plain")
+    actor = str((record.get("actor") or {}).get("id") or "")
+    if service == "git-upload-pack":
+        return await run_in_threadpool(_run_cgi, name, service, request, body, actor)
+
+    def push() -> Response:
+        before = gitremote.rev_parse(name)
+        current = staging.read_state(name)
+        if current.get("state") and current.get("state") not in {
+            "promoted",
+            "unchanged",
+            "failed",
+            "interrupted",
+        }:
+            return Response("pipeline busy\n", status_code=409, media_type="text/plain")
+        with staging.push_lock(name):
+            response = _run_cgi(name, service, request, body, actor)
+        after = gitremote.rev_parse(name)
+        if response.status_code == 200 and after and after != before:
+            try:
+                staging.start(
+                    name,
+                    after,
+                    record.get("actor") or {},
+                    gitremote.commit_subject(name, after),
+                    auth_method=str(record.get("auth_method") or "basic"),
+                    basic_username=str(record.get("basic_username") or ""),
+                )
+            except core.CapError as exc:
+                log.warning("pipeline start failed cap=%s: %s", name, exc)
+        return response
+
+    return await run_in_threadpool(push)
+
+
 # --------------------------------------------------------------------------- proxy
 
 
 async def proxy_redirect(request: Request) -> Response:
     name = request.path_params["name"]
-    target = f"/{name}/"
+    target = f"/cap/{name}/"
     if request.url.query:
         target = f"{target}?{request.url.query}"
     return RedirectResponse(target, status_code=307)
@@ -946,33 +1297,39 @@ async def json_index(request: Request) -> Response:
             "service": "capforge",
             "ui": False,
             "web_port": web_port(),
+            "routes": {"ui": "/ui/", "api": "/api/", "git": "/git/", "cap": "/cap/"},
             "capabilities": await run_in_threadpool(served_summaries),
         }
     )
 
 
-# --------------------------------------------------------------------------- asgi app
+async def ui_redirect(request: Request) -> Response:
+    return RedirectResponse("/ui/", status_code=308)
 
 
 def asgi_app() -> Starlette:
-    """The :8080 application: console API, static bundle, reverse proxy.
+    """The :8080 application: /ui, /api, /git and /cap.
 
-    Route order matters: /api first, then /assets, then the /{name}/... proxy,
-    then the console bundle at the root.
+    There is no root /{name} catch-all. Route order is API, git, UI, cap, root.
     """
     routes: list[Any] = [
         Route("/api/login", api_login, methods=["POST"]),
         Route("/api/session", api_session, methods=["GET"]),
         Route("/api/caps", api_caps, methods=["GET"]),
+        Route("/api/caps/{name}/env", api_env, methods=["GET", "POST"]),
+        Route("/api/caps/{name}/env/{var}", api_env_var, methods=["DELETE"]),
         Route("/api/caps/{name}/{action}", api_control, methods=["POST"]),
+        Route("/git/{name}.git/info/refs", git_info_refs, methods=["GET"]),
+        Route("/git/{name}.git/{service}", git_service, methods=["POST"]),
     ]
     dist = ui_dir() if ui_enabled() else None
-    if dist is not None and (dist / "assets").is_dir():
-        routes.append(Mount("/assets", StaticFiles(directory=dist / "assets"), name="assets"))
-    routes.append(Route("/{name}", proxy_redirect, methods=ALL_METHODS))
-    routes.append(Route("/{name}/{path:path}", proxy, methods=ALL_METHODS))
     if dist is not None:
-        routes.append(Mount("/", StaticFiles(directory=dist, html=True), name="ui"))
+        routes.append(Route("/ui", ui_redirect, methods=["GET"]))
+        routes.append(Mount("/ui", StaticFiles(directory=dist, html=True), name="ui"))
+    routes.append(Route("/cap/{name}", proxy_redirect, methods=ALL_METHODS))
+    routes.append(Route("/cap/{name}/{path:path}", proxy, methods=ALL_METHODS))
+    if dist is not None:
+        routes.append(Route("/", ui_redirect, methods=["GET"]))
     else:
         routes.append(Route("/", json_index, methods=["GET"]))
 

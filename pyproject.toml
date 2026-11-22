@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "capforge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Deterministic, versioned capabilities exposed over MCP for Open WebUI + Open Terminal"
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,6 +25,7 @@ dependencies = ["fastmcp>=4.1.3", "httpx>=0.27", "starlette>=0.41"]
 dev = [
     "mypy>=2.4.0",
     "pytest>=8.0",
+    "pytest-cov>=6.0",
     "pytest-xdist>=3.8.0",
     "ruff>=0.17.2",
 ]
@@ -41,6 +42,15 @@ addopts = "-ra"
 markers = [
     "slow: end-to-end tests that build real virtualenvs and subprocesses",
 ]
+
+[tool.coverage.run]
+source = ["capforge"]
+branch = true
+
+[tool.coverage.report]
+omit = ["tests/*"]
+# Measured full-suite baseline: 70.39%; keep the floor just below and ratchet upward.
+fail_under = 69
 
 [tool.ruff]
 line-length = 100

@@ -1,33 +1,41 @@
 # Next
 
-Known limitations and likely next steps for `capforge`. This is not a dated roadmap; it records
-gaps that are deliberately deferred. The design and current guarantees are in
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+Known limitations and deliberately deferred work for capforge 0.4.0. The design and current
+guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Open items
 
-- Enforce network and filesystem isolation if capabilities become less trusted (container/nsjail,
-  read-only mounts, egress policy, cgroup limits). The current posture is same-user, no OS sandbox.
-  Served web instances have no run timeout (they are resident by design); CPU/memory limits would
-  need a cgroup per child, which is deliberately out of scope for now.
-- Add authentication if the server is exposed beyond an internal network. The console requires
-  `CAPFORGE_WEB_TOKEN`, but the reverse proxy at `:8080/<name>/` is open by design; if capability
-  apps themselves must not be public, terminate auth in front of capforge.
-- Web proxy gaps, deferred deliberately: WebSocket and HTTP/2 upgrades are not proxied (a
-  capability needing them should not rely on the proxy); request/response streaming is buffered
-  through starlette with a 32 MB body cap; the proxy has no per-request timeout configuration
-  surface beyond httpx defaults.
-- Serve registry durability: the registry is a single JSON file, like the rest of the state;
-  multi-replica serving is out of scope, as for tags and locks.
-- The `:8080` log of served children is bounded (5 MB rotation, one generation), but nothing
-  ships those logs anywhere; a future metrics/trace story should account for them.
-- Add metrics/traces if the INFO log is not enough; there are no counters today.
-- Consider a shared state/lock backend if multi-replica deployment is ever required; the JSON files
-  and `flock` assume a single host and a local filesystem.
-- Deleting a capability is intentionally left to the shared terminal (`rm -rf`), because the caps
-  directory is the model's workspace; `scaffold_capability(overwrite=true)` archives the old draft
-  instead of destroying it. Deleting a *served* capability also requires
-  `serve_capability(action="stop")` first; the registry entry of a deleted capability is left
-  stale until then (restore marks missing versions `stop`).
-- The console bundle is optional at runtime (`CAPFORGE_WEB_UI=0` serves a JSON index). Bundling
-  new UI features means maintaining React + Tailwind through bun; keep the bundle small.
+- **Landlock coverage.** Capability, pytest and served web children use Landlock. `git
+  http-backend`, `git archive` and `uv sync` are tracked but not yet under a Landlock policy.
+  Closing that gap should not require new dependencies.
+- **Upload streaming.** `git-upload-pack` responses are currently buffered by the CGI bridge.
+  Large repositories should stream to the client with a background task that kills the child on
+  disconnect.
+- **Network, CPU and memory.** Landlock is filesystem-only. There is no network namespace,
+  seccomp, cgroup or memory limit; a capability can still make outbound calls and consume CPU.
+  For untrusted code, run it in a separate container/user with egress policy and cgroup limits, or
+  add Bubblewrap/nsjail (see the comparison in `plans/`).
+- **Git tokens.** One token grants clone and push for 600 s. There is no read-only scope and no
+  revocation UI; minting a new token and waiting out the TTL is the current lever.
+- **Repository growth.** Per-repo quota (`CAPFORGE_REPO_QUOTA_BYTES`) and a post-promotion
+  `git gc` exist, but there is no operator dashboard or automatic orphan-repo cleanup.
+- **Legacy tags.** The pip/`packages` runtime was removed in 0.4.0. Tags promoted by older
+  releases are refused with a migration error; operators must re-promote them with
+  `pyproject.toml`/`uv.lock` (or restore the code into a clone and push). There is no automatic
+  converter.
+- **Capability deletion.** `delete_capability(name, confirm)` and `capforge delete` remove a
+  capability and its state; there is no undo/archive, and scaffold overwrite does not exist.
+- **Secrets.** Operator-managed env values are plaintext JSON with mode `0600` under
+  `<state>/secrets/`; there is no at-rest encryption, rotation history, reveal or deletion
+  workflow beyond the console. They are per capability and shared across tags, so a promoted push
+  can read them at runtime. See `docs/ARCHITECTURE.md` §10.
+- **Shared data.** `data: shared` is unversioned and unsynchronized. Overlapping CLI calls and a
+  served web child can race; the capability must use SQLite/locks. Backups are the operator's job.
+- **Logs.** One rotated generation per pipeline/scaffold; served child logs rotate at 5 MB. There
+  is no log shipping, history, or console log endpoint yet.
+- **Console.** The React bundle is served under `/ui/` and uses relative `/api` calls. It is not
+  covered by a browser test; route/asset behaviour is tested through ASGI.
+- **Multi-replica.** State, locks and repos assume one host and a local filesystem. A shared
+  state/lock backend is out of scope.
+- **Docker.** The image targets a modern kernel for Landlock. Old kernels require
+  `CAPFORGE_SANDBOX=warn`/`off`, which is not a security boundary.

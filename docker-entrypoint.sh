@@ -32,8 +32,8 @@ if [ "$(id -u)" = "0" ]; then
     groupmod --non-unique --gid "$PGID" capforge
     usermod --non-unique --uid "$PUID" --gid "$PGID" capforge
 
-    caps_dir="${CAPFORGE_CAPS_DIR:-/home/capforge/.agents/skills}"
-    state_dir="${CAPFORGE_STATE_DIR:-/var/lib/capforge}"
+    caps_dir="${CAPFORGE_CAPS_DIR:-/var/lib/capforge/caps}"
+    state_dir="${CAPFORGE_STATE_DIR:-/var/lib/capforge/state}"
 
     for dir in /home/capforge "$caps_dir" "$state_dir"; do
         mkdir -p "$dir" 2>/dev/null || true

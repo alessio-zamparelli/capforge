@@ -21,9 +21,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-# git powers the best-effort audit trail (`git log` per promotion) and
-# `list_tags(diff_against_active=true)`. util-linux provides `setpriv`, which
-# the entrypoint uses to drop privileges after applying PUID/PGID.
+# git serves the capability receive/upload ingress and `list_tags` diffs.
+# util-linux provides `setpriv` and `prlimit`; the entrypoint drops privileges
+# after applying PUID/PGID.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git util-linux \
  && rm -rf /var/lib/apt/lists/*
@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Default identity. PUID/PGID at runtime remap this user and its group; the
 # entrypoint starts as root only long enough to chown the mounts and drop.
 RUN useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin capforge \
- && mkdir -p /home/capforge/.agents/skills /var/lib/capforge \
+ && mkdir -p /var/lib/capforge/caps /var/lib/capforge/state \
  && chown -R capforge:capforge /home/capforge /var/lib/capforge
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
@@ -60,8 +60,9 @@ COPY --from=ui /src/dist /app/ui/dist
 ENV PATH="/app/.venv/bin:$PATH" \
     PUID=10001 \
     PGID=10001 \
-    CAPFORGE_CAPS_DIR=/home/capforge/.agents/skills \
-    CAPFORGE_STATE_DIR=/var/lib/capforge \
+    CAPFORGE_CAPS_DIR=/var/lib/capforge/caps \
+    CAPFORGE_STATE_DIR=/var/lib/capforge/state \
+    CAPFORGE_SANDBOX=require \
     CAPFORGE_HOST=0.0.0.0 \
     CAPFORGE_PORT=8099 \
     CAPFORGE_PATH=/mcp \

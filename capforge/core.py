@@ -16,35 +16,40 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .contract import WORKSPACE_SKILL, WORKSPACE_SKILL_MARKER
+from . import sandbox
 
 log = logging.getLogger("capforge")
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-# A single pip requirement. Deliberately conservative: no whitespace, commas,
-# URLs or leading '-' so a model-authored spec can never be read as a pip flag
-# or break the `packages: [a, b]` frontmatter it is serialized into.
-PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+*!<>=~;\[\]-]{0,199}$")
+# Operator-managed environment names declared in SKILL.md (`env: [NAME, ...]`).
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# Legacy pip requirement syntax. Kept only for parsing old frontmatter and rejecting it.
 # The ASGI object name in `app:` frontmatter; it becomes half of a uvicorn
 # "module:variable" argument, so it must be a plain Python identifier.
 APP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 WEB_KINDS = ("cli", "web")
+DATA_KINDS = ("version", "shared")
+
+PYTHON_VERSION = "3.14"
+PYTHON_REQUIRES = ">=3.14,<3.15"
 
 DEFAULT_RUN_TIMEOUT = 120
 DEFAULT_TEST_TIMEOUT = 300
 DEFAULT_INSTALL_TIMEOUT = 240
 DEFAULT_SERVE_BOOT_TIMEOUT = 60
 DEFAULT_KEEP_TAGS = 5
-MAX_PACKAGES = 50
 MAX_CAPTURE_BYTES = 256 * 1024
+DEFAULT_SANDBOX = "require"
+DEFAULT_LOG_MAX_BYTES = 1024 * 1024
+DEFAULT_LOG_TAIL_BYTES = 64 * 1024
 
 # prctl(PR_SET_CHILD_SUBREAPER): detached grandchildren of capability calls
 # re-parent to this process instead of PID 1, where the orphan sweep can find them.
@@ -55,6 +60,34 @@ PR_SET_CHILD_SUBREAPER = 36
 # settings are deliberately absent: only the installer needs them.
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR")
 PIP_ENV_ALLOWLIST = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL")
+
+# Names that capability code may not override. They are either inherited/global, set by
+# capforge for the child, or interpreted by Python/uv itself.
+ENV_RESERVED = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "VIRTUAL_ENV",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+        "CAPFORGE_CAP",
+        "CAPFORGE_VERSION",
+        "CAPFORGE_DATA_DIR",
+        "CAPFORGE_SHARED_DATA_DIR",
+        "CAPFORGE_SERVE_PORT",
+        "CAPFORGE_PUBLIC_URL",
+        "CAPFORGE_SERVE",
+        *ENV_ALLOWLIST,
+    }
+)
+ENV_RESERVED_PREFIXES = ("CAPFORGE_", "PYTHON", "LD_", "UV_")
+MAX_ENV_VARS = 32
+MAX_ENV_VALUE_BYTES = 16 * 1024
+# Tests and the web boot probe never receive real values; declared names get this
+# obvious placeholder so imports/settings objects still work without leaking secrets
+# into model-visible pipeline logs.
+ENV_PLACEHOLDER = "capforge-test-placeholder"
 
 # Keep in sync with versioning.SKIP.
 SKIP_PARTS = frozenset(
@@ -77,42 +110,6 @@ def caps_dir() -> Path:
 
 def state_dir() -> Path:
     return Path(os.environ.get("CAPFORGE_STATE_DIR") or (Path.home() / ".capforge")).resolve()
-
-
-# Reserved: leading underscore is invalid as a capability name and skipped by discovery.
-WORKSPACE_SKILL_DIR = "_capforge"
-
-
-def guide_enabled() -> bool:
-    raw = os.environ.get("CAPFORGE_GUIDE", "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
-
-
-def ensure_workspace_skill() -> Path | None:
-    """Install the generated guide skill into the caps root, unless disabled.
-
-    The folder is reserved (leading underscore), so it never appears in
-    `list_capabilities` and cannot collide with a real capability. A file without the
-    managed marker is treated as user-authored and is never overwritten; deleting the
-    generated file restores it on the next `serve`.
-    """
-    if not guide_enabled():
-        return None
-    path = caps_dir() / WORKSPACE_SKILL_DIR / "SKILL.md"
-    try:
-        if path.is_file():
-            existing = path.read_text(encoding="utf-8", errors="replace")
-            if WORKSPACE_SKILL_MARKER not in existing or existing == WORKSPACE_SKILL:
-                return path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(WORKSPACE_SKILL, encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        log.warning("could not install the workspace guide at %s", path, exc_info=True)
-        return None
-    log.info("installed workspace guide at %s", path)
-    return path
 
 
 def keep_tags() -> int:
@@ -146,6 +143,19 @@ def serve_boot_timeout() -> int:
     return _timeout("CAPFORGE_SERVE_BOOT_TIMEOUT", DEFAULT_SERVE_BOOT_TIMEOUT)
 
 
+def sandbox_mode() -> str:
+    raw = os.environ.get("CAPFORGE_SANDBOX", DEFAULT_SANDBOX).strip().lower()
+    return raw if raw in {"require", "warn", "off"} else DEFAULT_SANDBOX
+
+
+def log_max_bytes() -> int:
+    return _timeout("CAPFORGE_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES)
+
+
+def log_tail_bytes() -> int:
+    return _timeout("CAPFORGE_LOG_TAIL_BYTES", DEFAULT_LOG_TAIL_BYTES)
+
+
 def _contained(base: Path, child: Path) -> Path:
     base_r, child_r = base.resolve(), child.resolve()
     if child_r != base_r and base_r not in child_r.parents:
@@ -170,24 +180,6 @@ def version_path(name: str, tag: str) -> Path:
     return _contained(state_dir() / "versions", state_dir() / "versions" / name / tag)
 
 
-def validate_packages(packages: list[str] | None) -> list[str]:
-    """Return clean requirement specs or raise a message the model can act on."""
-    cleaned: list[str] = []
-    for raw in packages or []:
-        spec = str(raw).strip()
-        if not spec:
-            continue
-        if not PKG_RE.match(spec):
-            raise CapError(
-                f"Invalid package requirement {raw!r}. Use a plain requirement such as "
-                "'pypdf>=5' or 'httpx': no spaces, commas, URLs, quotes or leading '-'."
-            )
-        cleaned.append(spec)
-    if len(cleaned) > MAX_PACKAGES:
-        raise CapError(f"Too many packages ({len(cleaned)}); the limit is {MAX_PACKAGES}.")
-    return cleaned
-
-
 # ----------------------------------------------------------------------------- locks
 
 
@@ -204,6 +196,22 @@ def _file_lock(path: Path) -> Iterator[None]:
             return
         try:
             yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def try_file_lock(path: Path) -> Iterator[bool]:
+    """Non-blocking exclusive flock; yields False if another process holds it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -266,13 +274,66 @@ class Capability:
     entrypoint: str = "main.py"
     packages: list[str] = field(default_factory=list)
     kind: str = "cli"
+    data: str = "version"
     app_name: str = "app"
+    env: list[str] = field(default_factory=list)
     body: str = ""
     error: str | None = None
 
     @property
     def draft_ready(self) -> bool:
         return self.error is None and (self.path / self.entrypoint).is_file()
+
+
+def _dependency_names(path: Path) -> list[str]:
+    """Read [project].dependencies from pyproject.toml; [] if absent/unreadable."""
+    import tomllib
+
+    project = path / "pyproject.toml"
+    try:
+        data = tomllib.loads(project.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    deps = data.get("project", {}).get("dependencies", [])
+    if not isinstance(deps, list):
+        return []
+    names: list[str] = []
+    for raw in deps:
+        match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(raw).strip())
+        if match:
+            names.append(match.group(0).lower().replace("_", "-"))
+    return names
+
+
+def valid_env_name(name: str) -> str:
+    """Validate one declared/stored environment name; refuses runtime-owned keys."""
+    text = str(name).strip()
+    if not ENV_NAME_RE.match(text):
+        raise CapError(
+            f"Invalid environment variable name {name!r}. Use letters, digits and underscores, "
+            "starting with a letter or underscore (max 128 chars)."
+        )
+    if text in ENV_RESERVED or text.startswith(ENV_RESERVED_PREFIXES):
+        raise CapError(f"Environment variable {text!r} is reserved by capforge.")
+    return text
+
+
+def _env_declarations(meta: dict[str, Any]) -> list[str]:
+    """Normalise `env:` frontmatter (inline list, block list or single value)."""
+    raw = meta.get("env")
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, list) else [raw]
+    names: list[str] = []
+    for value in values:
+        if not str(value).strip():
+            continue
+        name = valid_env_name(value)
+        if name not in names:
+            names.append(name)
+    if len(names) > MAX_ENV_VARS:
+        raise CapError(f"env declares {len(names)} variables; the limit is {MAX_ENV_VARS}.")
+    return names
 
 
 def _load_from(name: str, path: Path) -> Capability:
@@ -289,28 +350,31 @@ def _load_from(name: str, path: Path) -> Capability:
     if not cap.description:
         cap.error = "SKILL.md frontmatter has no description"
         return cap
-    raw_pkgs = meta.get("packages") or []
-    try:
-        cap.packages = validate_packages(
-            [str(p) for p in (raw_pkgs if isinstance(raw_pkgs, list) else [raw_pkgs]) if str(p).strip()]
-        )
-    except CapError as exc:
-        cap.error = str(exc)
+    if meta.get("packages"):
+        cap.error = "packages is no longer supported; declare dependencies in pyproject.toml"
         return cap
     cap.kind = str(meta.get("kind") or "cli").strip().lower() or "cli"
     if cap.kind not in WEB_KINDS:
         cap.error = f"kind must be one of {list(WEB_KINDS)}, got {cap.kind!r}"
         return cap
-    cap.app_name = str(meta.get("app") or "app").strip() or "app"
+    cap.data = str(meta.get("data") or "version").strip().lower() or "version"
+    if cap.data not in DATA_KINDS:
+        cap.error = f"data must be one of {list(DATA_KINDS)}, got {cap.data!r}"
+        return cap
+    try:
+        cap.env = _env_declarations(meta)
+    except CapError as exc:
+        cap.error = str(exc)
+        return cap
     if cap.kind == "web":
-        if "uvicorn" not in cap.packages:
-            cap.error = (
-                "kind: web requires 'uvicorn' in packages, e.g. packages: [fastapi, uvicorn]"
-            )
+        deps = _dependency_names(path)
+        if "uvicorn" not in deps:
+            cap.error = "kind: web requires 'uvicorn' in [project].dependencies"
             return cap
-        if not APP_NAME_RE.match(cap.app_name):
-            cap.error = f"app must be a Python identifier, got {cap.app_name!r}"
-            return cap
+    cap.app_name = str(meta.get("app") or "app").strip() or "app"
+    if cap.kind == "web" and not APP_NAME_RE.match(cap.app_name):
+        cap.error = f"app must be a Python identifier, got {cap.app_name!r}"
+        return cap
     try:
         entry = _contained(path, path / raw_entry)
         cap.entrypoint = entry.relative_to(path).as_posix()
@@ -421,7 +485,177 @@ def write_state(name: str, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+# ---------------------------------------------------------------- capability environment
+
+
+def _secrets_file(name: str) -> Path:
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
+    return _contained(state_dir(), state_dir() / "secrets" / f"{name}.json")
+
+
+def _quarantine_secrets(path: Path) -> None:
+    dest = path.with_name(f"{path.stem}.corrupt-{time.time_ns()}{path.suffix}")
+    try:
+        path.replace(dest)
+        log.warning("quarantined corrupt secrets file %s -> %s", path, dest)
+    except OSError:
+        log.exception("could not quarantine corrupt secrets file %s", path)
+
+
+def read_cap_env(name: str) -> dict[str, dict[str, Any]]:
+    """Operator-managed values for one capability. Never returned to the model.
+
+    The file is per capability, not per tag, so values survive promotions. Reads
+    need no lock: writers replace the file atomically.
+    """
+    path = _secrets_file(name)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _quarantine_secrets(path)
+        return {}
+    raw = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        _quarantine_secrets(path)
+        return {}
+    clean: dict[str, dict[str, Any]] = {}
+    for key, record in raw.items():
+        try:
+            key = valid_env_name(key)
+        except CapError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        value = record.get("value")
+        if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_ENV_VALUE_BYTES:
+            continue
+        clean[key] = {"value": value, "updated_at": int(record.get("updated_at") or 0)}
+    return clean
+
+
+def _write_cap_env(name: str, env: dict[str, dict[str, Any]]) -> None:
+    path = _secrets_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"name": name, "env": env}, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def set_cap_env(name: str, key: str, value: str) -> dict[str, Any]:
+    """Set one operator-managed value. The model has no path to this function."""
+    key = valid_env_name(key)
+    if not isinstance(value, str):
+        raise CapError("Environment value must be a string.")
+    if "\x00" in value:
+        raise CapError("Environment values cannot contain NUL bytes.")
+    if len(value.encode("utf-8")) > MAX_ENV_VALUE_BYTES:
+        raise CapError(f"Environment value is larger than {MAX_ENV_VALUE_BYTES} bytes.")
+    with cap_lock(name):
+        env = read_cap_env(name)
+        env[key] = {"value": value, "updated_at": int(time.time())}
+        _write_cap_env(name, env)
+    log.info("env set cap=%s name=%s", name, key)
+    return {"name": key, "configured": True, "updated_at": env[key]["updated_at"]}
+
+
+def delete_cap_env(name: str, key: str) -> dict[str, Any]:
+    """Remove one value. Absent values are not an error."""
+    key = valid_env_name(key)
+    with cap_lock(name):
+        env = read_cap_env(name)
+        removed = env.pop(key, None) is not None
+        if removed:
+            _write_cap_env(name, env)
+    log.info("env unset cap=%s name=%s removed=%s", name, key, removed)
+    return {"name": key, "configured": False, "removed": removed}
+
+
+def cap_env_values(name: str, cap: Capability) -> dict[str, str]:
+    """Configured values for exactly the names this version declares."""
+    stored = read_cap_env(name)
+    return {key: stored[key]["value"] for key in cap.env if key in stored}
+
+
+def cap_env_missing(name: str, cap: Capability) -> list[str]:
+    stored = read_cap_env(name)
+    return [key for key in cap.env if key not in stored]
+
+
+def cap_env_placeholders(cap: Capability) -> dict[str, str]:
+    return {key: ENV_PLACEHOLDER for key in cap.env}
+
+
+def env_status(name: str, caps: Iterable[Capability]) -> list[dict[str, Any]]:
+    """Names + configured state (never values) for the console and MCP responses.
+
+    Declarations from both the draft and the active tag are included, plus stored
+    names the current code no longer declares so the operator can clean them up.
+    """
+    stored = read_cap_env(name)
+    declared: list[str] = []
+    for cap in caps:
+        for key in cap.env:
+            if key not in declared:
+                declared.append(key)
+    names = declared + [key for key in sorted(stored) if key not in declared]
+    return [
+        {
+            "name": key,
+            "declared": key in declared,
+            "configured": key in stored,
+            "updated_at": stored.get(key, {}).get("updated_at") or 0,
+        }
+        for key in names
+    ]
+
+
+def _apply_cap_env(env: dict[str, str], name: str, cap: Capability, *, tag: str | None) -> None:
+    """Inject declared values only for an active tag; tests/drafts get placeholders."""
+    if tag is None:
+        env.update(cap_env_placeholders(cap))
+        return
+    missing = cap_env_missing(name, cap)
+    if missing:
+        raise CapError(
+            f"{name!r} needs environment variables that only the operator can set in the "
+            f"console: {', '.join(missing)}"
+        )
+    env.update(cap_env_values(name, cap))
+
+
 # ----------------------------------------------------------------------------- hashes
+
+
+def list_files(root: Path) -> list[str]:
+    """Relative file list for MCP responses; stable, bounded by the caller's use."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if any(part in SKIP_PARTS for part in rel.parts):
+            continue
+        if path.is_file():
+            out.append(rel.as_posix())
+    return out
 
 
 def tree_hash(root: Path) -> str:
@@ -438,11 +672,6 @@ def tree_hash(root: Path) -> str:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def requirements_hash(packages: list[str]) -> str:
-    payload = "\n".join(sorted(set(packages)))
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 # ------------------------------------------------------------------------ processes
@@ -497,6 +726,18 @@ def register_owned(pid: int) -> None:
 def unregister_owned(pid: int) -> None:
     with _child_lock:
         _owned_children.discard(pid)
+
+
+@contextmanager
+def track_child(pid: int) -> Iterator[None]:
+    """Mark a direct child as in-flight so a concurrent stray sweep leaves it alone."""
+    with _child_lock:
+        _live_children.add(pid)
+    try:
+        yield
+    finally:
+        with _child_lock:
+            _live_children.discard(pid)
 
 
 def set_subreaper() -> bool:
@@ -658,16 +899,6 @@ def _run_process(
 # --------------------------------------------------------------------------- venvs
 
 
-def _venv_for(name: str, packages: list[str]) -> Path:
-    base = _contained(state_dir(), state_dir() / "venvs" / name)
-    return base / requirements_hash(packages)
-
-
-def _venv_lock(name: str, packages: list[str]) -> Path:
-    digest = requirements_hash(packages)
-    return _contained(state_dir(), state_dir() / "locks" / f"{name}-venv-{digest}.lock")
-
-
 def _base_env() -> dict[str, str]:
     env = {k: os.environ[k] for k in ENV_ALLOWLIST if k in os.environ}
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -680,66 +911,99 @@ def _base_env() -> dict[str, str]:
 
 
 def _install_env() -> dict[str, str]:
-    """The installer may see pip index settings; capability code never does."""
+    """The installer may see index settings; capability code never does."""
     env = _base_env()
     env.update({k: os.environ[k] for k in PIP_ENV_ALLOWLIST if k in os.environ})
+    # uv reads its own index/cache settings; expose them only to the installer.
+    for key in (
+        "UV_DEFAULT_INDEX",
+        "UV_INDEX_URL",
+        "UV_INDEX",
+        "UV_CACHE_DIR",
+        "UV_LINK_MODE",
+        "UV_PYTHON",
+        "UV_PYTHON_DOWNLOADS",
+        "UV_NO_PROGRESS",
+    ):
+        if key in os.environ:
+            env[key] = os.environ[key]
     return env
 
 
-def ensure_venv(name: str, packages: list[str], notes: list[str] | None = None) -> Path:
-    """Return a venv holding exactly `packages`. Reused when the requirement set is unchanged."""
-    clean = sorted(set(validate_packages(packages)))
-    venv = _venv_for(name, clean)
+def lock_hash(source: Path) -> str:
+    lock = Path(source) / "uv.lock"
+    if not lock.is_file():
+        raise CapError(
+            f"{lock} is missing. The capability must be a uv project with a committed uv.lock."
+        )
+    return hashlib.sha256(lock.read_bytes()).hexdigest()[:16]
+
+
+def venv_path(name: str, source: Path, group: str = "prod") -> Path:
+    suffix = "-py314" if group == "prod" else "-py314-test"
+    base = _contained(state_dir(), state_dir() / "venvs" / name)
+    return base / f"{lock_hash(source)}{suffix}"
+
+
+def _venv_lock(name: str, source: Path, group: str) -> Path:
+    digest = lock_hash(source)
+    return _contained(state_dir(), state_dir() / "locks" / f"{name}-venv-{digest}-{group}.lock")
+
+
+def ensure_venv(
+    name: str, source: Path, group: str = "prod", notes: list[str] | None = None
+) -> Path:
+    """Build the uv environment for one project/group, keyed by its uv.lock.
+
+    The venv lives under the state dir and is never inside the draft or a version.
+    `uv sync --frozen` is the only install path; a lock that does not match
+    pyproject.toml fails the build instead of silently resolving something else.
+    """
+    if group not in {"prod", "test"}:
+        raise CapError(f"Unknown environment group {group!r}")
+    source = Path(source).resolve()
+    venv = venv_path(name, source, group)
     python = venv / "bin" / "python"
     if python.is_file():
         return venv
-    with _file_lock(_venv_lock(name, clean)):
+    uv = shutil.which("uv") or "/bin/uv"
+    if not Path(uv).exists():
+        raise CapError("uv is not installed; the image must provide uv")
+    with _file_lock(_venv_lock(name, source, group)):
         if python.is_file():
             return venv
         venv.parent.mkdir(parents=True, exist_ok=True)
-        tmp = venv.with_name(venv.name + ".building")
-        shutil.rmtree(tmp, ignore_errors=True)
-        # pip is only needed when there is something to install, so the stdlib-only path skips it.
-        with_pip = bool(clean)
+        env = _install_env()
+        env["UV_PROJECT_ENVIRONMENT"] = str(venv)
+        env["UV_PYTHON"] = PYTHON_VERSION
+        env["UV_PYTHON_DOWNLOADS"] = "never"
+        env.setdefault("UV_LINK_MODE", "copy")
+        env.setdefault("UV_CACHE_DIR", str(state_dir() / "cache" / "uv"))
+        env.setdefault("UV_NO_PROGRESS", "1")
+        args = [uv, "sync", "--frozen", "--no-install-project", "--python", PYTHON_VERSION]
+        if group == "prod":
+            args.append("--no-dev")
+        else:
+            args.extend(["--group", "dev"])
         code, _, stderr, timed_out = _run_process(
-            [sys.executable, "-m", "venv", *([] if with_pip else ["--without-pip"]), str(tmp)],
-            cwd=None,
-            env=_install_env(),
+            args,
+            cwd=source,
+            env=env,
             payload=None,
             timeout=install_timeout(),
         )
-        if timed_out or code != 0:
-            shutil.rmtree(tmp, ignore_errors=True)
-            reason = "timed out" if timed_out else (stderr.strip()[-800:] or f"exit {code}")
-            raise CapError(f"Could not create a virtualenv: {reason}")
-        if with_pip:
-            code, _, stderr, timed_out = _run_process(
-                [
-                    str(tmp / "bin" / "python"),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--quiet",
-                    "--disable-pip-version-check",
-                    *clean,
-                ],
-                cwd=None,
-                env=_install_env(),
-                payload=None,
-                timeout=install_timeout(),
-            )
-            if notes is not None:
-                notes.append(f"pip install {' '.join(clean)} -> exit {code}")
-            if timed_out:
-                shutil.rmtree(tmp, ignore_errors=True)
-                raise CapError(f"Installing {clean} timed out after {install_timeout()}s")
-            if code != 0:
-                shutil.rmtree(tmp, ignore_errors=True)
-                raise CapError(f"Installing {clean} failed:\n{stderr.strip()[-2000:]}")
-        if venv.exists():
+        if notes is not None:
+            notes.append(f"uv sync {group} -> exit {code}")
+        if timed_out:
             shutil.rmtree(venv, ignore_errors=True)
-        tmp.replace(venv)
-        log.info("built venv cap=%s requirements=%s path=%s", name, clean, venv)
+            raise CapError(f"uv sync timed out after {install_timeout()}s")
+        if code != 0:
+            shutil.rmtree(venv, ignore_errors=True)
+            raise CapError(f"uv sync failed:\n{stderr.strip()[-2000:]}")
+        if not (venv / "bin" / "python").is_file():
+            shutil.rmtree(venv, ignore_errors=True)
+            raise CapError("uv sync did not create a virtualenv")
+        log.info("built venv cap=%s group=%s lock=%s path=%s", name, group, lock_hash(source), venv)
     return venv
 
 
@@ -752,6 +1016,56 @@ def data_dir(name: str, tag: str | None, *, create: bool = True) -> Path:
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def shared_data_dir(name: str, *, create: bool = True) -> Path:
+    path = _contained(state_dir(), state_dir() / "data" / name / "shared")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sandbox_policy(
+    source: Path, venv: Path, data: Path, *, shared: Path | None = None
+) -> sandbox.Policy:
+    system = [Path(p) for p in ("/usr", "/usr/local", "/lib", "/lib64", "/bin", "/sbin")]
+    base = Path(sys.base_prefix)
+    executable = Path(sys.executable).resolve().parent
+    read = [*system, base, executable, Path(venv), Path(source)]
+    read_files = [
+        Path("/etc/ld.so.cache"),
+        Path("/etc/passwd"),
+        Path("/etc/group"),
+        Path("/etc/localtime"),
+        Path("/dev/urandom"),
+    ]
+    cert = os.environ.get("SSL_CERT_FILE")
+    if cert:
+        read_files.append(Path(cert))
+    write_files = [Path("/dev/null")]
+    write = [Path(data)]
+    if shared is not None:
+        write.append(Path(shared))
+    return sandbox.Policy(
+        read=tuple(read),
+        write=tuple(write),
+        read_files=tuple(read_files),
+        write_files=tuple(write_files),
+    )
+
+
+def _sandbox_command(cmd: list[str], policy: sandbox.Policy, name: str) -> list[str]:
+    mode = sandbox_mode()
+    if mode == "off":
+        return cmd
+    if sandbox.abi_version() is None:
+        if mode == "require":
+            raise CapError(
+                "CAPFORGE_SANDBOX=require but Landlock is unavailable on this kernel"
+            )
+        log.warning("landlock unavailable; running cap=%s without filesystem confinement", name)
+        return cmd
+    return sandbox.wrap(cmd, policy)
 
 
 @dataclass
@@ -815,18 +1129,32 @@ def execute(
     entry = _contained(source, source / cap.entrypoint)
     if not entry.is_file():
         raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
-    venv = ensure_venv(cap.name, packages if packages is not None else cap.packages)
+    venv = ensure_venv(cap.name, source, "prod")
+    data = data_dir(cap.name, data_tag if data_tag is not None else tag)
+    scratch = data / ".tmp"
+    scratch.mkdir(parents=True, exist_ok=True)
+    shared = shared_data_dir(cap.name) if cap.data == "shared" else None
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
     env["CAPFORGE_VERSION"] = tag or "draft"
-    env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, data_tag if data_tag is not None else tag))
+    env["CAPFORGE_DATA_DIR"] = str(data)
+    if shared is not None:
+        env["CAPFORGE_SHARED_DATA_DIR"] = str(shared)
+    env["TMPDIR"] = str(scratch)
+    env["HOME"] = str(scratch)
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
+    _apply_cap_env(env, cap.name, cap, tag=tag)
 
     payload = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
     started = time.monotonic()
-    code, stdout, stderr, timed_out = _run_process(
+    cmd = _sandbox_command(
         [str(venv / "bin" / "python"), str(entry)],
+        _sandbox_policy(source, venv, data, shared=shared),
+        cap.name,
+    )
+    code, stdout, stderr, timed_out = _run_process(
+        cmd,
         cwd=source,
         env=env,
         payload=payload,
@@ -886,11 +1214,32 @@ def run_tests(
     tests = source / "tests"
     has_tests = tests.is_dir() and any(tests.rglob("test_*.py"))
     if cap.kind == "web":
+        pytest_result: ExecResult | None = None
         if has_tests:
-            result = _run_pytest(cap, source, packages, timeout)
-            if not result.ok:
-                return result
-        return probe_web_boot(cap, source, packages=packages)
+            pytest_result = _run_pytest(cap, source, timeout)
+            if not pytest_result.ok:
+                return pytest_result
+        boot = probe_web_boot(cap, source)
+        if pytest_result is None:
+            return boot
+        combined = ExecResult(
+            ok=boot.ok,
+            exit_code=boot.exit_code,
+            stdout=(
+                "pytest:\n"
+                + pytest_result.stdout
+                + "\nboot probe:\n"
+                + boot.stdout
+            ),
+            stderr=(
+                ("pytest:\n" + pytest_result.stderr if pytest_result.stderr else "")
+                + ("\nboot probe:\n" + boot.stderr if boot.stderr else "")
+            ).strip(),
+            duration_ms=pytest_result.duration_ms + boot.duration_ms,
+            timed_out=boot.timed_out,
+            result=boot.result,
+        )
+        return combined
     if not has_tests:
         # Same execution path as a real call: invalid stdout must fail the gate.
         return execute(
@@ -898,32 +1247,40 @@ def run_tests(
             source,
             {},
             tag=None,
-            packages=packages,
             timeout=timeout or test_timeout(),
             data_tag="test",
         )
-    return _run_pytest(cap, source, packages, timeout)
+    return _run_pytest(cap, source, timeout)
 
 
 def _run_pytest(
     cap: Capability,
     source: Path,
-    packages: list[str] | None,
     timeout: int | None,
 ) -> ExecResult:
-    """Run the draft's pytest suite in a venv with pytest added."""
+    """Run the capability's pytest suite from its uv dev environment."""
     tests = source / "tests"
-    venv = ensure_venv(
-        cap.name, list(packages if packages is not None else cap.packages) + ["pytest"]
-    )
+    venv = ensure_venv(cap.name, source, "test")
+    data = data_dir(cap.name, "test")
+    scratch = data / ".tmp"
+    scratch.mkdir(parents=True, exist_ok=True)
+    shared = shared_data_dir(cap.name) if cap.data == "shared" else None
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
-    env["CAPFORGE_VERSION"] = "draft"
-    env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, "test"))
+    env["CAPFORGE_VERSION"] = "test"
+    env["CAPFORGE_DATA_DIR"] = str(data)
+    if shared is not None:
+        env["CAPFORGE_SHARED_DATA_DIR"] = str(shared)
+    env["TMPDIR"] = str(scratch)
+    env["HOME"] = str(scratch)
+    env["COVERAGE_FILE"] = str(data / ".coverage")
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
+    # Model-authored tests and their output are visible to the model: never inject
+    # real values here, only harmless placeholders for declared names.
+    env.update(cap_env_placeholders(cap))
     started = time.monotonic()
-    code, stdout, stderr, timed_out = _run_process(
+    cmd = _sandbox_command(
         [
             str(venv / "bin" / "python"),
             "-m",
@@ -934,6 +1291,11 @@ def _run_pytest(
             "no:cacheprovider",
             str(tests),
         ],
+        _sandbox_policy(source, venv, data, shared=shared),
+        cap.name,
+    )
+    code, stdout, stderr, timed_out = _run_process(
+        cmd,
         cwd=source,
         env=env,
         payload=None,
@@ -1021,12 +1383,20 @@ def web_child_env(
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
     env["CAPFORGE_VERSION"] = tag or "draft"
-    env["CAPFORGE_DATA_DIR"] = str(data_dir(cap.name, data_tag if data_tag is not None else tag))
+    data = data_dir(cap.name, data_tag if data_tag is not None else tag)
+    scratch = data / ".tmp"
+    scratch.mkdir(parents=True, exist_ok=True)
+    env["CAPFORGE_DATA_DIR"] = str(data)
+    if cap.data == "shared":
+        env["CAPFORGE_SHARED_DATA_DIR"] = str(shared_data_dir(cap.name))
+    env["TMPDIR"] = str(scratch)
+    env["HOME"] = str(scratch)
     env["CAPFORGE_SERVE_PORT"] = str(port)
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
     if public_url:
         env["CAPFORGE_PUBLIC_URL"] = public_url
+    _apply_cap_env(env, cap.name, cap, tag=tag)
     return env
 
 
@@ -1034,7 +1404,6 @@ def probe_web_boot(
     cap: Capability,
     source: Path,
     *,
-    packages: list[str] | None = None,
     timeout: int | None = None,
 ) -> ExecResult:
     """Boot the ASGI app once on a throwaway port and probe it over HTTP.
@@ -1044,10 +1413,16 @@ def probe_web_boot(
     entry = _contained(source, source / cap.entrypoint)
     if not entry.is_file():
         raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
-    venv = ensure_venv(cap.name, packages if packages is not None else cap.packages)
+    venv = ensure_venv(cap.name, source, "prod")
     port = _free_port()
     env = web_child_env(cap, tag=None, venv=venv, port=port, data_tag="test")
-    cmd = [str(venv / "bin" / "python"), *web_child_argv(cap, source, port)]
+    data = data_dir(cap.name, "test")
+    shared = shared_data_dir(cap.name) if cap.data == "shared" else None
+    cmd = _sandbox_command(
+        [str(venv / "bin" / "python"), *web_child_argv(cap, source, port)],
+        _sandbox_policy(source, venv, data, shared=shared),
+        cap.name,
+    )
     started = time.monotonic()
     budget = timeout or serve_boot_timeout()
     proc = subprocess.Popen(

@@ -24,7 +24,7 @@ async function jsonOrThrow(resp: Response) {
 
 export async function login(token: string): Promise<void> {
   await jsonOrThrow(
-    await fetch("/api/login", {
+    await fetch("../api/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token }),
@@ -33,7 +33,7 @@ export async function login(token: string): Promise<void> {
 }
 
 export async function session(): Promise<{ authed: boolean; console_enabled: boolean }> {
-  return jsonOrThrow(await fetch("/api/session")) as Promise<{
+  return jsonOrThrow(await fetch("../api/session")) as Promise<{
     authed: boolean;
     console_enabled: boolean;
   }>;
@@ -54,6 +54,20 @@ export interface ServedInfo {
   endpoints: Endpoint[];
 }
 
+export interface EnvInfo {
+  name: string;
+  declared: boolean;
+  configured: boolean;
+  updated_at: number;
+}
+
+export interface EnvChange {
+  ok: boolean;
+  restarted?: boolean;
+  restart_error?: string;
+  env: EnvInfo[];
+}
+
 export interface CapInfo {
   name: string;
   description: string;
@@ -63,10 +77,11 @@ export interface CapInfo {
   draft_error: string | null;
   draft_changed: boolean;
   served: ServedInfo | null;
+  env: EnvInfo[];
 }
 
 export async function caps(): Promise<CapInfo[]> {
-  const body = (await jsonOrThrow(await fetch("/api/caps"))) as { caps: CapInfo[] };
+  const body = (await jsonOrThrow(await fetch("../api/caps"))) as { caps: CapInfo[] };
   return body.caps;
 }
 
@@ -75,10 +90,29 @@ export async function control(
   action: "start" | "stop" | "restart"
 ): Promise<unknown> {
   return jsonOrThrow(
-    await fetch(`/api/caps/${name}/${action}`, {
+    await fetch(`../api/caps/${name}/${action}`, {
       method: "POST",
       headers: { "content-type": "application/json", "X-CSRF": "1" },
       body: JSON.stringify({}),
     })
   );
+}
+
+export async function setEnv(name: string, key: string, value: string): Promise<EnvChange> {
+  return (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/env`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ name: key, value }),
+    })
+  )) as EnvChange;
+}
+
+export async function clearEnv(name: string, key: string): Promise<EnvChange> {
+  return (await jsonOrThrow(
+    await fetch(
+      `../api/caps/${encodeURIComponent(name)}/env/${encodeURIComponent(key)}`,
+      { method: "DELETE", headers: { "X-CSRF": "1" } }
+    )
+  )) as EnvChange;
 }

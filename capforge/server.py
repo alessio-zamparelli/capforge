@@ -1,62 +1,63 @@
-"""MCP surface. Ten tools, stable names, no schema churn as capabilities come and go."""
+"""MCP surface: nine stable tools; capabilities live behind a git repository."""
 
 from __future__ import annotations
 
 import logging
 import shutil
-import time
 from pathlib import Path
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
-from . import __version__, versioning
-from .contract import (
-    CONTRACT,
-    GITIGNORE,
-    SCAFFOLD_APP,
-    SCAFFOLD_MAIN,
-    SCAFFOLD_SKILL,
-    SCAFFOLD_SKILL_WEB,
-    SCAFFOLD_TEST,
-    SCAFFOLD_TEST_WEB,
-)
+from . import __version__, core, scaffold, versioning
+from . import staging as staging_service
+from .contract import CONTRACT
 from .core import (
     WEB_KINDS,
     CapError,
-    cap_lock,
     cap_path,
     caps_dir,
     data_dir,
-    ensure_venv,
+    env_status,
     execute,
     install_timeout,
     keep_tags,
+    list_files,
     load_capability,
     load_capability_at,
-    requirements_hash,
-    run_tests,
+    log_max_bytes,
+    log_tail_bytes,
     run_timeout,
+    sandbox_mode,
     serve_boot_timeout,
     state_dir,
     test_timeout,
     tree_hash,
-    validate_packages,
+    try_file_lock,
 )
-from .core import (
-    list_capabilities as discover,
-)
+from .core import list_capabilities as discover
 
 log = logging.getLogger("capforge")
 
-# Set by cli._serve: "stdio" disables web serving (no HTTP surface to proxy through).
 RUNTIME_TRANSPORT = "http"
+TOOL_NAMES = [
+    "get_contract",
+    "list_capabilities",
+    "get_capability",
+    "scaffold_capability",
+    "run_capability",
+    "serve_capability",
+    "staging",
+    "delete_capability",
+    "rollback_capability",
+    "list_tags",
+]
 
 mcp = FastMCP(
     "capforge",
     instructions=(
-        "Deterministic, versioned capabilities. Write a capability folder, test the draft, "
-        "promote it to an immutable tag, then call it. Call get_contract first."
+        "Git-authored capabilities. Scaffold a uv project, clone its repository, edit, "
+        "push, and poll staging(latest). The pipeline tests and promotes on green."
     ),
 )
 
@@ -72,66 +73,95 @@ def _cap_or_error(name: str):
         return None, _fail(str(exc))
 
 
-def _archive_draft(name: str, path: Path) -> Path:
-    """Keep the previous draft instead of deleting it on scaffold(overwrite=true)."""
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = state_dir() / "backups" / name / f"{stamp}-{time.time_ns() % 1_000_000:06d}"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(path, dest, ignore=versioning.SKIP)
-    return dest
+def _git_url(name: str) -> str:
+    from . import web
+
+    return f"{web.public_base()}/git/{name}.git"
 
 
-# ------------------------------------------------------------------------ discovery
+def _env_caps(cap) -> list:
+    """Draft and active declarations, so status survives a draft-only edit."""
+    caps = [cap]
+    state = versioning.read_state(cap.name)
+    tag = (state.get("active") or {}).get("tag")
+    if tag:
+        source = versioning.version_path(cap.name, tag)
+        if source.is_dir():
+            active = load_capability_at(cap.name, source)
+            if not active.error:
+                caps.append(active)
+    return caps
+
+
+def _actor(ctx: Context | None) -> dict[str, Any]:
+    if ctx is None:
+        return {}
+    try:
+        request_context = getattr(ctx, "request_context", None)
+        request = getattr(request_context, "request", None)
+        if request is None:
+            return {}
+        headers = request.headers
+    except Exception:
+        return {}
+    mapping = {
+        "id": "x-openwebui-user-id",
+        "email": "x-openwebui-user-email",
+        "name": "x-openwebui-user-name",
+        "role": "x-openwebui-user-role",
+        "chat_id": "x-openwebui-chat-id",
+        "message_id": "x-openwebui-message-id",
+    }
+    return {
+        key: str(value)[:300]
+        for key, header in mapping.items()
+        if (value := headers.get(header))
+    }
 
 
 @mcp.tool
 def get_contract() -> dict:
-    """Read this first: the folder layout, the stdin/stdout contract, and the rules a
-    capability must follow. Returns the caps root (shared with the terminal), the state
-    directory, and the current limits."""
-    web = _web_info()
+    """Read this first: the git clone/push loop, the uv project contract, limits and paths."""
+    from . import web
+
     return {
         "ok": True,
         "version": __version__,
         "caps_dir": str(caps_dir()),
         "state_dir": str(state_dir()),
+        "caps_owner": "server; not shared with the terminal",
+        "tools": TOOL_NAMES,
         "keep_tags": keep_tags(),
         "limits": {
             "run_timeout_s": run_timeout(),
             "test_timeout_s": test_timeout(),
             "install_timeout_s": install_timeout(),
             "serve_boot_timeout_s": serve_boot_timeout(),
+            "log_max_bytes": log_max_bytes(),
+            "log_tail_bytes": log_tail_bytes(),
+            "sandbox": sandbox_mode(),
         },
-        "web": web,
+        "web": {
+            "host": web.web_host(),
+            "port": web.web_port(),
+            "ui": f"{web.public_base()}/ui/",
+            "api": f"{web.public_base()}/api/",
+            "git": f"{web.public_base()}/git/<name>.git",
+            "cap": f"{web.public_base()}/cap/<name>/",
+        },
+        "loop": (
+            "scaffold_capability -> staging(action='token') -> git clone -> edit/uv add/uv lock "
+            "-> commit -> git push -> staging(action='latest'); promotion is automatic on green."
+        ),
         "contract": CONTRACT,
     }
 
 
-def _web_info() -> dict:
-    """Web listener facts for get_contract; never includes the token value.
-    Lazy import keeps get_contract usable if the web install is broken."""
-    try:
-        from . import web
-
-        return {
-            "host": web.web_host(),
-            "port": web.web_port(),
-            "url_prefix": "http://<host>:<web port>/<name>/",
-            "console": "token-gated dashboard at the web root; CAPFORGE_WEB_TOKEN gates it, "
-            "unset disables it (the value is never exposed)",
-            "disabled": web.web_port() == 0,
-        }
-    except Exception as exc:
-        return {"disabled": True, "error": str(exc)}
-
-
 @mcp.tool
 def list_capabilities() -> dict:
-    """List every capability in the caps root with its active tag and draft status.
-    Cheap: call it instead of guessing names."""
-    caps = discover()
+    """List capabilities, their active tag, draft state and repository URL."""
     out = []
-    for cap in caps:
+    for cap in discover():
         state = versioning.read_state(cap.name)
         active = state.get("active") or {}
         out.append(
@@ -139,6 +169,7 @@ def list_capabilities() -> dict:
                 "name": cap.name,
                 "description": cap.description,
                 "kind": cap.kind,
+                "data": cap.data,
                 "active": active.get("tag"),
                 "draft_ready": cap.draft_ready,
                 "draft_error": cap.error,
@@ -148,7 +179,8 @@ def list_capabilities() -> dict:
                     and active["content_hash"] != tree_hash(cap.path)
                 ),
                 "tags": len(state.get("tags") or []),
-                "packages": cap.packages,
+                "git_url": _git_url(cap.name),
+                "env": env_status(cap.name, _env_caps(cap)),
             }
         )
     return {"ok": True, "caps_dir": str(caps_dir()), "count": len(out), "capabilities": out}
@@ -156,8 +188,7 @@ def list_capabilities() -> dict:
 
 @mcp.tool
 def get_capability(name: str) -> dict:
-    """Full detail for one capability: SKILL.md as written, frontmatter, entrypoint,
-    packages, hashes, tags and the active version."""
+    """Full detail for one capability: the materialised draft, active tag, repo and data mode."""
     cap, err = _cap_or_error(name)
     if err:
         return err
@@ -166,13 +197,16 @@ def get_capability(name: str) -> dict:
         "ok": True,
         "name": cap.name,
         "path": str(cap.path),
+        "git_url": _git_url(cap.name),
         "description": cap.description,
         "kind": cap.kind,
+        "data": cap.data,
         "entrypoint": cap.entrypoint,
-        "packages": cap.packages,
+        "env": env_status(cap.name, _env_caps(cap)),
         "draft_ready": cap.draft_ready,
         "draft_error": cap.error,
         "draft_hash": tree_hash(cap.path) if cap.path.is_dir() else None,
+        "files": list_files(cap.path),
         "skill_md": (cap.path / "SKILL.md").read_text(encoding="utf-8", errors="replace")
         if (cap.path / "SKILL.md").is_file()
         else None,
@@ -181,220 +215,120 @@ def get_capability(name: str) -> dict:
     }
 
 
-# ------------------------------------------------------------------------ authoring
-
-
 @mcp.tool
-def scaffold_capability(
-    name: str,
-    description: str,
-    packages: list[str] | None = None,
-    overwrite: bool = False,
-    kind: str = "cli",
-) -> dict:
-    """Create a capability folder with SKILL.md, a working main.py and one passing test.
-    Start here instead of writing files by hand: the skeleton already satisfies the contract.
-    kind="web" scaffolds a FastAPI service (app.py + a boot test) to run with serve_capability.
-    overwrite=true archives the previous draft under the state directory first."""
-    try:
-        path = cap_path(name)
-    except CapError as exc:
-        return _fail(str(exc))
-    description = description.strip()
-    if not description:
-        return _fail("description is required: it is the only thing the model sees in the manifest.")
-    if "\n" in description or "\r" in description or "---" in description:
-        return _fail("description must be one line and must not contain '---'.")
-    if len(description) > 500:
-        return _fail("description must be at most 500 characters.")
+def scaffold_capability(name: str, description: str, kind: str = "cli") -> dict:
+    """Create a uv base project, publish `main` in a new bare repo, and materialise the draft.
+    The model then mints a token with staging(action='token') and clones the repository."""
     kind = str(kind).strip().lower() or "cli"
     if kind not in WEB_KINDS:
-        return _fail(f"kind must be one of {list(WEB_KINDS)}, got {kind!r}.")
+        return _fail(f"kind must be one of {list(WEB_KINDS)}, got {kind!r}")
     try:
-        pkgs = validate_packages(packages or [])
+        result = scaffold.create(name, description, kind)
     except CapError as exc:
         return _fail(str(exc))
-    if kind == "web" and not {"fastapi", "uvicorn", "httpx"} <= set(pkgs):
-        pkgs = list(dict.fromkeys(["fastapi", "uvicorn", "httpx", *pkgs]))
-
-    backup: Path | None = None
-    try:
-        with cap_lock(name):
-            if path.exists() and not overwrite:
-                return _fail(
-                    f"{name!r} already exists at {path}. Pass overwrite=true to replace it "
-                    "(the old draft is archived first), or edit it in place."
-                )
-            if path.exists():
-                backup = _archive_draft(name, path)
-                shutil.rmtree(path)
-            (path / "tests").mkdir(parents=True)
-            if kind == "web":
-                (path / "SKILL.md").write_text(
-                    SCAFFOLD_SKILL_WEB.format(
-                        name=name, description=description, packages=", ".join(pkgs)
-                    ),
-                    encoding="utf-8",
-                )
-                (path / "app.py").write_text(SCAFFOLD_APP.format(name=name), encoding="utf-8")
-                (path / "tests" / "test_main.py").write_text(
-                    SCAFFOLD_TEST_WEB.format(name=name), encoding="utf-8"
-                )
-                files = ["SKILL.md", "app.py", "tests/test_main.py"]
-            else:
-                (path / "SKILL.md").write_text(
-                    SCAFFOLD_SKILL.format(
-                        name=name, description=description, packages=", ".join(pkgs)
-                    ),
-                    encoding="utf-8",
-                )
-                (path / "main.py").write_text(SCAFFOLD_MAIN.format(name=name), encoding="utf-8")
-                (path / "tests" / "test_main.py").write_text(
-                    SCAFFOLD_TEST.format(name=name), encoding="utf-8"
-                )
-                files = ["SKILL.md", "main.py", "tests/test_main.py"]
-            (path / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     except OSError as exc:
-        return _fail(f"Could not write {path}: {exc}")
-    return {
-        "ok": True,
-        "name": name,
-        "kind": kind,
-        "path": str(path),
-        "files": files,
-        "backup": str(backup) if backup else None,
-        "next": (
-            "Edit app.py and SKILL.md, then test_capability(name) and promote_capability(name), "
-            "then serve_capability(name, action='start')."
-            if kind == "web"
-            else "Edit main.py and SKILL.md, then call test_capability(name) and promote_capability(name)."
-        ),
-    }
+        return _fail(f"Could not scaffold {name!r}: {exc}")
+    result["ok"] = True
+    result["next"] = (
+        "Call staging(name, action='token'), clone git_url with Basic auth, edit, "
+        "uv add/uv lock, commit, push HEAD:main, then poll staging(name, action='latest'). "
+        "The scaffold includes tests/test_scaffold.py; keep or replace it."
+    )
+    return result
 
 
-@mcp.tool
-def install_packages(name: str, packages: list[str]) -> dict:
-    """Install Python packages into this capability's own virtualenv and record them in
-    SKILL.md. Isolated from the hub and from every other capability. To remove packages,
-    call promote_capability with the exact new `packages` list."""
-    cap, err = _cap_or_error(name)
-    if err:
-        return err
-    try:
-        wanted = validate_packages(packages)
-    except CapError as exc:
-        return _fail(str(exc))
-    if not wanted:
-        return _fail("packages is empty")
-    merged = sorted({*cap.packages, *wanted})
-    try:
-        with cap_lock(cap.name):
-            venv = ensure_venv(cap.name, merged)
-            versioning.write_packages(cap.name, merged)
-    except CapError as exc:
-        return _fail(str(exc))
-    return {
-        "ok": True,
-        "name": cap.name,
-        "installed": wanted,
-        "packages": merged,
-        "venv": str(venv),
-        "requirements_hash": requirements_hash(merged),
-        "note": "Recorded in SKILL.md. A new requirement set builds a fresh venv on next run; "
-        "the old one is left in place for the versions that pinned it.",
-    }
-
-
-# ----------------------------------------------------------------------- validation
-
-
-@mcp.tool
 def test_capability(name: str, args: dict | None = None) -> dict:
-    """Run the draft's test suite (pytest if tests/test_*.py exists, otherwise a real smoke
-    run through the same JSON contract). Optionally also run the entrypoint once with `args`
-    and report `run_ok` separately. The test suite is the pre-promotion gate: promote refuses
-    while tests fail."""
+    """Internal/operator helper (not an MCP tool): test the server draft."""
     cap, err = _cap_or_error(name)
     if err:
         return err
     if not cap.draft_ready:
         return _fail(f"Draft is not runnable: {cap.error}")
+    from .core import run_tests
 
     try:
         tests = run_tests(cap, cap.path)
     except CapError as exc:
-        return _fail(str(exc))
-
-    payload: dict[str, Any] = {
-        "ok": tests.ok,
-        "name": cap.name,
-        "draft_hash": tree_hash(cap.path)[:12],
-        "tests_ok": tests.ok,
-        "tests": {
-            "passed": tests.ok,
-            "exit_code": tests.exit_code,
-            "duration_ms": tests.duration_ms,
-            "stdout": tests.stdout[-3000:],
-            "stderr": tests.stderr[-3000:],
-        },
-    }
+        return _fail(f"Tests could not run: {exc}")
+    payload: dict[str, Any] = {"ok": tests.ok, "tests": tests.as_dict()}
     if args is not None:
-        try:
-            run = execute(cap, cap.path, args, tag=None)
-        except CapError as exc:
-            payload["run"] = {"ok": False, "error": str(exc)}
-            payload["run_ok"] = False
-            payload["ok"] = False
-        else:
-            payload["run"] = run.as_dict()
-            payload["run_ok"] = run.ok
-            payload["ok"] = bool(payload["ok"] and run.ok)
+        run = execute(cap, cap.path, args, tag=None)
+        payload["run"] = run.as_dict()
+        payload["ok"] = bool(payload["ok"] and run.ok)
     return payload
 
 
-# ------------------------------------------------------------------------- runtime
+def promote_capability(
+    name: str,
+    tag: str | None = None,
+    note: str = "",
+    skip_tests: bool = False,
+    force: bool = False,
+) -> dict:
+    """Internal/operator helper (not an MCP tool): test the server draft and promote."""
+    cap, err = _cap_or_error(name)
+    if err:
+        return err
+    if not cap.draft_ready:
+        return _fail(f"Draft is not runnable: {cap.error}")
+    if not skip_tests:
+        from .core import run_tests
+
+        try:
+            tests = run_tests(cap, cap.path)
+        except CapError as exc:
+            return _fail(f"Tests could not run: {exc}")
+        if not tests.ok:
+            return {
+                "ok": False,
+                "error": "Tests failed; promotion refused.",
+                "exit_code": tests.exit_code,
+                "stdout": tests.stdout[-3000:],
+                "stderr": tests.stderr[-3000:],
+            }
+    try:
+        result = versioning.promote(cap.name, tag, note=note, force=force)
+    except CapError as exc:
+        return _fail(str(exc))
+    result["ok"] = True
+    result["tests_skipped"] = skip_tests
+    return result
 
 
 @mcp.tool
 def run_capability(name: str, args: dict | None = None) -> dict:
-    """Execute the ACTIVE tagged version of a capability. Falls back to the draft only when
-    nothing has been promoted yet, and says so in the result. The tag's own SKILL.md defines
-    its entrypoint and packages; later draft edits cannot change what the tag runs."""
+    """Execute the active tag (or the scaffold draft before the first promotion)."""
     try:
         path = cap_path(name)
     except CapError as exc:
         return _fail(str(exc))
     if not path.is_dir():
-        return _fail(
-            f"No capability named {name!r} in {caps_dir()}. Use scaffold_capability to create one."
-        )
+        return _fail(f"No capability named {name!r} in {caps_dir()}; scaffold it first.")
 
     state = versioning.read_state(name)
     active = state.get("active") or {}
     tag = active.get("tag")
-
     if tag:
         source = versioning.version_path(name, tag)
         if not source.is_dir():
             return _fail(
-                f"Active tag {tag!r} is recorded but its files are gone. Roll back or promote again."
+                f"Active tag {tag!r} is recorded but its files are gone. Roll back or push again."
             )
         source_cap = load_capability_at(name, source)
         if source_cap.error:
             return _fail(f"Active tag {tag!r} is not runnable: {source_cap.error}")
-        packages = active["packages"] if "packages" in active else source_cap.packages
         mode = "active"
     else:
         source_cap = load_capability(name)
         if not source_cap.draft_ready:
             return _fail(
                 f"{name!r} has never been promoted and the draft is not runnable "
-                f"({source_cap.error}). Run test_capability and promote_capability first."
+                f"({source_cap.error}). Push a green commit first."
             )
-        source, packages, tag, mode = source_cap.path, source_cap.packages, None, "draft"
+        source, tag, mode = source_cap.path, None, "draft"
 
     try:
-        result = execute(source_cap, source, args or {}, tag=tag, packages=packages)
+        result = execute(source_cap, source, args or {}, tag=tag)
     except CapError as exc:
         return _fail(str(exc))
 
@@ -405,38 +339,36 @@ def run_capability(name: str, args: dict | None = None) -> dict:
             "version": tag or "draft",
             "mode": mode,
             "entrypoint": source_cap.entrypoint,
-            "packages": packages,
-            "content_hash": str(active.get("content_hash") or tree_hash(source))[:12],
+            "env": "uv",
+            "content_hash": str((active.get("content_hash") if tag else tree_hash(source)) or "")[:12],
             "data_dir": str(data_dir(name, tag)),
         }
     )
     if mode == "draft":
-        out["warning"] = "Running the unpromoted draft. Promote it once the tests pass."
+        out["warning"] = "Running the unpromoted scaffold draft; push a green commit to promote."
+        if source_cap.env:
+            out["env_warning"] = (
+                "Draft runs use placeholder values for declared env; promote, then set real "
+                "values in the console."
+            )
     return out
 
 
-# -------------------------------------------------------------------------- serving
-
-
 @mcp.tool
-def serve_capability(name: str, action: str = "status") -> dict:
-    """Start, stop, restart or inspect the long-lived web server for a capability's
-    ACTIVE tag. Requires kind: web and a promoted tag; drafts are never served.
-    start/stop/restart manage the instance pinned to the active tag; restart also
-    picks up a newly promoted tag. The service is reachable at the URL in the result
-    (the web listener's /<name>/ prefix)."""
+def serve_capability(name: str, action: str = "status", tail: int | None = None) -> dict:
+    """Start, stop, restart, inspect or read logs for a web capability's ACTIVE tag."""
     if RUNTIME_TRANSPORT == "stdio":
         return _fail(
             "web serving requires HTTP transport: run `capforge serve` without "
             "--transport stdio (the web listener is skipped in stdio mode)."
         )
     action = str(action).strip().lower() or "status"
-    if action not in ("start", "stop", "restart", "status"):
-        return _fail(f"action must be one of start, stop, restart, status; got {action!r}")
+    if action not in ("start", "stop", "restart", "status", "logs"):
+        return _fail(f"action must be one of start, stop, restart, status, logs; got {action!r}")
     try:
         from . import web
 
-        result = getattr(web, action)(name)
+        result = web.logs(name, tail) if action == "logs" else getattr(web, action)(name)
     except CapError as exc:
         return _fail(str(exc))
     result["ok"] = True
@@ -449,64 +381,121 @@ def serve_capability(name: str, action: str = "status") -> dict:
     return result
 
 
-# ------------------------------------------------------------------------ promotion
-
-
 @mcp.tool
-def promote_capability(
+def staging(
     name: str,
-    tag: str | None = None,
-    note: str = "",
-    packages: list[str] | None = None,
-    skip_tests: bool = False,
-    force: bool = False,
+    action: str = "latest",
+    kind: str = "pipeline",
+    tail: int | None = None,
+    ctx: Context | None = None,
 ) -> dict:
-    """Snapshot the draft into an immutable tag and make it the active version.
-    Runs the tests first and refuses on failure. Old tags beyond the keep limit are pruned,
-    along with their per-version data and unused venvs. Pass force=true to tag an unchanged
-    draft (a re-release of the same content)."""
-    cap, err = _cap_or_error(name)
-    if err:
-        return err
-    if not cap.draft_ready:
-        return _fail(f"Draft is not runnable: {cap.error}")
-    if packages is not None:
-        try:
-            packages = validate_packages(packages)
-        except CapError as exc:
-            return _fail(str(exc))
-
-    if not skip_tests:
-        try:
-            tests = run_tests(cap, cap.path, packages=packages)
-        except CapError as exc:
-            return _fail(f"Tests could not run: {exc}")
-        if not tests.ok:
-            return {
-                "ok": False,
-                "error": "Tests failed; promotion refused.",
-                "exit_code": tests.exit_code,
-                "stdout": tests.stdout[-3000:],
-                "stderr": tests.stderr[-3000:],
-                "hint": "Fix the code, or pass skip_tests=true with a note explaining why.",
-            }
-
+    """Git credentials and push feedback. action='token' mints one short-lived token for
+    clone and push; action='latest' returns the pipeline state, tag and log tail;
+    action='logs' returns the bounded pipeline or scaffold log."""
+    action = str(action).strip().lower() or "latest"
     try:
-        result = versioning.promote(cap.name, tag, packages=packages, note=note, force=force)
+        cap_path(name)
+        if action == "token":
+            minted = staging_service.mint(name, _actor(ctx))
+            minted["ok"] = True
+            minted["git_url"] = _git_url(name)
+            user = minted.get("basic_username") or "git"
+            minted["hint"] = (
+                f"Use Basic auth only: username {user!r}, password the token. "
+                "git -c credential.helper='!f() { echo username=$BASIC_USERNAME; "
+                "echo password=$TOKEN; }; f' clone \"$GIT_URL\""
+            )
+            return minted
+        if action == "latest":
+            data = staging_service.latest(name)
+            data.update({"ok": True, "name": name, "git_url": _git_url(name)})
+            return data
+        if action == "logs":
+            data = staging_service.read_log(name, kind, tail)
+            data.update({"ok": True, "name": name, "kind": kind})
+            return data
+        return _fail(f"action must be one of token, latest, logs; got {action!r}")
     except CapError as exc:
         return _fail(str(exc))
 
-    result["ok"] = True
-    result["tests_skipped"] = skip_tests
-    return result
+
+def _delete_targets(name: str) -> list[Path]:
+    root = core.cap_path(name)
+    state = state_dir()
+    return [
+        root,
+        state / "versions" / name,
+        state / "venvs" / name,
+        state / "data" / name,
+        state / "logs" / name,
+        state / "git" / f"{name}.git",
+        state / "served" / name,
+        state / "state" / f"{name}.json",
+        state / "staging" / f"{name}.json",
+    ]
+
+
+@mcp.tool
+def delete_capability(name: str, confirm: str) -> dict:
+    """Delete a capability and all of its server-side state. `confirm` must equal `name`.
+    Stops a served instance first, refuses while a push or pipeline is running, and is
+    idempotent when the capability is already gone."""
+    from . import staging as staging_service
+
+    try:
+        validated = cap_path(name).name
+    except CapError as exc:
+        return _fail(str(exc))
+    if confirm != validated:
+        return _fail("confirm must equal the capability name exactly")
+    targets = _delete_targets(validated)
+    exists = any(path.exists() for path in targets) or bool(staging_service.read_state(validated))
+    if not exists:
+        return {"ok": True, "deleted": False, "name": validated, "reason": "not found"}
+
+    current = staging_service.read_state(validated)
+    if current.get("state") and current.get("state") not in {
+        "promoted", "unchanged", "failed", "interrupted",
+    }:
+        return _fail("a push pipeline is in progress; wait for it to finish")
+
+    push = state_dir() / "locks" / f"{validated}-git-push.lock"
+    pipeline = state_dir() / "locks" / f"{validated}-pipeline.lock"
+    stopped = False
+    with try_file_lock(push) as push_ok:
+        if not push_ok:
+            return _fail("a push is in progress; try again after it finishes")
+        with try_file_lock(pipeline) as pipeline_ok:
+            if not pipeline_ok:
+                return _fail("a pipeline is in progress; try again after it finishes")
+            from . import web
+
+            web.forget(validated)
+            stopped = True
+            with core.cap_lock(validated):
+                staging_service.forget(validated)
+                for target in targets:
+                    if target.is_dir():
+                        shutil.rmtree(target, ignore_errors=True)
+                    else:
+                        target.unlink(missing_ok=True)
+                staging_root = core.cap_path(validated).parent / ".staging"
+                for leftover in staging_root.glob(f"{validated}-*"):
+                    shutil.rmtree(leftover, ignore_errors=True)
+                for lock in (state_dir() / "locks").glob(f"{validated}*.lock"):
+                    try:
+                        lock.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    log.info("delete cap=%s stopped=%s deleted=true", validated, stopped)
+    return {"ok": True, "deleted": True, "name": validated, "stopped": stopped}
 
 
 @mcp.tool
 def rollback_capability(name: str, tag: str) -> dict:
-    """Make an older tag active again. Does not touch the working copy."""
+    """Make an older tag active again. Does not touch the draft or the repository."""
     try:
-        validated = cap_path(name).name
-        result = versioning.rollback(validated, tag)
+        result = versioning.rollback(cap_path(name).name, tag)
     except CapError as exc:
         return _fail(str(exc))
     result["ok"] = True
@@ -515,8 +504,7 @@ def rollback_capability(name: str, tag: str) -> dict:
 
 @mcp.tool
 def list_tags(name: str, diff_against_active: bool = False) -> dict:
-    """Tags for a capability, newest last, with the active one marked. Set
-    diff_against_active to see how the working copy differs from the active version."""
+    """Tags for a capability, newest last, with the active one marked."""
     cap, err = _cap_or_error(name)
     if err:
         return err
@@ -531,7 +519,4 @@ def list_tags(name: str, diff_against_active: bool = False) -> dict:
 
 
 if __name__ == "__main__":
-    from .core import ensure_workspace_skill
-
-    ensure_workspace_skill()
     mcp.run()

@@ -3,359 +3,92 @@
 from __future__ import annotations
 
 CONTRACT = """\
-# Capability contract
+# Capability contract (git-authored)
 
-A capability is one folder under the caps root. The folder name is the capability name and is
-shared between this MCP server and the terminal: what you write there is what this server runs.
+Capabilities are uv projects in a git repository. The server owns the caps directory; you do not
+have a shared filesystem mount. Work in a clone.
 
-    <caps>/<name>/
-        SKILL.md          frontmatter + instructions (read by Open WebUI every turn)
-        main.py           entrypoint (name configurable via `entrypoint:` in frontmatter)
-        tests/test_main.py optional; pytest runs if any test_*.py exists
-        <anything>        helper modules, data files, templates
+    scaffold_capability(name, description)
+    staging(name, action="token")      # short-lived clone/push token + git_url
+    git clone <git_url>                # your workspace
+    edit, uv add, uv lock, commit
+    git push origin HEAD:main
+    staging(name, action="latest")     # received -> ... -> promoted | failed
+    staging(name, action="logs")       # bounded pipeline/test log
 
-## Process contract
+The pipeline tests the pushed tree in a state-owned uv environment. Only a green push is swapped
+into the server draft and promoted. There is no manual promote/test/install tool.
 
-The entrypoint is executed as a fresh subprocess, once per call:
+## Project layout
 
-    <venv>/bin/python main.py < /dev/stdin
+    <name>/
+        SKILL.md            frontmatter + instructions; env: [NAME, ...] declares
+                            operator-set values; no packages field
+        pyproject.toml      dependencies; requires-python = ">=3.14,<3.15"
+        uv.lock             committed; `uv sync --frozen` is the only install path
+        .python-version     3.14
+        main.py | app.py    entrypoint (`entrypoint:`, `app:`)
+        tests/              pytest; the dev group also has pytest-cov
+        AGENTS.md           the loop, for the model
 
-* stdin  : one JSON object with the call arguments. Never argv, never environment variables.
-* stdout : one JSON value. It may be the whole output or the last non-empty line; anything
-           before it is kept in the log the caller sees, so print diagnostics freely.
-* stderr : logs. Shown to the caller on failure.
-* exit 0 : success. Any other exit code is a failure and stderr is reported.
-
-Return `{"error": "..."}` to signal a handled failure with a message meant for the model.
-Raise only for bugs; an uncaught exception is a failed call.
-
-## Rules that matter
-
-1. **Validate your input.** Arguments come from a language model. Reject anything you did not
-   expect with a specific message: "start_date must be YYYY-MM-DD, got 'next tuesday'".
-2. **No network by default.** Assume none. If you need it, say so in SKILL.md so a human can
-   decide; do not silently depend on it.
-3. **Write only under CAPFORGE_DATA_DIR.** It is per-capability and per-version. Everything
-   else in the filesystem is read-only in spirit: the hub, other capabilities and the versions
-   tree are not yours to modify.
-4. **No secrets.** Environment is filtered down to PATH, locale and TLS settings. pip index
-   settings are visible to the installer only, never to your process. There is no place to
-   put an API key in this design, by construction.
-5. **Be fast.** Calls time out (default 120s, CAPFORGE_RUN_TIMEOUT). Long work belongs in a
-   subprocess you poll, or in a file you write and read back later.
-6. **Deterministic output.** Same args plus same data directory must give the same result.
-   Sort collections, pin formats, never emit timestamps you did not ask for.
-7. **Leave nothing running.** A call must not leave processes behind it: anything you fork
-   that outlives the call is killed. A resident service is a web capability (`kind: web`)
-   served through `serve_capability`, never a detached daemon.
-
-## Web capabilities
-
-Frontmatter `kind: web` turns a capability into a long-lived HTTP service instead of a
-one-shot call:
-
-    ---
-    name: my_service
-    description: One sentence, shown to the model in the per-turn manifest.
-    kind: web
-    entrypoint: app.py
-    packages: [fastapi, uvicorn]
-    ---
-
-* `entrypoint` names the file containing the ASGI `app` object (optional `app:` overrides
-  the object name, default `app`). `uvicorn` must be in `packages`.
-* Write a FastAPI (or any ASGI) app. A `GET /health` returning 200 is a useful convention.
-* The service is a public network endpoint: validate every input, never return secrets,
-  write only under `CAPFORGE_DATA_DIR`, and never assume the caller is the model — anyone
-  who can reach the port is a caller.
-* There is no stdin/stdout JSON contract: the process is long-lived, the run timeout does
-  not apply, and the boot budget (CAPFORGE_SERVE_BOOT_TIMEOUT, default 60s) replaces it.
-* The environment is the same allowlist as a call, plus `CAPFORGE_SERVE_PORT` (the port you
-  are bound to) and `CAPFORGE_PUBLIC_URL` (the URL callers use).
-* Lifecycle: promote the draft, then `serve_capability(name, action="start")`. The instance
-  is pinned to the active tag; a later promotion does not change a running instance until
-  you `restart`. `test_capability` boots the app once and probes it before promotion.
-
-## Dependencies
-
-List them in SKILL.md frontmatter and the venv is built for you, per capability, keyed by the
-requirement set:
-
-    ---
-    name: my_cap
-    description: One sentence, shown to the model in the per-turn manifest.
-    packages: [pypdf>=5, httpx]
-    ---
-
-Package entries are plain requirement specs: no spaces, commas, quotes, URLs or leading
-`-`. That keeps them safe as pip arguments and unambiguous in the frontmatter. At most 50
-per capability. Call install_packages(name, packages) to add them now and record them;
-promote_capability(name, packages=[...]) replaces the set (including to remove one).
-Installs are isolated from the hub and from every other capability. stdlib-only is the
-happy path.
-
-## Versioning
-
-The working copy is the draft. `test_capability` runs the draft. `promote_capability` snapshots
-the draft into an immutable tag, records it in a git commit, and makes it the version
-`run_capability` executes. The tag carries its own SKILL.md, so later draft edits cannot
-change its entrypoint or dependencies. `rollback_capability` points back at an older tag
-without touching the draft. The last N tags are kept (default 5, CAPFORGE_KEEP_TAGS); older
-ones are deleted together with their per-version data and unused virtualenvs.
-"""
-
-WORKSPACE_SKILL_MARKER = "<!-- capforge-managed:"
-
-WORKSPACE_SKILL = """\
----
-name: capforge
-description: Author, test, promote and run capabilities through the capforge MCP tools; start with get_contract().
----
-
-<!-- capforge-managed: regenerated by `capforge serve`; edits may be overwritten. -->
-
-# capforge workspace
-
-This folder holds capabilities. Each capability is a folder with a `SKILL.md` (what it does and how
-to call it) and a runnable entrypoint (default `main.py`). The same folder is your terminal
-workspace and the code the `capforge` MCP server executes.
-
-## The loop
-
-1. `get_contract()` once. It has the layout, limits and full stdin/stdout contract.
-2. `list_capabilities()` to see names, active tags and whether a draft changed.
-3. `scaffold_capability(name, description)`; never start from an empty file.
-   Pass `kind="web"` for a long-lived HTTP service (FastAPI app) instead of a CLI.
-4. Edit `<name>/SKILL.md` and `<name>/main.py` with your file tools.
-5. `test_capability(name, args={...})`; it runs the tests and one real invocation.
-6. `promote_capability(name, tag, note)`; tests must pass and the tag becomes live.
-7. `run_capability(name, args)` always executes the active tag, not the draft.
-8. For `kind: web` capabilities: `serve_capability(name, action="start")` runs the active
-   tag as a long-lived server at `http://<host>:<web port>/<name>/`; actions are
-   start | stop | restart | status. `run_capability` refuses web capabilities.
-
-`rollback_capability(name, tag)` moves the active pointer. `list_tags(name,
-diff_against_active=true)` shows what differs from live.
+Add dependencies with `uv add` in the clone and commit the updated `uv.lock`. `uv sync` runs with
+`--no-dev` for production and the `dev` group for tests. `requires-python` is fixed at 3.14.
 
 ## Process contract
 
-The entrypoint reads **one JSON object on stdin** and writes **one JSON value on stdout**, exit 0.
-Arguments are never argv or environment variables. Diagnostics go to stderr. Return
-`{"error": "..."}` for a handled failure the model should read; raise only for bugs.
+The CLI entrypoint is executed as a fresh subprocess, once per call:
 
-The last non-empty stdout line may be the JSON value, but emitting only the JSON is simplest.
-A non-zero exit, a timeout or unparseable output is a failed call.
+    <venv>/bin/python main.py
+
+* stdin  : one JSON object with the call arguments. Never argv. The environment is
+           filtered; only names declared under `env:` receive operator-set values.
+* stdout : one JSON value; the whole output or the last non-empty line.
+* stderr : diagnostics, shown on failure.
+* exit 0 : success; any other code is a failure.
+
+Return `{"error": "..."}` for a handled failure the model should read. Raise only for bugs.
+
+## Environment
+
+Declare every variable your code reads in `SKILL.md`:
+
+    env: [WEATHER_API_KEY, SMTP_PASSWORD]
+
+The operator sets the values in the console (`/ui/`). You cannot read or write them and
+must never commit them. Declarations are per capability and shared across tags. Only
+declared names are injected, and only into the active tag; a missing value makes
+`run_capability`/`serve_capability` fail with the names. Tests and the web boot probe
+receive the placeholder `capforge-test-placeholder` for each declared name, so never
+require a real secret at import time or in a test.
 
 ## Rules
 
-* Validate every argument. It came from a language model; name the field and the expected format.
-* Write only under `CAPFORGE_DATA_DIR` (per capability and per version).
-* No secrets. The environment is filtered; there is nowhere to put a key.
-* Assume no network. List dependencies in `packages:` in SKILL.md or call `install_packages`.
-  Specs are plain requirements (`pypdf>=5`): no spaces, commas, URLs or leading `-`.
-* Be fast. Calls time out at 120s by default; long work belongs in a polled subprocess.
-* Be deterministic: same args and data directory, same result. Sort and pin formats.
-* Leave nothing running. Anything forked inside a call that outlives it is killed. A
-  resident service is `kind: web` served with `serve_capability`, not a detached daemon.
+1. Validate every argument. It came from a language model.
+2. No network by default; declare a real need in SKILL.md.
+3. Write runtime files only under `CAPFORGE_DATA_DIR` (per version). Add `data: shared` to
+   SKILL.md for a stable `CAPFORGE_SHARED_DATA_DIR` across tags; it is unversioned and the
+   capability owns concurrency, migrations and backup requirements. The code tree is read-only.
+4. Credentials are operator-managed. Declare names under `env:`; never commit a
+   value or invent one. The environment is filtered otherwise; index settings are
+   visible only to uv.
+5. Be fast. Calls time out (CAPFORGE_RUN_TIMEOUT, default 120s).
+6. Be deterministic. Same args plus the same data directory should give the same result.
+7. Leave nothing running. A resident service is `kind: web` served with `serve_capability`.
+8. Filesystem access is confined by Landlock: own code/venv/system read, own data read/write,
+   everything else denied. Network/CPU/memory are not confined.
 
-The draft is never what runs after promotion. Tags are immutable copies; edit and test the draft,
-then promote.
+## Web capabilities
+
+`kind: web` turns the project into a long-lived HTTP service. Put `fastapi`, `uvicorn` and
+`httpx` in `[project].dependencies`; `uvicorn` is required. `entrypoint: app.py` names the ASGI
+module; `app:` selects the object (default `app`). After promotion, `serve_capability` boots the
+active tag at `/cap/<name>/`; a promotion does not restart it until `restart`.
+
+## Versioning
+
+The pushed tree is tested before the draft swap. A green tree is snapshotted into an immutable tag,
+the active pointer moves, and old tags beyond CAPFORGE_KEEP_TAGS (default 5) are pruned with their
+per-version data and unused venvs. `rollback_capability` moves the pointer without touching the
+draft or the repository. Promotion is automatic; operator recovery is `capforge promote`/`test`.
+
 """
-
-SCAFFOLD_MAIN = '''\
-"""Entry point for capability {name}.
-
-Reads one JSON object from stdin, writes one JSON value to stdout.
-Edit freely: nothing here is required except the stdin/stdout contract.
-"""
-
-from __future__ import annotations
-
-import json
-import os
-import sys
-
-
-def handle(args: dict) -> dict:
-    # Replace with the real work. Keep the validation: arguments come from a model.
-    text = args.get("text")
-    if not isinstance(text, str):
-        return {{"error": "text is required and must be a string"}}
-    return {{"text": text, "length": len(text)}}
-
-
-def main() -> int:
-    raw = sys.stdin.read().strip()
-    try:
-        args = json.loads(raw) if raw else {{}}
-    except json.JSONDecodeError as exc:
-        print(f"stdin is not valid JSON: {{exc}}", file=sys.stderr)
-        return 2
-    if not isinstance(args, dict):
-        print("stdin must be a JSON object", file=sys.stderr)
-        return 2
-    try:
-        result = handle(args)
-    except Exception as exc:  # noqa: BLE001 - a bug must not look like a crash
-        print(f"unhandled error: {{type(exc).__name__}}: {{exc}}", file=sys.stderr)
-        return 1
-    json.dump(result, sys.stdout, ensure_ascii=False, sort_keys=True)
-    sys.stdout.write("\\n")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-SCAFFOLD_SKILL = """\
----
-name: {name}
-description: {description}
-entrypoint: main.py
-packages: [{packages}]
----
-
-# {name}
-
-What this does, in two or three sentences. Be concrete: the model reads this to decide
-whether the capability is the right one for the job.
-
-## Arguments
-
-| name | type | required | meaning |
-|------|------|----------|---------|
-| text | string | yes | the value to measure |
-
-## Returns
-
-    {{"text": "hello", "length": 5}}
-
-## Notes
-
-Anything the caller must know: limits, formats, what it refuses, what it never touches.
-"""
-
-SCAFFOLD_TEST = '''\
-"""Tests for {name}. These run before a promotion, and a failure blocks it."""
-
-from __future__ import annotations
-
-import json
-import subprocess
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def run(payload: dict) -> dict:
-    proc = subprocess.run(
-        [sys.executable, str(ROOT / "main.py")],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, proc.stderr
-    return json.loads(proc.stdout.strip().splitlines()[-1])
-
-
-def test_happy_path() -> None:
-    assert run({{"text": "hello"}})["length"] == 5
-
-
-def test_rejects_bad_input() -> None:
-    assert "error" in run({{"text": 42}})
-'''
-
-GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n.venv/\n"
-
-SCAFFOLD_APP = '''\
-"""ASGI app for web capability {name}.
-
-Runs as a long-lived service: `serve_capability(name, action="start")` boots it with
-uvicorn and reverse-proxies it at http://<host>:<web port>/{name}/<path>.
-Validate every input: anyone who can reach the port is a caller, not just the model.
-"""
-
-from __future__ import annotations
-
-from fastapi import FastAPI
-
-app = FastAPI(title="{name}")
-
-
-@app.get("/")
-def index() -> dict:
-    return {{"service": "{name}", "status": "ok"}}
-
-
-@app.get("/health")
-def health() -> dict:
-    return {{"healthy": True}}
-'''
-
-SCAFFOLD_SKILL_WEB = """\
----
-name: {name}
-description: {description}
-kind: web
-entrypoint: app.py
-packages: [{packages}]
----
-
-# {name} (web service)
-
-A long-lived HTTP service. After promotion it runs at `http://<host>:<web port>/{name}/`
-(see `serve_capability`). The model reads this to decide whether to start it and how to
-call it.
-
-## Endpoints
-
-| method | path | meaning |
-|--------|------|---------|
-| GET | `/` | service info |
-| GET | `/health` | liveness probe, returns 200 |
-
-## Notes
-
-* The service is public: validate every input, return no secrets, write only under
-  `CAPFORGE_DATA_DIR`.
-* Start it with `serve_capability(name, action="start")`; stop with `action="stop"`.
-  `restart` picks up a newly promoted tag.
-"""
-
-SCAFFOLD_TEST_WEB = '''\
-"""Tests for {name}. These run before a promotion, and a failure blocks it.
-
-The hub also boots the real app and probes it over HTTP as part of the gate; this
-suite covers behaviour in-process.
-"""
-
-from __future__ import annotations
-
-import anyio
-import httpx
-
-from app import app
-
-
-def _get(path: str) -> httpx.Response:
-    async def call() -> httpx.Response:
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.get(path)
-
-    return anyio.run(call)
-
-
-def test_index() -> None:
-    response = _get("/")
-    assert response.status_code == 200
-    assert response.json()["service"] == "{name}"
-
-
-def test_health() -> None:
-    assert _get("/health").status_code == 200
-'''

@@ -9,7 +9,6 @@ import os
 import signal
 import sys
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Literal, cast
 
 Transport = Literal["http", "stdio", "sse", "streamable-http"]
@@ -19,20 +18,6 @@ log = logging.getLogger("capforge")
 
 # Terminal skills live in one of these directories under the terminal user's home.
 # The terminal usually runs in another container, so its home is not Path.home() here.
-SKILL_DIRS = {
-    (".agents", "skills"),
-    (".cptr", "skills"),
-    (".claude", "skills"),
-    (".codex", "skills"),
-}
-
-
-def _is_skills_path(path: Path) -> bool:
-    """Accept any <home>/.agents/skills-style path, regardless of whose home it is."""
-    parts = path.resolve().parts
-    return len(parts) >= 2 and (parts[-2], parts[-1]) in SKILL_DIRS
-
-
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -72,15 +57,26 @@ def _doctor() -> int:
     else:
         if not os.access(root, os.W_OK):
             problems.append(f"caps dir is not writable by uid {os.getuid()}: {root}")
-        # Open WebUI scans these names under the *terminal* user's home. The terminal
-        # normally runs in another container, so do not compare against Path.home().
-        if not _is_skills_path(root):
-            problems.append(
-                f"caps dir does not look like a terminal skills path: {root}. "
-                "Mount the same host folder at <terminal-home>/.agents/skills "
-                "(or .cptr/.claude/.codex) and point CAPFORGE_CAPS_DIR at capforge's mount; "
-                "the terminal's home can differ from this container's home."
-            )
+
+    try:
+        import shutil
+
+        uv = shutil.which("uv")
+        print(f"uv         {uv or 'MISSING'}")
+        if not uv:
+            problems.append("uv is missing; capabilities cannot build their environments")
+        git = shutil.which("git")
+        print(f"git        {git or 'MISSING'}")
+        if not git:
+            problems.append("git is missing; the capability repository cannot run")
+        from . import sandbox
+
+        abi = sandbox.abi_version()
+        print(f"landlock   ABI {abi if abi is not None else 'unavailable'}")
+        if abi is None:
+            problems.append("Landlock is unavailable; CAPFORGE_SANDBOX=require will refuse to run")
+    except Exception as exc:
+        problems.append(f"sandbox/uv/git check failed: {exc}")
 
     try:
         state.mkdir(parents=True, exist_ok=True)
@@ -113,9 +109,8 @@ def _serve(args: argparse.Namespace) -> int:
     import signal  # noqa: F401 - referenced by _handle_signals below
 
     from . import server as server_module
-    from .core import ensure_workspace_skill, set_subreaper
+    from .core import set_subreaper
 
-    ensure_workspace_skill()
     transport = args.transport or "http"
     if transport not in TRANSPORTS:
         print(f"invalid transport {transport!r}; choose one of {sorted(TRANSPORTS)}", file=sys.stderr)
@@ -195,6 +190,37 @@ def _uvicorn_log_level() -> str:
     return os.environ.get("CAPFORGE_LOG_LEVEL", "INFO").lower()
 
 
+def _promote(args: argparse.Namespace) -> int:
+    from .server import promote_capability
+
+    result = promote_capability(
+        args.name, tag=args.tag, note=args.note, force=args.force
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
+def _test(args: argparse.Namespace) -> int:
+    from .server import test_capability
+
+    result = test_capability(args.name)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
+def _delete(args: argparse.Namespace) -> int:
+    from .server import delete_capability
+
+    if not args.yes:
+        answer = input(f"Delete capability {args.name!r} and all state? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("aborted", file=sys.stderr)
+            return 1
+    result = delete_capability(args.name, args.name)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     level_name = os.environ.get("CAPFORGE_LOG_LEVEL", "INFO").upper()
     level = logging.getLevelNamesMapping().get(level_name, logging.INFO)
@@ -219,6 +245,22 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor = sub.add_parser("doctor", help="Check the deployment and print the caps root")
     doctor.set_defaults(func=lambda _a: _doctor())
+
+    promote = sub.add_parser("promote", help="Operator recovery: test and promote the server draft")
+    promote.add_argument("name")
+    promote.add_argument("--tag", default=None)
+    promote.add_argument("--note", default="")
+    promote.add_argument("--force", action="store_true")
+    promote.set_defaults(func=_promote)
+
+    test = sub.add_parser("test", help="Operator recovery: test the server draft")
+    test.add_argument("name")
+    test.set_defaults(func=_test)
+
+    delete = sub.add_parser("delete", help="Delete a capability and all of its server state")
+    delete.add_argument("name")
+    delete.add_argument("--yes", action="store_true", dest="yes")
+    delete.set_defaults(func=_delete)
 
     tools = sub.add_parser("tools", help="Print the MCP tool schemas as JSON")
     tools.set_defaults(func=lambda _a: _print_tools())
