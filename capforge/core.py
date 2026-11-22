@@ -2140,10 +2140,18 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _http_probe(port: int, deadline: float) -> tuple[bool, str]:
+def _http_probe(
+    port: int, deadline: float, *, proc: subprocess.Popen | None = None
+) -> tuple[bool, str]:
     """Raw-socket GET /, retried until the deadline. ANY response proves the
-    ASGI app booted; `/health` is a scaffold convention, not contractual."""
+    ASGI app booted; `/health` is a scaffold convention, not contractual.
+
+    When `proc` is given, a child that has already exited fails the probe at
+    once instead of idling out the whole boot budget (uvicorn is exec'd
+    directly, so it never daemonizes)."""
     while True:
+        if proc is not None and proc.poll() is not None:
+            return False, f"child exited (code {proc.returncode}) before binding a port"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False, "no HTTP response before the boot budget expired"
@@ -2267,7 +2275,7 @@ def probe_web_boot(
     reader = threading.Thread(target=_drain, args=(proc.stdout, sink), daemon=True)
     reader.start()
     try:
-        up, detail = _http_probe(port, time.monotonic() + budget)
+        up, detail = _http_probe(port, time.monotonic() + budget, proc=proc)
     finally:
         _kill_group(proc)
         try:

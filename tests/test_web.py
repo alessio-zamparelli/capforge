@@ -26,7 +26,7 @@ def env(monkeypatch):
     monkeypatch.setenv("CAPFORGE_KEEP_TAGS", "3")
     monkeypatch.setenv("CAPFORGE_RUN_TIMEOUT", "60")
     monkeypatch.setenv("CAPFORGE_TEST_TIMEOUT", "180")
-    monkeypatch.setenv("CAPFORGE_SERVE_BOOT_TIMEOUT", "60")
+    monkeypatch.setenv("CAPFORGE_SERVE_BOOT_TIMEOUT", "20")
     # A real port value keeps serving enabled, but nothing binds it: HTTP
     # assertions drive web.asgi_app() in-process through httpx.ASGITransport.
     monkeypatch.setenv("CAPFORGE_WEB_PORT", "18999")
@@ -234,26 +234,29 @@ def test_owned_web_children_survive_sweeps(env):
     assert server.serve_capability("ownedsvc", action="status")["status"] == "running"
 
 
-def test_prune_stops_pinned_instance_without_deadlock(env):
+def test_prune_stops_pinned_instance_without_deadlock(env, monkeypatch):
     _, server, web, _core = env
+    # keep=1 makes a single new tag push v1 out of the window; _prune never
+    # drops the active tag, so v1 is still the victim.
+    monkeypatch.setenv("CAPFORGE_KEEP_TAGS", "1")
     _make_web_cap(env, "pruned")
     started = server.serve_capability("pruned", action="start")
     assert started["status"] == "running"
-    # Push the pinned tag (v1) out of the retention window. The instance stays
-    # pinned to v1 because there is no restart, so pruning v1 must stop it.
-    # prune runs while holding cap_lock(name); stop_pinned must not reacquire it.
-    for tag in ("v2", "v3", "v4", "v5"):
-        app_py = Path(server.get_capability("pruned")["path"]) / "app.py"
-        app_py.write_text(
-            _web_cap_source(
-                "pruned",
-                f'@app.get("/{tag}")\ndef {tag}() -> dict:\n    return {{"tag": "{tag}"}}\n',
-            ),
-            encoding="utf-8",
-        )
-        assert server.test_capability("pruned")["ok"], tag
-        promo = server.promote_capability("pruned", tag=tag)
-        assert promo["ok"] and promo.get("promoted") is not False, promo
+    # The instance stays pinned to v1 because there is no restart, so pruning
+    # v1 must stop it. prune runs while holding cap_lock(name); stop_pinned
+    # must not reacquire it.
+    app_py = Path(server.get_capability("pruned")["path"]) / "app.py"
+    app_py.write_text(
+        _web_cap_source(
+            "pruned",
+            '@app.get("/v2")\ndef v2() -> dict:\n    return {"tag": "v2"}\n',
+        ),
+        encoding="utf-8",
+    )
+    assert server.test_capability("pruned")["ok"]
+    promo = server.promote_capability("pruned", tag="v2")
+    assert promo["ok"] and promo.get("promoted") is not False, promo
+    assert promo["pruned"] == ["v1"], promo
     status = server.serve_capability("pruned", action="status")
     assert status["status"] == "stopped", status
     assert web._INSTANCES == {}

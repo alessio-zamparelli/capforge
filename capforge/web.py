@@ -409,7 +409,9 @@ def _spawn(
             )
         bound = _parse_bound_port(log_file)
         if bound is not None:
-            up, detail = core._http_probe(bound, min(deadline, time.monotonic() + 10))
+            up, detail = core._http_probe(
+                bound, min(deadline, time.monotonic() + 10), proc=proc
+            )
             if up:
                 instance.port = bound
                 instance.endpoints = _fetch_endpoints(bound)

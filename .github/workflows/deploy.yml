@@ -62,7 +62,11 @@ jobs:
         run: uv run --locked mypy capforge
 
       - name: Run test suite
-        run: uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=71
+        # xdist is already a dev dependency; each test owns its temp dirs and
+        # stray sweeps are per-process, so -n auto is safe (see AGENTS.md).
+        run: >-
+          uv run --locked pytest -q -n auto --durations=10
+          --cov=capforge --cov-branch --cov-fail-under=71
 
       - name: MCP and web round-trip probe
         env:
@@ -99,6 +103,14 @@ jobs:
 
       - name: Set up bun
         uses: oven-sh/setup-bun@v2
+
+      - name: Cache bun packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('ui/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
 
       - name: Install dependencies (frozen lockfile)
         run: bun install --frozen-lockfile
