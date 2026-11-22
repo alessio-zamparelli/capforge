@@ -389,9 +389,25 @@ def test_prune_removes_per_version_data(env):
     for tag in ("v1", "v2", "v3"):
         core.data_dir("hello", tag).mkdir(parents=True, exist_ok=True)
         (core.data_dir("hello", tag) / "x").write_text(tag, encoding="utf-8")
+        (root / "state" / "served" / "hello" / tag).mkdir(parents=True, exist_ok=True)
         versioning.promote("hello", tag=tag, force=True)
     assert not (root / "state" / "data" / "hello" / "v1").exists()
+    assert not (root / "state" / "served" / "hello" / "v1").exists()
     assert s.list_tags("hello")["active"] == "v3"
+
+
+def test_sandbox_allows_name_resolution(env):
+    root, s = env
+    assert s.scaffold_capability("dnsprobe", "Resolves localhost.")["ok"]
+    (root / "caps" / "dnsprobe" / "main.py").write_text(
+        "import json, socket, sys\n"
+        "addr = socket.getaddrinfo('localhost', 80, type=socket.SOCK_STREAM)[0][4][0]\n"
+        "json.dump({'addr': addr}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    result = s.run_capability("dnsprobe")
+    assert result["ok"], result
+    assert result["result"]["addr"] in {"127.0.0.1", "::1"}
 
 
 def test_cross_capability_shared_folder_requires_approval_and_honours_access(env):

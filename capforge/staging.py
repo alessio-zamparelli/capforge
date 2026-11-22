@@ -29,6 +29,10 @@ _TERMINAL = {"promoted", "unchanged", "failed", "interrupted"}
 # Public alias for callers (web push route) that gate on pipeline activity.
 TERMINAL_STATES = frozenset(_TERMINAL)
 
+# staging_id -> name for pipelines whose worker thread is alive in this process.
+_ACTIVE: dict[str, str] = {}
+_active_lock = threading.Lock()
+
 
 # --------------------------------------------------------------------------- paths
 
@@ -224,13 +228,72 @@ def write_state(name: str, data: dict[str, Any]) -> None:
 
 
 def latest(name: str) -> dict[str, Any]:
-    data = read_state(name)
+    data = reconcile(name)
     tail = read_log(name, "pipeline") if data else {"text": "", "bytes": 0, "truncated": False}
     return {**data, "log_tail": tail["text"], "log_bytes": tail["bytes"], "log_truncated": tail["truncated"]}
 
 
 def active(name: str) -> bool:
-    return read_state(name).get("state") not in _TERMINAL and bool(read_state(name))
+    data = read_state(name)
+    return bool(data) and data.get("state") not in _TERMINAL
+
+
+def _pipeline_lock_path(name: str) -> Path:
+    return core._contained(
+        core.state_dir(), core.state_dir() / "locks" / f"{name}-pipeline.lock"
+    )
+
+
+def reconcile(name: str) -> dict[str, Any]:
+    """Mark a non-terminal pipeline as interrupted when no worker can own it.
+
+    A crash or restart leaves `received`/`testing` behind. The pipeline flock is
+    released with the process, so a free lock plus no in-process worker means
+    the state is stale. Recover it so pushes and deletes are not wedged forever.
+    """
+    data = read_state(name)
+    state = data.get("state")
+    if not state or state in _TERMINAL:
+        return data
+    staging_id = str(data.get("staging_id") or "")
+    with _active_lock:
+        if _ACTIVE.get(name) == staging_id:
+            return data
+    with core.try_file_lock(_pipeline_lock_path(name)) as free:
+        # Re-check under the lock: a worker may have started and registered
+        # between the read above and here.
+        with _active_lock:
+            if _ACTIVE.get(name) == staging_id:
+                return data
+        current = read_state(name)
+        if current.get("state") != state:
+            return current
+        if not free:
+            return current
+        _set(
+            name,
+            staging_id,
+            "interrupted",
+            error="pipeline worker disappeared; marked interrupted",
+        )
+        log.warning("reconciled stale pipeline cap=%s staging=%s was=%s", name, staging_id, state)
+        return read_state(name)
+
+
+def reconcile_all() -> list[str]:
+    """Recover every stale staging record at startup; returns the names touched."""
+    root = staging_dir()
+    recovered: list[str] = []
+    for path in sorted(root.glob("*.json")):
+        name = path.stem
+        if name == "tokens" or not core.NAME_RE.match(name):
+            continue
+        before = read_state(name).get("state")
+        if reconcile(name).get("state") == "interrupted" and before != "interrupted":
+            recovered.append(name)
+    if recovered:
+        log.info("reconciled %d interrupted pipeline(s)", len(recovered))
+    return recovered
 
 
 # --------------------------------------------------------------------------- locks
@@ -245,8 +308,7 @@ def push_lock(name: str) -> Iterator[None]:
 
 @contextmanager
 def pipeline_lock(name: str) -> Iterator[None]:
-    lock = core._contained(core.state_dir(), core.state_dir() / "locks" / f"{name}-pipeline.lock")
-    with core._file_lock(lock):
+    with core._file_lock(_pipeline_lock_path(name)):
         yield
 
 
@@ -293,6 +355,45 @@ def sweep_backups(max_age_seconds: int = 24 * 3600) -> list[str]:
     return removed
 
 
+def _remove_stale(path: Path, now: float, max_age_seconds: int) -> bool:
+    try:
+        if now - path.stat().st_mtime < max_age_seconds:
+            return False
+    except OSError:
+        return False
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def sweep_stale(max_age_seconds: int = 24 * 3600) -> list[str]:
+    """Drop staging trees and upload/scratch files left by a crashed pipeline."""
+    now = time.time()
+    removed: list[str] = []
+    directory = core.caps_dir() / ".staging"
+    if directory.is_dir():
+        for entry in directory.iterdir():
+            if entry.name == "backups" or not entry.is_dir():
+                continue
+            if _remove_stale(entry, now, max_age_seconds):
+                removed.append(entry.name)
+    tmp = core.state_dir() / "tmp"
+    if tmp.is_dir():
+        for entry in tmp.iterdir():
+            if not (entry.name.startswith("push-") or entry.name.startswith("git-")):
+                continue
+            if _remove_stale(entry, now, max_age_seconds):
+                removed.append(entry.name)
+    if removed:
+        log.info("swept %d stale staging artifact(s)", len(removed))
+    return removed
+
+
 # ------------------------------------------------------------------------ pipeline
 
 
@@ -321,28 +422,37 @@ def start(
     core.cap_path(name)
     if not gitremote.repo_path(name).is_dir():
         raise core.CapError(f"No repository for {name!r}; scaffold it first")
-    current = read_state(name)
+    current = reconcile(name)
     if current.get("state") not in _TERMINAL and current.get("state"):
         raise core.CapError(f"A pipeline is already running for {name!r}")
     staging_id = f"{int(time.time())}-{secrets.token_hex(3)}"
-    _set(
-        name,
-        staging_id,
-        "received",
-        sha=sha,
-        actor=actor,
-        git_source={"ref": "refs/heads/main", "sha": sha, "subject": subject},
-        tag=None,
-        error=None,
-        auth_method=auth_method,
-        basic_username=basic_username,
-    )
-    thread = threading.Thread(
-        target=_run_pipeline,
-        args=(name, staging_id, sha, actor, subject, auth_method, basic_username),
-        daemon=True,
-    )
-    thread.start()
+    # Register before writing the state so a concurrent `latest`/`start` can
+    # never mistake a just-started worker for a crashed one.
+    with _active_lock:
+        _ACTIVE[name] = staging_id
+    try:
+        _set(
+            name,
+            staging_id,
+            "received",
+            sha=sha,
+            actor=actor,
+            git_source={"ref": "refs/heads/main", "sha": sha, "subject": subject},
+            tag=None,
+            error=None,
+            auth_method=auth_method,
+            basic_username=basic_username,
+        )
+        thread = threading.Thread(
+            target=_run_pipeline,
+            args=(name, staging_id, sha, actor, subject, auth_method, basic_username),
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        with _active_lock:
+            _ACTIVE.pop(name, None)
+        raise
     return {"ok": True, "name": name, "staging_id": staging_id, "state": "received", "sha": sha}
 
 
@@ -430,4 +540,7 @@ def _run_pipeline(
         _set(name, staging_id, "failed", sha=sha, error=str(exc)[-4000:])
         log.warning("pipeline failed cap=%s staging=%s: %s", name, staging_id, exc)
     finally:
+        with _active_lock:
+            if _ACTIVE.get(name) == staging_id:
+                _ACTIVE.pop(name, None)
         shutil.rmtree(parent, ignore_errors=True)

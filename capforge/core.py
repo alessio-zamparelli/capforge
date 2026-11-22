@@ -57,6 +57,9 @@ MAX_CAPTURE_BYTES = 256 * 1024
 DEFAULT_SANDBOX = "require"
 DEFAULT_LOG_MAX_BYTES = 1024 * 1024
 DEFAULT_LOG_TAIL_BYTES = 64 * 1024
+# MCP responses stay small; a repository may legally contain thousands of files.
+MAX_LISTED_FILES = 500
+HASH_CHUNK_BYTES = 1024 * 1024
 
 # prctl(PR_SET_CHILD_SUBREAPER): detached grandchildren of capability calls
 # re-parent to this process instead of PID 1, where the orphan sweep can find them.
@@ -246,6 +249,37 @@ def cap_lock(name: str) -> Iterator[None]:
     lock = _contained(state_dir(), state_dir() / "locks" / f"{name}.lock")
     with _file_lock(lock):
         yield
+
+
+def tag_lock_path(name: str, tag: str) -> Path:
+    """Lock file shared by runs and pruning for one immutable tag."""
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
+    if not TAG_RE.match(tag or ""):
+        raise CapError(f"Invalid tag {tag!r}.")
+    return _contained(state_dir(), state_dir() / "locks" / f"{name}-{tag}-run.lock")
+
+
+@contextmanager
+def tag_run_lock(name: str, tag: str) -> Iterator[None]:
+    """Shared lock held for the lifetime of one run against a version.
+
+    Promotion/prune takes a non-blocking exclusive lock on the same file, so a
+    run can never lose its version or per-version data mid-flight.
+    """
+    path = tag_lock_path(name, tag)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        except OSError:  # pragma: no cover - filesystems without flock
+            log.warning("flock unavailable on %s; continuing without a run lock", path)
+            yield
+            return
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 # ----------------------------------------------------------------------- frontmatter
@@ -687,6 +721,35 @@ def _dependency_names(path: Path) -> list[str]:
     return names
 
 
+def _validate_project(path: Path) -> str | None:
+    """Check the fixed uv/Python contract; return a model-facing error if it fails."""
+    import tomllib
+
+    lock = path / "uv.lock"
+    if not lock.is_file():
+        return "uv.lock is missing; commit the uv lockfile for this capability"
+    version_file = path / ".python-version"
+    try:
+        pinned = version_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return f".python-version is missing; pin Python {PYTHON_VERSION}"
+    if not re.fullmatch(rf"{re.escape(PYTHON_VERSION)}(?:\.\d+)?", pinned):
+        return f".python-version must be {PYTHON_VERSION}, got {pinned or 'an empty file'!r}"
+    project = path / "pyproject.toml"
+    try:
+        data = tomllib.loads(project.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"pyproject.toml is missing or invalid: {exc}"
+    project_table = data.get("project")
+    requires = project_table.get("requires-python") if isinstance(project_table, dict) else None
+    if not isinstance(requires, str) or re.sub(r"\s+", "", requires) != PYTHON_REQUIRES:
+        return (
+            f'pyproject.toml requires-python must be "{PYTHON_REQUIRES}", '
+            f"got {requires!r}"
+        )
+    return None
+
+
 def valid_env_name(name: str) -> str:
     """Validate one declared/stored environment name; refuses runtime-owned keys."""
     text = str(name).strip()
@@ -744,6 +807,10 @@ def _load_from(name: str, path: Path) -> Capability:
     cap.env_specs = spec.env
     cap.env = [item.name for item in spec.env]
     cap.shares = spec.shares
+    project_error = _validate_project(path)
+    if project_error is not None:
+        cap.error = project_error
+        return cap
     if cap.serves_web:
         deps = _dependency_names(path)
         if "uvicorn" not in deps:
@@ -1545,33 +1612,60 @@ def _apply_cap_env(env: dict[str, str], name: str, cap: Capability, *, tag: str 
 # ----------------------------------------------------------------------------- hashes
 
 
-def list_files(root: Path) -> list[str]:
-    """Relative file list for MCP responses; stable, bounded by the caller's use."""
+def _tree_paths(root: Path) -> list[str]:
+    """Relative file paths in stable order, pruning cache/VCS directories.
+
+    `rglob` walks into `.git`/`.venv`/cache trees before filtering, which is
+    expensive and can follow symlinks. Walk with pruning instead and sort the
+    result once so hashes stay identical for ordinary trees.
+    """
     root = Path(root)
     if not root.is_dir():
         return []
+    def _raise(error: OSError) -> None:
+        raise error
+
     out: list[str] = []
-    for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root)
-        if any(part in SKIP_PARTS for part in rel.parts):
-            continue
-        if path.is_file():
-            out.append(rel.as_posix())
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=_raise
+    ):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in SKIP_PARTS
+            and not os.path.islink(os.path.join(dirpath, name))
+        ]
+        base = Path(dirpath)
+        for name in filenames:
+            if name in SKIP_PARTS:
+                continue
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            out.append(path.relative_to(root).as_posix())
+    out.sort()
     return out
+
+
+def list_files(root: Path, limit: int | None = None) -> list[str]:
+    """Relative file list for MCP responses; stable and optionally bounded."""
+    paths = _tree_paths(root)
+    if limit is not None:
+        return paths[: max(0, limit)]
+    return paths
 
 
 def tree_hash(root: Path) -> str:
     """Stable content hash of a capability snapshot, ignoring caches and VCS."""
+    root = Path(root)
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root)
-        if any(part in SKIP_PARTS for part in rel.parts):
-            continue
-        if not path.is_file():
-            continue
-        digest.update(rel.as_posix().encode())
+    for rel in _tree_paths(root):
+        path = root / rel
+        digest.update(rel.encode())
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        with path.open("rb") as handle:
+            while chunk := handle.read(HASH_CHUNK_BYTES):
+                digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -1945,6 +2039,18 @@ def _sandbox_policy(
         Path("/etc/group"),
         Path("/etc/localtime"),
         Path("/dev/urandom"),
+        # Name resolution is a documented capability feature (network is not
+        # confined), but glibc needs these files before it can resolve a host.
+        Path("/etc/resolv.conf"),
+        Path("/etc/hosts"),
+        Path("/etc/nsswitch.conf"),
+        Path("/etc/gai.conf"),
+        Path("/etc/host.conf"),
+        Path("/etc/services"),
+        # CA bundles live outside /usr on several distributions.
+        Path("/etc/ssl/certs/ca-certificates.crt"),
+        Path("/etc/ssl/cert.pem"),
+        Path("/etc/pki/tls/certs/ca-bundle.crt"),
     ]
     cert = os.environ.get("SSL_CERT_FILE")
     if cert:
@@ -2034,6 +2140,31 @@ def execute(
     share_mounts: tuple[ShareMount, ...] | None = None,
 ) -> ExecResult:
     """Run one capability's CLI entrypoint: JSON in on stdin, JSON out on stdout."""
+    with tag_run_lock(cap.name, tag or "draft"):
+        return _execute_locked(
+            cap,
+            source,
+            args,
+            tag=tag,
+            packages=packages,
+            timeout=timeout,
+            data_tag=data_tag,
+            share_mounts=share_mounts,
+        )
+
+
+def _execute_locked(
+    cap: Capability,
+    source: Path,
+    args: dict[str, Any] | None,
+    *,
+    tag: str | None,
+    packages: list[str] | None = None,
+    timeout: int | None = None,
+    data_tag: str | None = None,
+    share_mounts: tuple[ShareMount, ...] | None = None,
+) -> ExecResult:
+    """Implementation of `execute`; the caller holds the tag's shared run lock."""
     if not cap.runs_cli or cap.cli_entrypoint is None:
         raise CapError(
             f"{cap.name!r} has no CLI entrypoint (kind: {cap.kind}). "

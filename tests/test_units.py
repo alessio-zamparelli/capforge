@@ -56,7 +56,21 @@ def test_parse_skill_md_without_frontmatter():
     assert body == "hello"
 
 
+def _project(path) -> None:
+    """Write the fixed uv contract unless a test supplied its own pyproject."""
+    (path / "uv.lock").write_text("", encoding="utf-8")
+    (path / ".python-version").write_text("3.14\n", encoding="utf-8")
+    pyproject = path / "pyproject.toml"
+    if not pyproject.exists():
+        pyproject.write_text(
+            '[project]\nname="demo"\nversion="0.1.0"\n'
+            'requires-python=">=3.14,<3.15"\ndependencies=[]\n',
+            encoding="utf-8",
+        )
+
+
 def _skill(path, description: str = "d") -> None:
+    _project(path)
     (path / "SKILL.md").write_text(
         f"---\ndescription: {description}\n---\n", encoding="utf-8"
     )
@@ -290,6 +304,64 @@ def test_execute_refuses_web_capabilities(tmp_path, monkeypatch):
     with pytest.raises(core.CapError) as exc_info:
         core.execute(cap, tmp_path, {}, tag=None)
     assert "serve_capability" in str(exc_info.value)
+
+
+def test_prune_defers_a_version_with_a_live_run(tmp_path, monkeypatch):
+    from capforge import versioning
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "caps").mkdir()
+    version_dir = tmp_path / "state" / "versions" / "demo" / "v1"
+    version_dir.mkdir(parents=True)
+    state = {
+        "name": "demo",
+        "active": {"tag": "v2"},
+        "tags": [
+            {"tag": "v1", "created_at": 1},
+            {"tag": "v2", "created_at": 2},
+        ],
+    }
+    with core.tag_run_lock("demo", "v1"):
+        assert versioning._prune(state, keep=1) == []
+        assert version_dir.is_dir()
+        assert [tag["tag"] for tag in state["tags"]] == ["v1", "v2"]
+
+    assert versioning._prune(state, keep=1) == ["v1"]
+    assert not version_dir.exists()
+    assert [tag["tag"] for tag in state["tags"]] == ["v2"]
+
+
+def test_venv_gc_keeps_the_draft_and_cleans_its_lock(tmp_path, monkeypatch):
+    from capforge import versioning
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    draft = tmp_path / "caps" / "demo"
+    draft.mkdir(parents=True)
+    (draft / "uv.lock").write_text("", encoding="utf-8")
+    draft_digest = core.lock_hash(draft)
+
+    kept = tmp_path / "state" / "venvs" / "demo" / f"{draft_digest}-py314"
+    kept.mkdir(parents=True)
+    orphan_digest = "a" * 16
+    orphan = tmp_path / "state" / "venvs" / "demo" / f"{orphan_digest}-py314"
+    orphan.mkdir()
+    orphan_test = tmp_path / "state" / "venvs" / "demo" / f"{orphan_digest}-py314-test"
+    orphan_test.mkdir()
+    locks = tmp_path / "state" / "locks"
+    locks.mkdir(parents=True)
+    prod_lock = locks / f"demo-venv-{orphan_digest}-prod.lock"
+    test_lock = locks / f"demo-venv-{orphan_digest}-test.lock"
+    prod_lock.write_text("", encoding="utf-8")
+    test_lock.write_text("", encoding="utf-8")
+
+    versioning._gc_venvs("demo", [])
+    assert kept.is_dir()
+    assert not orphan.exists()
+    assert not orphan_test.exists()
+    assert not prod_lock.exists()
+    assert not test_lock.exists()
 
 
 def test_registry_persistence(tmp_path, monkeypatch):
@@ -643,12 +715,18 @@ def test_push_state_check_and_start_are_under_the_push_lock(tmp_path, monkeypatc
         },
     )
 
-    async def fake_body(request, limit):
-        return b"push"
+    spooled = {"n": 0}
 
-    monkeypatch.setattr(web, "_read_limited_body", fake_body)
+    async def fake_spool(request, limit):
+        spooled["n"] += 1
+        path = tmp_path / f"push-{spooled['n']}.body"
+        path.write_bytes(b"push")
+        return path
 
-    def fake_cgi(name, service, request, body, actor):
+    monkeypatch.setattr(web, "_spool_body", fake_spool)
+
+    def fake_cgi(name, service, request, body_path, actor):
+        assert body_path is not None and body_path.read_bytes() == b"push"
         calls["cgi"] += 1
         in_cgi.set()
         release.wait(timeout=5)
@@ -659,7 +737,12 @@ def test_push_state_check_and_start_are_under_the_push_lock(tmp_path, monkeypatc
     monkeypatch.setattr(gitremote, "rev_parse", lambda name: next(shas, "after"))
 
     def fake_start(name, sha, *args, **kwargs):
-        staging.write_state(name, {"name": name, "state": "received", "sha": sha})
+        # Real start() registers the live worker before writing the state.
+        with staging._active_lock:
+            staging._ACTIVE[name] = "fake"
+        staging.write_state(
+            name, {"name": name, "state": "received", "staging_id": "fake", "sha": sha}
+        )
         return {"ok": True}
 
     monkeypatch.setattr(staging, "start", fake_start)
@@ -679,8 +762,101 @@ def test_push_state_check_and_start_are_under_the_push_lock(tmp_path, monkeypatc
             responses = await asyncio.gather(first, second)
             return [response.status_code for response in responses]
 
-    assert anyio.run(run) == [200, 409]
-    assert calls["cgi"] == 1
+    try:
+        assert anyio.run(run) == [200, 409]
+        assert calls["cgi"] == 1
+    finally:
+        with staging._active_lock:
+            staging._ACTIVE.pop("demo", None)
+
+
+def _request_with_body(body: bytes):
+    from starlette.requests import Request
+
+    sent = {"done": False}
+
+    async def receive():
+        if sent["done"]:
+            return {"type": "http.disconnect"}
+        sent["done"] = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [],
+        "query_string": b"",
+        "path": "/",
+        "raw_path": b"/",
+    }
+    return Request(scope, receive)
+
+
+def test_spool_body_enforces_the_cap_and_cleans_up(tmp_path, monkeypatch):
+    import anyio
+
+    import capforge.web as web
+
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+
+    path = anyio.run(lambda: web._spool_body(_request_with_body(b"12345"), 10))
+    assert path is not None and path.read_bytes() == b"12345"
+    path.unlink()
+
+    assert anyio.run(lambda: web._spool_body(_request_with_body(b"12345678901"), 10)) is None
+    assert not list((tmp_path / "state" / "tmp").glob("push-*"))
+
+
+def test_reconcile_recovers_an_orphaned_pipeline(tmp_path, monkeypatch):
+    from capforge import staging
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "caps").mkdir()
+    staging.write_state(
+        "demo",
+        {"name": "demo", "state": "testing", "staging_id": "old", "updated": 1},
+    )
+    assert staging.reconcile("demo")["state"] == "interrupted"
+
+    staging.write_state(
+        "demo",
+        {"name": "demo", "state": "promoted", "staging_id": "done", "updated": 2},
+    )
+    assert staging.reconcile("demo")["state"] == "promoted"
+
+
+def test_reconcile_leaves_a_live_pipeline_alone(tmp_path, monkeypatch):
+    from capforge import staging
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "caps").mkdir()
+    with staging.pipeline_lock("demo"):
+        staging.write_state(
+            "demo",
+            {"name": "demo", "state": "testing", "staging_id": "live", "updated": 1},
+        )
+        assert staging.reconcile("demo")["state"] == "testing"
+    assert staging.reconcile("demo")["state"] == "interrupted"
+
+
+def test_sweep_stale_removes_only_old_staging_trees(tmp_path, monkeypatch):
+    import os
+
+    from capforge import staging
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    stale = tmp_path / "caps" / ".staging" / "demo-old"
+    fresh = tmp_path / "caps" / ".staging" / "demo-new"
+    (stale / "tree").mkdir(parents=True)
+    (fresh / "tree").mkdir(parents=True)
+    os.utime(stale, (0, 0))
+
+    assert staging.sweep_stale() == ["demo-old"]
+    assert not stale.exists()
+    assert fresh.is_dir()
 
 
 # ------------------------------------------------------------------ nothing survives a call
@@ -739,6 +915,15 @@ def test_tree_hash_ignores_caches(tmp_path):
     (tmp_path / ".pytest_cache").mkdir()
     (tmp_path / ".pytest_cache" / "nodeids").write_text("x", encoding="utf-8")
     assert core.tree_hash(tmp_path) == before
+
+
+def test_tree_hash_skips_symlinks_and_list_files_is_bounded(tmp_path):
+    (tmp_path / "main.py").write_text("print(1)\n", encoding="utf-8")
+    before = core.tree_hash(tmp_path)
+    os.symlink(tmp_path / "main.py", tmp_path / "link.py")
+    assert core.tree_hash(tmp_path) == before
+    assert "link.py" not in core.list_files(tmp_path)
+    assert core.list_files(tmp_path, limit=1) == ["main.py"]
 
 
 def test_entrypoint_cannot_escape_the_capability(tmp_path):
@@ -962,6 +1147,68 @@ def test_mcp_detail_reports_env_status_without_values(tmp_path, monkeypatch):
     assert listed["capabilities"][0]["env"][0]["configured"] is True
 
 
+def test_get_capability_bounds_the_file_list(tmp_path, monkeypatch):
+    from capforge import server
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(core, "MAX_LISTED_FILES", 2)
+    cap = tmp_path / "caps" / "demo"
+    cap.mkdir(parents=True)
+    (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
+    _skill(cap)
+    _deploy(cap)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (cap / name).write_text(name, encoding="utf-8")
+
+    detail = server.get_capability("demo")
+    assert detail["ok"] is True
+    assert detail["files_truncated"] is True
+    assert detail["file_count"] is None
+    assert len(detail["files"]) == 2
+
+
+def test_project_contract_is_validated(tmp_path):
+    cap = tmp_path / "demo"
+    cap.mkdir()
+    (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (cap / "SKILL.md").write_text("---\ndescription: d\n---\n", encoding="utf-8")
+    _deploy(cap)
+
+    missing_lock = core.load_capability_at("demo", cap)
+    assert "uv.lock" in missing_lock.error
+
+    (cap / "uv.lock").write_text("", encoding="utf-8")
+    missing_pin = core.load_capability_at("demo", cap)
+    assert ".python-version" in missing_pin.error
+
+    (cap / ".python-version").write_text("3.13\n", encoding="utf-8")
+    wrong_pin = core.load_capability_at("demo", cap)
+    assert "3.14" in wrong_pin.error
+
+    (cap / ".python-version").write_text("3.14\n", encoding="utf-8")
+    missing_pyproject = core.load_capability_at("demo", cap)
+    assert "pyproject.toml" in missing_pyproject.error
+
+    (cap / "pyproject.toml").write_text(
+        '[project]\nname="demo"\nversion="0.1.0"\n'
+        'requires-python=">=3.12"\ndependencies=[]\n',
+        encoding="utf-8",
+    )
+    wrong_requires = core.load_capability_at("demo", cap)
+    assert "requires-python" in wrong_requires.error
+
+    (cap / "pyproject.toml").write_text(
+        '[project]\nname="demo"\nversion="0.1.0"\n'
+        'requires-python=">=3.14,<3.15"\ndependencies=[]\n',
+        encoding="utf-8",
+    )
+    assert core.load_capability_at("demo", cap).error is None
+
+    (cap / ".python-version").write_text("3.14.8\n", encoding="utf-8")
+    assert core.load_capability_at("demo", cap).error is None
+
+
 def test_corrupt_env_store_is_quarantined(tmp_path, monkeypatch):
     monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
     directory = tmp_path / "state" / "secrets"
@@ -1094,7 +1341,7 @@ def test_git_route_accepts_basic_and_rejects_bearer(tmp_path, monkeypatch):
 
 def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
 
-    from capforge import server, staging
+    from capforge import core, server, staging
 
     monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
@@ -1119,6 +1366,7 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     (state / "staging" / f"{name}.json").write_text("{}", encoding="utf-8")
     backup = caps / ".staging" / "backups" / f"{name}-20260101-000000"
     backup.mkdir(parents=True)
+    core._write_cap_env(name, {"API_KEY": {"value": "s3cret", "updated_at": 1}})
     staging.mint(name, {"id": "actor-1"})
 
     assert server.delete_capability(name, "wrong")["ok"] is False
@@ -1129,6 +1377,7 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     assert not (state / "git" / f"{name}.git").exists()
     assert not (state / "state" / f"{name}.json").exists()
     assert not (state / "staging" / f"{name}.json").exists()
+    assert not (state / "secrets" / f"{name}.json").exists()
     assert not backup.exists()
     assert all(
         value.get("name") != name

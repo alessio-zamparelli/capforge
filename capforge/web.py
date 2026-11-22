@@ -26,9 +26,11 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1432,26 +1434,67 @@ def _max_upload_bytes() -> int:
         return 64 * 1024 * 1024
 
 
-async def _read_limited_body(request: Request, limit: int) -> bytes | None:
-    """Read a request body without trusting Content-Length or buffering past the cap."""
+class PayloadTooLarge(Exception):
+    """A streamed request body exceeded the configured cap."""
+
+
+def _declared_too_large(request: Request, limit: int) -> bool:
     declared = request.headers.get("content-length")
-    if declared:
-        try:
-            if int(declared) > limit:
-                return None
-        except ValueError:
-            pass
-    chunks: list[bytes] = []
+    if not declared:
+        return False
+    try:
+        return int(declared) > limit
+    except ValueError:
+        return False
+
+
+async def _iter_limited(request: Request, limit: int) -> AsyncIterator[bytes]:
+    """Yield request chunks while enforcing a cap, without buffering the body."""
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
         if total > limit:
-            return None
-        chunks.append(chunk)
-    return b"".join(chunks)
+            raise PayloadTooLarge
+        if chunk:
+            yield chunk
 
 
-def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str) -> Response:
+async def _spool_body(request: Request, limit: int) -> Path | None:
+    """Spool an upload to disk instead of RAM; None when it exceeds the cap."""
+    if _declared_too_large(request, limit):
+        return None
+    directory = core.state_dir() / "tmp"
+    directory.mkdir(parents=True, exist_ok=True)
+    handle, raw_path = tempfile.mkstemp(prefix="push-", dir=str(directory))
+    path = Path(raw_path)
+    total = 0
+    try:
+        with os.fdopen(handle, "wb") as out:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    raise PayloadTooLarge
+                out.write(chunk)
+    except PayloadTooLarge:
+        path.unlink(missing_ok=True)
+        return None
+    except BaseException:
+        # Includes client disconnects/cancellation: never leave a spool behind.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _run_cgi(
+    name: str,
+    service: str,
+    request: Request,
+    body_path: Path | None,
+    actor: str,
+) -> Response:
     """Run one git http-backend request. Called in a threadpool."""
     from . import gitremote
 
@@ -1472,7 +1515,7 @@ def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str)
             "QUERY_STRING": request.url.query,
             "REQUEST_METHOD": request.method,
             "CONTENT_TYPE": request.headers.get("content-type", ""),
-            "CONTENT_LENGTH": str(len(body)),
+            "CONTENT_LENGTH": str(body_path.stat().st_size) if body_path else "0",
             "REMOTE_USER": actor or "git",
             "REMOTE_ADDR": request.client.host if request.client else "?",
             "GIT_PROTOCOL": request.headers.get("git-protocol", ""),
@@ -1488,10 +1531,15 @@ def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str)
     env["TMPDIR"] = str(scratch)
     env["HOME"] = str(scratch)
     started = time.monotonic()
+    stdin_handle: Any = None
+    stdin: Any = subprocess.DEVNULL
     try:
+        if body_path is not None:
+            stdin_handle = body_path.open("rb")
+            stdin = stdin_handle
         proc = subprocess.Popen(
             ["git", "http-backend"],
-            stdin=subprocess.PIPE,
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
@@ -1500,7 +1548,7 @@ def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str)
         )
         try:
             with core.track_child(proc.pid):
-                out, err = proc.communicate(body, timeout=core.git_timeout())
+                out, err = proc.communicate(timeout=core.git_timeout())
         except subprocess.TimeoutExpired:
             core._kill_group(proc)
             out, err = proc.communicate()
@@ -1508,6 +1556,11 @@ def _run_cgi(name: str, service: str, request: Request, body: bytes, actor: str)
     except OSError as exc:
         return Response(f"git backend failed: {exc}\n", status_code=502, media_type="text/plain")
     finally:
+        if stdin_handle is not None:
+            try:
+                stdin_handle.close()
+            except OSError:
+                pass
         shutil.rmtree(scratch, ignore_errors=True)
     if proc.returncode != 0 and not out:
         return Response("git backend failed\n", status_code=502, media_type="text/plain")
@@ -1559,7 +1612,7 @@ async def git_info_refs(request: Request) -> Response:
         name,
         service,
         request,
-        b"",
+        None,
         str((record.get("actor") or {}).get("id") or ""),
     )
 
@@ -1576,40 +1629,46 @@ async def git_service(request: Request) -> Response:
     record = _git_auth(request, name)
     if record is None:
         return _unauthorized(name)
-    body = await _read_limited_body(request, _max_upload_bytes())
-    if body is None:
-        return Response("push too large\n", status_code=413, media_type="text/plain")
+    body_path = await _spool_body(request, _max_upload_bytes())
+    if body_path is None:
+        return Response("request body too large\n", status_code=413, media_type="text/plain")
     actor = str((record.get("actor") or {}).get("id") or "")
-    if service == "git-upload-pack":
-        return await run_in_threadpool(_run_cgi, name, service, request, body, actor)
+    try:
+        if service == "git-upload-pack":
+            return await run_in_threadpool(_run_cgi, name, service, request, body_path, actor)
 
-    def push() -> Response:
-        # The state check and the pipeline start are one critical section with
-        # the CGI call: otherwise a second push can pass the check while the
-        # first is between _run_cgi and staging.start(), and one tree is dropped
-        # or promoted under another push's sha.
-        with staging.push_lock(name):
-            current = staging.read_state(name)
-            if current.get("state") and current.get("state") not in staging.TERMINAL_STATES:
-                return Response("pipeline busy\n", status_code=409, media_type="text/plain")
-            before = gitremote.rev_parse(name)
-            response = _run_cgi(name, service, request, body, actor)
-            after = gitremote.rev_parse(name)
-            if response.status_code == 200 and after and after != before:
-                try:
-                    staging.start(
-                        name,
-                        after,
-                        record.get("actor") or {},
-                        gitremote.commit_subject(name, after),
-                        auth_method=str(record.get("auth_method") or "basic"),
-                        basic_username=str(record.get("basic_username") or ""),
-                    )
-                except core.CapError as exc:
-                    log.warning("pipeline start failed cap=%s: %s", name, exc)
-        return response
+        def push() -> Response:
+            # The state check and the pipeline start are one critical section with
+            # the CGI call: otherwise a second push can pass the check while the
+            # first is between _run_cgi and staging.start(), and one tree is dropped
+            # or promoted under another push's sha.
+            with staging.push_lock(name):
+                current = staging.reconcile(name)
+                if current.get("state") and current.get("state") not in staging.TERMINAL_STATES:
+                    return Response("pipeline busy\n", status_code=409, media_type="text/plain")
+                before = gitremote.rev_parse(name)
+                response = _run_cgi(name, service, request, body_path, actor)
+                after = gitremote.rev_parse(name)
+                if response.status_code == 200 and after and after != before:
+                    try:
+                        staging.start(
+                            name,
+                            after,
+                            record.get("actor") or {},
+                            gitremote.commit_subject(name, after),
+                            auth_method=str(record.get("auth_method") or "basic"),
+                            basic_username=str(record.get("basic_username") or ""),
+                        )
+                    except core.CapError as exc:
+                        log.warning("pipeline start failed cap=%s: %s", name, exc)
+            return response
 
-    return await run_in_threadpool(push)
+        return await run_in_threadpool(push)
+    finally:
+        try:
+            body_path.unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not remove spooled upload %s", body_path, exc_info=True)
 
 
 # --------------------------------------------------------------------------- proxy
@@ -1639,14 +1698,13 @@ async def proxy(request: Request) -> Response:
             },
             status_code=404,
         )
-    body = await _read_limited_body(request, MAX_PROXY_BODY)
-    if body is None:
+    if _declared_too_large(request, MAX_PROXY_BODY):
         return JSONResponse({"error": "request body too large"}, status_code=413)
     headers = {
         key: value
         for key, value in request.headers.items()
         if key not in PROXY_DROP_REQUEST
-        and key != "host"
+        and key not in {"host", "content-length"}
         and not key.startswith("x-capforge-")
     }
     headers["host"] = f"127.0.0.1:{instance.port}"
@@ -1656,11 +1714,19 @@ async def proxy(request: Request) -> Response:
     upstream = httpx.URL(f"http://127.0.0.1:{instance.port}/{path}").copy_merge_params(
         request.query_params
     )
+    empty_body = request.headers.get("content-length") == "0"
+    content: Any = (
+        None
+        if request.method in ("GET", "HEAD") or empty_body
+        else _iter_limited(request, MAX_PROXY_BODY)
+    )
     try:
         upstream_request = client.build_request(
-            request.method, upstream, headers=headers, content=body
+            request.method, upstream, headers=headers, content=content
         )
         upstream_response = await client.send(upstream_request, stream=True)
+    except PayloadTooLarge:
+        return JSONResponse({"error": "request body too large"}, status_code=413)
     except httpx.HTTPError:
         log.warning("proxy error cap=%s upstream=127.0.0.1:%d", name, instance.port)
         return JSONResponse(

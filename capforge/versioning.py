@@ -7,7 +7,6 @@ rollback never depends on what the model did to the working copy afterwards.
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 import subprocess
 import time
@@ -25,7 +24,9 @@ from .core import (
     lock_hash,
     read_state,
     state_dir,
+    tag_lock_path,
     tree_hash,
+    try_file_lock,
     version_path,
     write_state,
 )
@@ -187,6 +188,19 @@ def _would_prune(
     return [tag["tag"] for tag in ordered[: max(0, surplus)]]
 
 
+def _venv_lock_path(name: str, digest: str, group: str) -> Path:
+    return state_dir() / "locks" / f"{name}-venv-{digest}-{group}.lock"
+
+
+def _venv_parts(entry_name: str) -> tuple[str, str, str]:
+    """Split a venv dir name into (digest, group, lock_suffix)."""
+    if entry_name.endswith("-py314-test"):
+        return entry_name[: -len("-py314-test")], "test", "-py314-test"
+    if entry_name.endswith("-py314"):
+        return entry_name[: -len("-py314")], "prod", "-py314"
+    return "", "", ""
+
+
 def _gc_venvs(name: str, tags: list[dict[str, Any]]) -> None:
     """Drop uv venvs no surviving tag (or its test twin) can use. Best effort."""
     base = state_dir() / "venvs" / name
@@ -198,6 +212,14 @@ def _gc_venvs(name: str, tags: list[dict[str, Any]]) -> None:
         if lock:
             live.add(f"{lock}-py314")
             live.add(f"{lock}-py314-test")
+    # The draft (and a test run against it) is not represented in `tags`; keep
+    # its lock hash alive so a promote/prune cannot delete a venv mid-build.
+    try:
+        draft_lock = lock_hash(cap_path(name))
+        live.add(f"{draft_lock}-py314")
+        live.add(f"{draft_lock}-py314-test")
+    except (CapError, OSError):
+        pass
     try:
         from . import web
 
@@ -207,13 +229,21 @@ def _gc_venvs(name: str, tags: list[dict[str, Any]]) -> None:
     for entry in sorted(base.iterdir()):
         if not entry.is_dir() or entry.name in live:
             continue
-        if re.fullmatch(r"[0-9a-f]{16}-py314(?:-test)?", entry.name) or entry.name.endswith(
-            ".building"
-        ):
+        digest, group, suffix = _venv_parts(entry.name)
+        if not suffix and not entry.name.endswith(".building"):
+            continue
+        if not suffix:
             shutil.rmtree(entry, ignore_errors=True)
-            for lock_file in (state_dir() / "locks").glob(f"{name}-venv-{entry.name}.lock"):
-                lock_file.unlink(missing_ok=True)
-            log.info("pruned venv cap=%s path=%s", name, entry)
+            log.info("pruned incomplete venv cap=%s path=%s", name, entry)
+            continue
+        # Never delete a venv while `ensure_venv` is building or using it.
+        lock_path = _venv_lock_path(name, digest, group)
+        with try_file_lock(lock_path) as free:
+            if not free:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            lock_path.unlink(missing_ok=True)
+        log.info("pruned venv cap=%s path=%s", name, entry)
 
 
 def _prune(state: dict[str, Any], keep: int) -> list[str]:
@@ -221,30 +251,55 @@ def _prune(state: dict[str, Any], keep: int) -> list[str]:
     tags = list(state.get("tags") or [])
     active_tag = (state.get("active") or {}).get("tag")
     dropped: list[str] = []
+    blocked: set[str] = set()
     while len(tags) > keep:
         ordered = sorted(tags, key=lambda t: t.get("created_at") or 0)
-        victim = next((t for t in ordered if t["tag"] != active_tag), None)
+        victim = next(
+            (
+                t
+                for t in ordered
+                if t["tag"] != active_tag and t["tag"] not in blocked
+            ),
+            None,
+        )
         if victim is None:
             break
-        tags.remove(victim)
-        # A served instance pinned to this tag is about to lose its version dir,
-        # data and venv. Stop it first. Caller (promote) holds cap_lock(name):
-        # stop_pinned must not reacquire it, a nested flock would deadlock.
-        try:
-            from . import web
+        # A CLI run holds a shared lock for its whole lifetime. Take the
+        # exclusive lock non-blocking so we never remove a version, data dir or
+        # venv under a running process; retry this tag on the next promotion.
+        with try_file_lock(tag_lock_path(state["name"], victim["tag"])) as free:
+            if not free:
+                blocked.add(victim["tag"])
+                log.info(
+                    "prune deferred cap=%s tag=%s (run in progress)",
+                    state["name"],
+                    victim["tag"],
+                )
+                continue
+            tags.remove(victim)
+            # A served instance pinned to this tag is about to lose its version
+            # dir, data and venv. Stop it first. Caller (promote) holds
+            # cap_lock(name): stop_pinned must not reacquire it, a nested flock
+            # would deadlock.
+            try:
+                from . import web
 
-            web.stop_pinned(state["name"], victim["tag"])
-        except Exception:  # best effort; web.py may be absent or broken
-            log.warning(
-                "could not stop a served instance for pruned tag %s@%s",
-                state["name"],
-                victim["tag"],
-                exc_info=True,
+                web.stop_pinned(state["name"], victim["tag"])
+            except Exception:  # best effort; web.py may be absent or broken
+                log.warning(
+                    "could not stop a served instance for pruned tag %s@%s",
+                    state["name"],
+                    victim["tag"],
+                    exc_info=True,
+                )
+            shutil.rmtree(version_path(state["name"], victim["tag"]), ignore_errors=True)
+            shutil.rmtree(data_dir(state["name"], victim["tag"], create=False), ignore_errors=True)
+            shutil.rmtree(
+                state_dir() / "served" / state["name"] / victim["tag"],
+                ignore_errors=True,
             )
-        shutil.rmtree(version_path(state["name"], victim["tag"]), ignore_errors=True)
-        shutil.rmtree(data_dir(state["name"], victim["tag"], create=False), ignore_errors=True)
-        state.setdefault("pruned", []).append({"tag": victim["tag"], "at": int(time.time())})
-        dropped.append(victim["tag"])
+            state.setdefault("pruned", []).append({"tag": victim["tag"], "at": int(time.time())})
+            dropped.append(victim["tag"])
     state["tags"] = tags
     if dropped:
         _gc_venvs(state["name"], tags)

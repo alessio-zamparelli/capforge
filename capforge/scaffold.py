@@ -400,6 +400,7 @@ def create(name: str, description: str, kind: str = "cli") -> dict[str, Any]:
         log_path.write_text(
             f"scaffold {name}\nsha: {sha}\nkind: {kind}\nproject: {work}\n", encoding="utf-8"
         )
+        files = core.list_files(draft, limit=core.MAX_LISTED_FILES + 1)
         return {
             "name": name,
             "path": str(draft),
@@ -408,7 +409,8 @@ def create(name: str, description: str, kind: str = "cli") -> dict[str, Any]:
             "kind": kind,
             "modes": ["cli", "web"] if kind == "both" else [kind],
             "python": core.PYTHON_VERSION,
-            "files": core.list_files(draft),
+            "files": files[: core.MAX_LISTED_FILES],
+            "files_truncated": len(files) > core.MAX_LISTED_FILES,
         }
     except Exception:
         shutil.rmtree(work, ignore_errors=True)

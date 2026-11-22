@@ -227,6 +227,8 @@ def get_capability(name: str) -> dict:
         return err
     state = versioning.read_state(cap.name)
     caps_for = _env_caps(cap)
+    files = list_files(cap.path, limit=core.MAX_LISTED_FILES + 1)
+    files_truncated = len(files) > core.MAX_LISTED_FILES
     return {
         "ok": True,
         "name": cap.name,
@@ -245,7 +247,9 @@ def get_capability(name: str) -> dict:
         "draft_ready": cap.draft_ready,
         "draft_error": cap.error,
         "draft_hash": tree_hash(cap.path) if cap.path.is_dir() else None,
-        "files": list_files(cap.path),
+        "files": files[: core.MAX_LISTED_FILES],
+        "files_truncated": files_truncated,
+        "file_count": None if files_truncated else len(files),
         "skill_md": (cap.path / "SKILL.md").read_text(encoding="utf-8", errors="replace")
         if (cap.path / "SKILL.md").is_file()
         else None,
@@ -471,6 +475,7 @@ def _delete_targets(name: str) -> list[Path]:
         state / "logs" / name,
         state / "git" / f"{name}.git",
         state / "served" / name,
+        state / "secrets" / f"{name}.json",
         state / "state" / f"{name}.json",
         state / "staging" / f"{name}.json",
     ]
@@ -504,7 +509,7 @@ def delete_capability(name: str, confirm: str) -> dict:
             "shares_revoked": 0,
         }
 
-    current = staging_service.read_state(validated)
+    current = staging_service.reconcile(validated)
     if current.get("state") and current.get("state") not in {
         "promoted", "unchanged", "failed", "interrupted",
     }:

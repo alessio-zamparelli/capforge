@@ -149,7 +149,9 @@ def _serve(args: argparse.Namespace) -> int:
         web.restore()
     from . import staging
 
+    staging.reconcile_all()
     staging.sweep_backups()
+    staging.sweep_stale()
     server_module.RUNTIME_TRANSPORT = "http"
     _run_listeners(server_module.mcp, web, host, port, path)
     return 0
