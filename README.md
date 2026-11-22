@@ -14,6 +14,40 @@ A capability with `KIND = "web"` in `deploy.py` is a long-lived ASGI service. It
 reverse-proxied at `http://<host>:8080/cap/<name>/`; the console is `/ui/`, the control API is
 `/api/`, and the git smart-HTTP ingress is `/git/<name>.git`.
 
+## Publish flow
+
+```mermaid
+flowchart TD
+    A["Model: scaffold_capability(name, description, kind)"] --> B["Server: create uv project, uv.lock, tests, deploy.py<br/>publish main in bare repo + materialise draft"]
+    B --> C["Model: staging(name, action='token')<br/>short-lived Basic clone/push token"]
+    C --> D["git clone /git/name.git"]
+    D --> E["Edit code and tests; uv add / uv lock; commit"]
+    E --> F["git push HEAD:main"]
+    F --> G{"receive-pack accepted?"}
+    G -- "no: bad token, non-fast-forward,<br/>pipeline busy" --> X["Rejected; draft and active tag unchanged"]
+    G -- "yes, new main sha" --> H["Pipeline starts asynchronously"]
+    H --> I["extracting<br/>git archive into .staging, guarded"]
+    I --> J["validating<br/>SKILL.md, deploy.py, pyproject.toml,<br/>uv.lock, .python-version, entrypoint"]
+    J --> K["testing<br/>uv sync --frozen --group dev<br/>pytest + prod smoke run or web boot probe"]
+    K --> L{"green?"}
+    L -- "no" --> M["failed<br/>draft and active tag unchanged;<br/>bounded logs retained"]
+    L -- "yes" --> N{"tree hash changed?"}
+    N -- "no" --> O["unchanged<br/>no new tag; processed ref advances"]
+    N -- "yes" --> P["swap draft<br/>snapshot immutable tag"]
+    P --> Q["promote<br/>set active tag, record state, prune old tags"]
+    Q --> R["run_capability: execute active tag<br/>serve_capability: start/restart web cap"]
+    M --> S["Model polls staging(action='latest')<br/>and reads staging(action='logs')"]
+    O --> S
+    X --> S
+    S -->|"fix and push again"| E
+    R --> T["Operator console: pipeline, logs, tags,<br/>rollback, delete, env values"]
+```
+
+The HTTP push response is git's own report; promotion happens in a background pipeline. Poll
+`staging(name, action="latest")` for the terminal state (`promoted`, `unchanged`, `failed`,
+`interrupted`) and use `staging(name, action="logs")` for diagnostics. A failed push never moves the
+active tag.
+
 ## Shape
 
 - Fixed MCP surface of **ten tools**; capabilities live behind it.
