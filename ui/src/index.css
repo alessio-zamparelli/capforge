@@ -1,6 +1,7 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Tailwind v4: single import replaces the three @tailwind directives; @config
+   keeps the JS theme (zinc palette, darkMode media) from tailwind.config.js. */
+@import "tailwindcss";
+@config "../tailwind.config.js";
 
 /* zinc dark theme (shadcn-style variables) */
 :root {

@@ -68,7 +68,7 @@ function Login({ onLogin }: { onLogin: (token: string) => Promise<void> }) {
     <div className="flex min-h-screen items-center justify-center p-6">
       <form
         onSubmit={submit}
-        className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-card p-6 text-card-foreground shadow"
+        className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-card p-6 text-card-foreground shadow-sm"
       >
         <div className="flex items-center gap-2">
           <KeyRound className="h-5 w-5 text-muted-foreground" />
@@ -80,7 +80,7 @@ function Login({ onLogin }: { onLogin: (token: string) => Promise<void> }) {
           placeholder="Access token"
           value={token}
           onChange={(e) => setToken(e.target.value)}
-          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-hidden focus:ring-1 focus:ring-ring"
         />
         {error && <p className="text-sm text-red-400">{error}</p>}
         <button

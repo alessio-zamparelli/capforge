@@ -1,7 +1,8 @@
 /** @type {import('tailwindcss').Config} */
+// Tailwind 4 detects sources automatically (respecting .gitignore) and its
+// `dark:` variant already follows prefers-color-scheme, so neither `content`
+// nor `darkMode` is needed here: only the shadcn-style zinc palette remains.
 export default {
-  darkMode: "media",
-  content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
