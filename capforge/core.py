@@ -40,7 +40,8 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 # "module:variable" argument, so it must be a plain Python identifier.
 APP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-WEB_KINDS = ("cli", "web")
+CAP_KINDS = ("cli", "web")
+SCAFFOLD_KINDS = ("cli", "web", "both")
 DATA_KINDS = ("version", "shared")
 
 PYTHON_VERSION = "3.14"
@@ -286,7 +287,7 @@ def parse_skill_md(text: str) -> tuple[dict[str, Any], str]:
 
 # ------------------------------------------------------------- deploy.py descriptor
 
-_DEPLOY_SCALARS = frozenset({"KIND", "ENTRYPOINT", "APP", "DATA"})
+_DEPLOY_SCALARS = frozenset({"KIND", "CLI_ENTRYPOINT", "WEB_ENTRYPOINT", "APP", "DATA"})
 _ENV_ANNOTATIONS = {
     "str": "str",
     "SecretStr": "str",
@@ -340,12 +341,26 @@ class ShareMount:
 class DeploySpec:
     """The deployment descriptor read from deploy.py."""
 
-    kind: str = "cli"
-    entrypoint: str = "main.py"
+    modes: tuple[str, ...] = ("cli",)
+    cli_entrypoint: str | None = None
+    web_entrypoint: str | None = None
     app_name: str = "app"
     data: str = "version"
     env: list[EnvSpec] = field(default_factory=list)
     shares: tuple[ShareSpec, ...] = ()
+
+    @property
+    def kind(self) -> str:
+        """Canonical display value; the descriptor itself lists modes."""
+        return "both" if len(self.modes) > 1 else self.modes[0]
+
+    @property
+    def runs_cli(self) -> bool:
+        return "cli" in self.modes
+
+    @property
+    def serves_web(self) -> bool:
+        return "web" in self.modes
 
 
 def _node_name(node: ast.AST) -> str:
@@ -471,6 +486,36 @@ def _float_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _normalize_modes(value: Any) -> tuple[str, ...]:
+    """Turn KIND (a string or a list of modes) into a canonical, ordered tuple."""
+    if isinstance(value, str):
+        items: list[Any] = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise CapError('deploy.py: KIND must be "cli", "web", or a list like ["cli", "web"]')
+    modes: list[str] = []
+    for raw in items:
+        mode = str(raw).strip().lower()
+        if mode not in CAP_KINDS:
+            raise CapError(f"deploy.py: KIND entries must be one of {list(CAP_KINDS)}, got {raw!r}")
+        if mode in modes:
+            raise CapError(f"deploy.py: KIND lists {mode!r} more than once")
+        modes.append(mode)
+    if not modes:
+        raise CapError(f'deploy.py: KIND must name at least one of {list(CAP_KINDS)}')
+    return tuple(mode for mode in CAP_KINDS if mode in modes)
+
+
+def _entrypoint_value(values: Mapping[str, Any], name: str) -> str | None:
+    if name not in values:
+        return None
+    entrypoint = str(values[name]).strip()
+    if not entrypoint:
+        raise CapError(f"deploy.py: {name} must not be empty")
+    return entrypoint
+
+
 def parse_deploy_py(text: str) -> DeploySpec:
     """Parse deploy.py with `ast`; never import capability code into the hub."""
     try:
@@ -483,9 +528,19 @@ def parse_deploy_py(text: str) -> DeploySpec:
         if isinstance(node, ast.Assign):
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 target = node.targets[0].id
+                if target == "ENTRYPOINT":
+                    raise CapError(
+                        "deploy.py: ENTRYPOINT was renamed; use CLI_ENTRYPOINT for KIND "
+                        '"cli" and WEB_ENTRYPOINT for KIND "web"'
+                    )
                 if target in _DEPLOY_SCALARS or target == "SHARES":
                     values[target] = _literal_value(node.value, target)
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name) and node.target.id == "ENTRYPOINT":
+                raise CapError(
+                    "deploy.py: ENTRYPOINT was renamed; use CLI_ENTRYPOINT for KIND "
+                    '"cli" and WEB_ENTRYPOINT for KIND "web"'
+                )
             if isinstance(node.target, ast.Name) and (
                 node.target.id in _DEPLOY_SCALARS or node.target.id == "SHARES"
             ):
@@ -493,15 +548,21 @@ def parse_deploy_py(text: str) -> DeploySpec:
         elif isinstance(node, ast.ClassDef) and node.name == "Env":
             env_node = node
     if "KIND" not in values:
-        raise CapError('deploy.py must define KIND = "cli" or KIND = "web"')
-    kind = str(values["KIND"]).strip().lower()
-    if kind not in WEB_KINDS:
-        raise CapError(f"kind must be one of {list(WEB_KINDS)}, got {kind!r}")
-    if "ENTRYPOINT" not in values:
-        raise CapError('deploy.py must define ENTRYPOINT (for example "main.py")')
-    entrypoint = str(values["ENTRYPOINT"]).strip()
-    if not entrypoint:
-        raise CapError("deploy.py: ENTRYPOINT must not be empty")
+        raise CapError('deploy.py must define KIND (for example KIND = ["cli"])')
+    modes = _normalize_modes(values["KIND"])
+    runs_cli, serves_web = "cli" in modes, "web" in modes
+    cli_entrypoint = _entrypoint_value(values, "CLI_ENTRYPOINT")
+    web_entrypoint = _entrypoint_value(values, "WEB_ENTRYPOINT")
+    if runs_cli and cli_entrypoint is None:
+        raise CapError('deploy.py: KIND includes "cli" but CLI_ENTRYPOINT is missing')
+    if serves_web and web_entrypoint is None:
+        raise CapError('deploy.py: KIND includes "web" but WEB_ENTRYPOINT is missing')
+    if not runs_cli and cli_entrypoint is not None:
+        raise CapError('deploy.py: CLI_ENTRYPOINT is set but KIND does not include "cli"')
+    if not serves_web and web_entrypoint is not None:
+        raise CapError('deploy.py: WEB_ENTRYPOINT is set but KIND does not include "web"')
+    if not serves_web and "APP" in values:
+        raise CapError('deploy.py: APP is only valid when KIND includes "web"')
     app_name = str(values.get("APP") or "app").strip() or "app"
     data = str(values.get("DATA") or "version").strip().lower() or "version"
     if data not in DATA_KINDS:
@@ -541,8 +602,9 @@ def parse_deploy_py(text: str) -> DeploySpec:
         raise CapError(f"env declares {len(specs)} variables; the limit is {MAX_ENV_VARS}.")
     shares = _shares_from_value(values.get("SHARES"))
     return DeploySpec(
-        kind=kind,
-        entrypoint=entrypoint,
+        modes=modes,
+        cli_entrypoint=cli_entrypoint,
+        web_entrypoint=web_entrypoint,
         app_name=app_name,
         data=data,
         env=specs,
@@ -558,9 +620,11 @@ class Capability:
     name: str
     path: Path
     description: str = ""
-    entrypoint: str = "main.py"
+    cli_entrypoint: str | None = None
+    web_entrypoint: str | None = None
     packages: list[str] = field(default_factory=list)
     kind: str = "cli"
+    modes: tuple[str, ...] = ()
     data: str = "version"
     app_name: str = "app"
     env: list[str] = field(default_factory=list)
@@ -569,9 +633,38 @@ class Capability:
     body: str = ""
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        # Direct construction (tests, CLI helpers) still passes `kind`; parsed
+        # capabilities set both. Keep the two in sync without a second source.
+        if not self.modes:
+            if self.kind == "both":
+                self.modes = ("cli", "web")
+            elif self.kind in CAP_KINDS:
+                self.modes = (self.kind,)
+
+    @property
+    def runs_cli(self) -> bool:
+        return "cli" in self.modes
+
+    @property
+    def serves_web(self) -> bool:
+        return "web" in self.modes
+
     @property
     def draft_ready(self) -> bool:
-        return self.error is None and (self.path / self.entrypoint).is_file()
+        if self.error is not None:
+            return False
+        required = []
+        if self.runs_cli:
+            required.append(self.cli_entrypoint)
+        if self.serves_web:
+            required.append(self.web_entrypoint)
+        if not required:
+            return False
+        for entrypoint in required:
+            if entrypoint is None or not (self.path / entrypoint).is_file():
+                return False
+        return True
 
 
 def _dependency_names(path: Path) -> list[str]:
@@ -635,7 +728,9 @@ def _load_from(name: str, path: Path) -> Capability:
         return cap
     deploy = path / "deploy.py"
     if not deploy.is_file():
-        cap.error = "deploy.py is missing; it declares KIND, ENTRYPOINT, DATA and Env"
+        cap.error = (
+            "deploy.py is missing; it declares KIND, CLI_ENTRYPOINT/WEB_ENTRYPOINT, DATA and Env"
+        )
         return cap
     try:
         spec = parse_deploy_py(deploy.read_text(encoding="utf-8", errors="replace"))
@@ -643,34 +738,46 @@ def _load_from(name: str, path: Path) -> Capability:
         cap.error = str(exc)
         return cap
     cap.kind = spec.kind
+    cap.modes = spec.modes
     cap.data = spec.data
     cap.app_name = spec.app_name
     cap.env_specs = spec.env
     cap.env = [item.name for item in spec.env]
     cap.shares = spec.shares
-    if cap.kind == "web":
+    if cap.serves_web:
         deps = _dependency_names(path)
         if "uvicorn" not in deps:
-            cap.error = "kind: web requires 'uvicorn' in [project].dependencies"
+            cap.error = 'KIND includes "web": uvicorn is required in [project].dependencies'
             return cap
-    if cap.kind == "web" and not APP_NAME_RE.match(cap.app_name):
-        cap.error = f"app must be a Python identifier, got {cap.app_name!r}"
-        return cap
-    try:
-        entry = _contained(path, path / spec.entrypoint)
-        cap.entrypoint = entry.relative_to(path).as_posix()
-    except (CapError, ValueError):
-        cap.error = f"entrypoint {spec.entrypoint!r} escapes the capability folder"
-        return cap
-    if cap.kind == "web":
-        stem = Path(cap.entrypoint).stem
+        if not APP_NAME_RE.match(cap.app_name):
+            cap.error = f"app must be a Python identifier, got {cap.app_name!r}"
+            return cap
+    for field_name, raw in (
+        ("CLI_ENTRYPOINT", spec.cli_entrypoint),
+        ("WEB_ENTRYPOINT", spec.web_entrypoint),
+    ):
+        if raw is None:
+            continue
+        try:
+            entry = _contained(path, path / raw)
+            relative = entry.relative_to(path).as_posix()
+        except (CapError, ValueError):
+            cap.error = f"{field_name} {raw!r} escapes the capability folder"
+            return cap
+        if field_name == "CLI_ENTRYPOINT":
+            cap.cli_entrypoint = relative
+        else:
+            cap.web_entrypoint = relative
+        if not (path / relative).is_file():
+            cap.error = f"{field_name} {relative!r} not found"
+            return cap
+    if cap.web_entrypoint is not None:
+        stem = Path(cap.web_entrypoint).stem
         if not APP_NAME_RE.match(stem):
             cap.error = (
-                f"web entrypoint {cap.entrypoint!r} must have a valid Python module name"
+                f"web entrypoint {cap.web_entrypoint!r} must have a valid Python module name"
             )
             return cap
-    if not (path / cap.entrypoint).is_file():
-        cap.error = f"entrypoint {cap.entrypoint!r} not found"
     return cap
 
 
@@ -1926,15 +2033,15 @@ def execute(
     data_tag: str | None = None,
     share_mounts: tuple[ShareMount, ...] | None = None,
 ) -> ExecResult:
-    """Run one capability entrypoint in a subprocess: JSON in on stdin, JSON out on stdout."""
-    if cap.kind == "web":
+    """Run one capability's CLI entrypoint: JSON in on stdin, JSON out on stdout."""
+    if not cap.runs_cli or cap.cli_entrypoint is None:
         raise CapError(
-            f"{cap.name!r} is a web capability (kind: web): it has no JSON entrypoint. "
+            f"{cap.name!r} has no CLI entrypoint (kind: {cap.kind}). "
             "Use serve_capability(name, action='start') to run it as a server."
         )
-    entry = _contained(source, source / cap.entrypoint)
+    entry = _contained(source, source / cap.cli_entrypoint)
     if not entry.is_file():
-        raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
+        raise CapError(f"CLI_ENTRYPOINT {cap.cli_entrypoint!r} is missing from {source}")
     venv = ensure_venv(cap.name, source, "prod")
     data = data_dir(cap.name, data_tag if data_tag is not None else tag)
     scratch = data / ".tmp"
@@ -2013,53 +2120,78 @@ def run_tests(
     packages: list[str] | None = None,
     timeout: int | None = None,
 ) -> ExecResult:
-    """Run the capability's own test suite, or a real smoke run when it has none.
+    """Run the gates the declared modes require.
 
-    Web capabilities are gated by a real boot + HTTP probe instead of the JSON
-    smoke path, in addition to pytest when tests exist: a promotion must prove
-    the ASGI app actually starts.
+    * CLI: pytest when tests exist, otherwise a real JSON smoke run.
+    * Web: pytest (when present) plus a real boot + HTTP probe.
+    * Both: all of the above, and the CLI smoke run even when pytest exists, so
+      a promotion proves each advertised surface.
     """
     tests = source / "tests"
     has_tests = tests.is_dir() and any(tests.rglob("test_*.py"))
-    if cap.kind == "web":
-        pytest_result: ExecResult | None = None
-        if has_tests:
-            pytest_result = _run_pytest(cap, source, timeout)
-            if not pytest_result.ok:
-                return pytest_result
+    sections: list[tuple[str, ExecResult]] = []
+    if has_tests:
+        pytest_result = _run_pytest(cap, source, timeout)
+        sections.append(("pytest", pytest_result))
+        if not pytest_result.ok:
+            return _combined_result(sections)
+    if cap.serves_web:
         boot = probe_web_boot(cap, source)
-        if pytest_result is None:
-            return boot
-        combined = ExecResult(
-            ok=boot.ok,
-            exit_code=boot.exit_code,
-            stdout=(
-                "pytest:\n"
-                + pytest_result.stdout
-                + "\nboot probe:\n"
-                + boot.stdout
-            ),
-            stderr=(
-                ("pytest:\n" + pytest_result.stderr if pytest_result.stderr else "")
-                + ("\nboot probe:\n" + boot.stderr if boot.stderr else "")
-            ).strip(),
-            duration_ms=pytest_result.duration_ms + boot.duration_ms,
-            timed_out=boot.timed_out,
-            result=boot.result,
-        )
-        return combined
-    if not has_tests:
+        sections.append(("boot probe", boot))
+        if not boot.ok:
+            return _combined_result(sections)
+    if cap.runs_cli and (cap.serves_web or not has_tests):
         # Same execution path as a real call: invalid stdout must fail the gate.
-        return execute(
-            cap,
-            source,
-            {},
-            tag=None,
-            timeout=timeout or test_timeout(),
-            data_tag="test",
-            share_mounts=test_share_mounts(cap, data_dir(cap.name, "test")),
+        sections.append(
+            (
+                "cli smoke",
+                execute(
+                    cap,
+                    source,
+                    {},
+                    tag=None,
+                    timeout=timeout or test_timeout(),
+                    data_tag="test",
+                    share_mounts=test_share_mounts(cap, data_dir(cap.name, "test")),
+                ),
+            )
         )
-    return _run_pytest(cap, source, timeout)
+    if not sections:
+        # A capability with neither mode is invalid upstream; fail closed.
+        return ExecResult(
+            ok=False,
+            exit_code=None,
+            stdout="",
+            stderr="capability declares no cli or web mode",
+            duration_ms=0,
+        )
+    return _combined_result(sections)
+
+
+def _combined_result(sections: list[tuple[str, ExecResult]]) -> ExecResult:
+    """Merge gate results; any failing section fails the whole gate."""
+    if len(sections) == 1:
+        return sections[0][1]
+    stdout = "\n".join(
+        f"{label}:\n{result.stdout}" for label, result in sections if result.stdout
+    )
+    stderr = "\n".join(
+        f"{label}:\n{result.stderr}" for label, result in sections if result.stderr
+    ).strip()
+    return ExecResult(
+        ok=all(result.ok for _, result in sections),
+        exit_code=next(
+            (result.exit_code for _, result in reversed(sections) if not result.ok), 0
+        ),
+        stdout=stdout,
+        stderr=stderr,
+        duration_ms=sum(result.duration_ms for _, result in sections),
+        timed_out=any(result.timed_out for _, result in sections),
+        result=next(
+            (result.result for _, result in reversed(sections) if result.result is not None),
+            None,
+        ),
+    )
 
 
 def _run_pytest(
@@ -2178,8 +2310,10 @@ def web_child_argv(cap: Capability, source: Path, port: int) -> list[str]:
     nested entrypoints importable; `--root-path` lets FastAPI build prefixed URLs
     without the deprecated `FastAPI(root_path=...)` parameter. Children always
     bind 127.0.0.1."""
-    module = Path(cap.entrypoint).stem
-    app_dir = (source / cap.entrypoint).parent
+    if cap.web_entrypoint is None:
+        raise CapError(f"{cap.name!r} has no WEB_ENTRYPOINT")
+    module = Path(cap.web_entrypoint).stem
+    app_dir = (source / cap.web_entrypoint).parent
     return [
         "-m",
         "uvicorn",
@@ -2240,11 +2374,14 @@ def probe_web_boot(
 ) -> ExecResult:
     """Boot the ASGI app once on a throwaway port and probe it over HTTP.
 
-    Used as the promotion gate for kind: web. The child is killed before
-    returning; anything that detached itself is left to the stray sweep."""
-    entry = _contained(source, source / cap.entrypoint)
+    Used as the promotion gate whenever KIND includes "web". The child is
+    killed before returning; anything that detached itself is left to the stray
+    sweep."""
+    if cap.web_entrypoint is None:
+        raise CapError(f"{cap.name!r} has no WEB_ENTRYPOINT")
+    entry = _contained(source, source / cap.web_entrypoint)
     if not entry.is_file():
-        raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
+        raise CapError(f"WEB_ENTRYPOINT {cap.web_entrypoint!r} is missing from {source}")
     venv = ensure_venv(cap.name, source, "prod")
     port = _free_port()
     data = data_dir(cap.name, "test")

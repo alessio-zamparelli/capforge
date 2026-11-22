@@ -116,8 +116,8 @@ def test_scaffold_lists_generated_files(env):
     assert "tests/test_scaffold.py" in detail["files"]
     assert "deploy.py" in detail["files"]
     deploy = (Path(made["path"]) / "deploy.py").read_text(encoding="utf-8")
-    assert 'KIND = "cli"' in deploy
-    assert 'ENTRYPOINT = "main.py"' in deploy
+    assert 'KIND = ["cli"]' in deploy
+    assert 'CLI_ENTRYPOINT = "main.py"' in deploy
     assert "pydantic" in (Path(made["path"]) / "pyproject.toml").read_text(encoding="utf-8")
     assert "entrypoint:" not in (Path(made["path"]) / "SKILL.md").read_text(encoding="utf-8")
     test_source = (Path(made["path"]) / "tests" / "test_scaffold.py").read_text(encoding="utf-8")
@@ -165,6 +165,46 @@ def test_web_pipeline_log_contains_pytest_and_boot(env):
     logs = s.staging("websvc", action="logs")["text"]
     assert "pytest:" in logs and "passed" in logs
     assert "boot probe:" in logs
+
+
+def test_hybrid_scaffold_runs_cli_and_serves_web(env):
+    _, s = env
+    made = s.scaffold_capability("hybrid", "Both surfaces.", kind="both")
+    assert made["ok"], made
+    root = Path(made["path"])
+    assert (root / "main.py").is_file()
+    assert (root / "app.py").is_file()
+    deploy = (root / "deploy.py").read_text(encoding="utf-8")
+    assert 'KIND = ["cli", "web"]' in deploy
+    assert 'CLI_ENTRYPOINT = "main.py"' in deploy
+    assert 'WEB_ENTRYPOINT = "app.py"' in deploy
+
+    tested = s.test_capability("hybrid")
+    assert tested["ok"], tested
+    stdout = tested["tests"]["stdout"]
+    assert "pytest:" in stdout
+    assert "boot probe:" in stdout
+    assert "cli smoke:" in stdout
+
+    run = s.run_capability("hybrid", {"text": "abc"})
+    assert run["ok"], run
+    assert run["result"] == {"text": "abc", "length": 3}
+    assert run["kind"] == "both"
+    assert run["cli_entrypoint"] == "main.py"
+
+    promo = s.promote_capability("hybrid", tag="v1")
+    assert promo["ok"], promo
+    assert promo["kind"] == "both"
+    assert promo["modes"] == ["cli", "web"]
+    assert promo["cli_entrypoint"] == "main.py"
+    assert promo["web_entrypoint"] == "app.py"
+
+    detail = s.get_capability("hybrid")
+    assert detail["runs_cli"] is True and detail["serves_web"] is True
+    assert detail["cli_entrypoint"] == "main.py"
+    assert detail["web_entrypoint"] == "app.py"
+    listed = s.list_capabilities()["capabilities"][0]
+    assert listed["runs_cli"] is True and listed["serves_web"] is True
 
 
 def test_run_draft_builds_uv_env(env):

@@ -29,7 +29,7 @@ environment and promotes it to an immutable tag on green. `run_capability` execu
 There is no shared filesystem between the terminal and the server. Cross-capability folders are
 explicit, operator-approved shared volumes declared in `deploy.py`.
 
-A capability with `KIND = "web"` in `deploy.py` is a long-lived ASGI service. It is
+A capability whose `KIND` includes `"web"` in `deploy.py` is a long-lived ASGI service. It is
 reverse-proxied at `http://<host>:8080/cap/<name>/`; the console is `/ui/`, the control API is
 `/api/`, and the git smart-HTTP ingress is `/git/<name>.git`.
 
@@ -240,11 +240,12 @@ commands; they are not MCP tools.
 ```text
 <name>/
     SKILL.md            name, description and instructions
-    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA, SHARES, Env
+    deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT,
+                        WEB_ENTRYPOINT, APP, DATA, SHARES, Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
-    main.py | app.py    entrypoint / ASGI app
+    main.py | app.py    CLI entrypoint and/or ASGI app
     tests/              pytest; the dev group also has pytest-cov
     AGENTS.md           the clone/edit/push loop (CLI and web)
 ```
@@ -252,15 +253,21 @@ commands; they are not MCP tools.
 `deploy.py` is the machine-readable contract:
 
 ```python
-KIND = "cli"            # "cli" or "web"
-ENTRYPOINT = "main.py"  # app.py for web
-DATA = "version"        # "version" or "shared"
-APP = "app"             # web only; the ASGI object
-SHARES = {              # operator-approved cross-capability folders
+KIND = ["cli"]                 # "cli", "web", or ["cli", "web"]
+CLI_ENTRYPOINT = "main.py"     # required when KIND includes "cli"
+WEB_ENTRYPOINT = "app.py"      # required when KIND includes "web"
+DATA = "version"               # "version" or "shared"
+APP = "app"                    # web only; the ASGI object
+SHARES = {                     # operator-approved cross-capability folders
     "datasets": "ro",
     "cache": "rw",
 }
 ```
+
+`KIND` lists the surfaces the capability exposes. `CLI_ENTRYPOINT` is the JSON
+entrypoint, `WEB_ENTRYPOINT` plus `APP` describe the ASGI app, and a hybrid lists
+both modes and declares both entrypoints. The declared entrypoints must match the
+modes. `ENTRYPOINT` was renamed to `CLI_ENTRYPOINT`/`WEB_ENTRYPOINT`.
 
 `SKILL.md` frontmatter carries only `name` and `description`; the deployment fields live in
 `deploy.py`. The CLI entrypoint reads **one JSON object on stdin** and writes **one JSON value on
@@ -324,9 +331,10 @@ not accepted. Do not put the token in the URL. Clone and push use the same token
 
 ## Web capabilities
 
-`KIND = "web"` in `deploy.py` requires `uvicorn` in `[project].dependencies` and an ASGI `app`.
-After a green push, `serve_capability(name, action="start")` boots the active tag at
-`/cap/<name>/`. `restart` picks up a newly promoted tag; promotion alone does not restart it.
+A `KIND` that includes `"web"` requires `uvicorn` in `[project].dependencies`, `WEB_ENTRYPOINT`
+and an ASGI `APP`. After a green push, `serve_capability(name, action="start")` boots the active
+tag at `/cap/<name>/`. `restart` picks up a newly promoted tag; promotion alone does not restart it.
+A hybrid (`KIND = ["cli", "web"]`) also keeps `run_capability` on `CLI_ENTRYPOINT`.
 Boot failures return the child log tail. The child is sandboxed by Landlock and writes only to
 its data directories and approved shared folders.
 

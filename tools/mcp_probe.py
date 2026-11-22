@@ -21,6 +21,7 @@ URL = os.environ.get("CAPFORGE_URL", "http://127.0.0.1:8099/mcp")
 WEB_URL = os.environ.get("CAPFORGE_WEB_PROBE_URL", "http://127.0.0.1:8080")
 CAP_NAME = f"probe_{os.getpid()}"
 WEB_NAME = f"webprobe_{os.getpid()}"
+BOTH_NAME = f"bothprobe_{os.getpid()}"
 TOOLS = [
     "get_contract",
     "list_capabilities",
@@ -243,10 +244,49 @@ def main() -> int:
         stopped = call("serve_capability", {"name": WEB_NAME, "action": "stop"})
         print("serve stop ->", stopped["ok"], stopped.get("status"))
         assert stopped.get("status") == "stopped", stopped
+
+        both_made = call(
+            "scaffold_capability",
+            {"name": BOTH_NAME, "description": "Probe hybrid.", "kind": "both"},
+        )
+        print("both scaffold ->", both_made["ok"], both_made["kind"], both_made["modes"])
+        assert both_made["modes"] == ["cli", "web"], both_made
+        both_minted = call("staging", {"name": BOTH_NAME, "action": "token"})
+        push(
+            BOTH_NAME,
+            both_minted["token"],
+            both_minted["git_url"],
+            both_minted["basic_username"],
+            lambda work: (work / "AGENTS.md").write_text(
+                (work / "AGENTS.md").read_text() + "\n", encoding="utf-8"
+            ),
+        )
+        both_state = {}
+        for _ in range(180):
+            both_state = call("staging", {"name": BOTH_NAME, "action": "latest"})
+            print("both pipeline ->", both_state.get("state"), both_state.get("tag"))
+            if both_state.get("state") in {"promoted", "unchanged", "failed", "interrupted"}:
+                break
+            time.sleep(1)
+        assert both_state.get("state") == "promoted", both_state
+
+        both_run = call("run_capability", {"name": BOTH_NAME, "args": {"text": "ab"}})
+        print("both run ->", both_run["ok"], both_run["kind"], both_run["result"])
+        assert both_run["ok"] and both_run["result"]["length"] == 2, both_run
+        both_started = call("serve_capability", {"name": BOTH_NAME, "action": "start"})
+        print("both serve ->", both_started["ok"], both_started.get("status"))
+        assert both_started.get("status") == "running", both_started
+        with httpx.Client(timeout=30) as web_client:
+            health = web_client.get(f"{both_started['url']}health")
+            print("both /health ->", health.status_code, health.text[:60])
+            assert health.status_code == 200
+        both_stopped = call("serve_capability", {"name": BOTH_NAME, "action": "stop"})
+        assert both_stopped.get("status") == "stopped", both_stopped
     finally:
         cleanup(contract, CAP_NAME)
         cleanup(contract, WEB_NAME)
-        print("cleaned up", CAP_NAME, WEB_NAME)
+        cleanup(contract, BOTH_NAME)
+        print("cleaned up", CAP_NAME, WEB_NAME, BOTH_NAME)
     return 0
 
 

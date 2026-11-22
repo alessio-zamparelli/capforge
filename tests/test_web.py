@@ -74,6 +74,18 @@ def _make_web_cap(env, name: str, *, tag: str = "v1", extra: str = "") -> None:
     assert promo["ok"], promo
 
 
+def _make_hybrid_cap(env, name: str, *, tag: str = "v1") -> None:
+    _, server, _, _ = env
+    made = server.scaffold_capability(name, f"{name} hybrid service.", kind="both")
+    assert made["ok"], made
+    root = Path(made["path"])
+    (root / "app.py").write_text(_web_cap_source(name), encoding="utf-8")
+    tested = server.test_capability(name)
+    assert tested["ok"], tested
+    promo = server.promote_capability(name, tag=tag)
+    assert promo["ok"], promo
+
+
 def _asgi_get(web, path: str) -> tuple[int, str]:
     """GET through the console ASGI app in-process (no listener is bound)."""
     import anyio
@@ -129,6 +141,26 @@ def test_web_lifecycle_proxy_and_restart(env):
     assert web._INSTANCES == {}
 
 
+def test_hybrid_runs_cli_and_serves_web(env):
+    _, server, web, _core = env
+    _make_hybrid_cap(env, "hybrid")
+    started = server.serve_capability("hybrid", action="start")
+    assert started["ok"], started
+    assert started["status"] == "running"
+    assert started["url"].endswith("/cap/hybrid/")
+    code, body = _asgi_get(web, "/cap/hybrid/health")
+    assert code == 200 and '"healthy":true' in body.replace(" ", ""), body
+
+    run = server.run_capability("hybrid", {"text": "xy"})
+    assert run["ok"], run
+    assert run["result"] == {"text": "xy", "length": 2}
+    assert run["kind"] == "both"
+    assert run["cli_entrypoint"] == "main.py"
+
+    stopped = server.serve_capability("hybrid", action="stop")
+    assert stopped["status"] == "stopped"
+
+
 def test_delete_capability_stops_served_child(env):
     root, server, web, _core = env
     _make_web_cap(env, "deleted")
@@ -150,7 +182,7 @@ def test_serve_refuses_draft_and_cli(env):
     assert server.test_capability("plaincli")["ok"]
     assert server.promote_capability("plaincli", tag="v1")["ok"]
     refused = server.serve_capability("plaincli", action="start")
-    assert refused["ok"] is False and "not a web capability" in refused["error"], refused
+    assert refused["ok"] is False and "does not serve web" in refused["error"], refused
 
     made = server.scaffold_capability("webdraft", "Draft web.", kind="web")
     assert made["ok"]

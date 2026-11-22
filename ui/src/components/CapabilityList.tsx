@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   Globe,
   Play,
   RefreshCw,
@@ -101,10 +102,13 @@ function CapabilityCard({
             className="h-auto min-w-0 max-w-full justify-start gap-2 px-0 hover:bg-transparent"
             onClick={() => setOpen((value) => !value)}
           >
-            {cap.kind === "web" ? <Globe data-icon="inline-start" /> : <Terminal data-icon="inline-start" />}
+            {cap.runs_cli && <Terminal data-icon="inline-start" />}
+            {cap.serves_web && <Globe data-icon="inline-start" />}
             <span className="truncate font-medium">{cap.name}</span>
           </Button>
-          {cap.kind === "web" && <Badge variant="outline">{cap.kind}</Badge>}
+          {cap.runs_cli && <Badge variant="secondary">CLI</Badge>}
+          {cap.serves_web && <Badge variant="outline">Web</Badge>}
+          {cap.serves_web && cap.web_route && <RouteLink route={cap.web_route} />}
           {cap.active && <Badge variant="secondary">{cap.active}</Badge>}
           {cap.draft_changed && <StatusBadge warn>draft changed</StatusBadge>}
           {cap.env.length > 0 && (
@@ -130,7 +134,7 @@ function CapabilityCard({
           </span>
         </div>
 
-        {cap.kind === "web" && (
+        {cap.serves_web && (
           <div className="flex shrink-0 items-center gap-1">
             <ActionButton
               label="Start"
@@ -161,7 +165,7 @@ function CapabilityCard({
       </CardHeader>
 
       {open && (
-        <CardContent className="flex flex-col gap-4 border-t">
+        <CardContent className="flex flex-col gap-4 border-t pt-4">
           <CapabilityDetail name={cap.name} onChanged={onChanged} onAuthLost={onAuthLost} />
 
           {served && served.endpoints.length > 0 && (
@@ -259,11 +263,7 @@ function DeleteCapability({
   };
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <div className="flex items-center gap-2 text-sm font-medium text-destructive">
-        <Trash2 data-icon="inline-start" />
-        Delete capability
-      </div>
+    <div className="flex flex-wrap items-center justify-end gap-2">
       <Button variant="destructive" size="sm" onClick={() => setOpen(true)}>
         <Trash2 data-icon="inline-start" />
         Delete
@@ -279,6 +279,25 @@ function DeleteCapability({
         onConfirm={remove}
       />
     </div>
+  );
+}
+
+function RouteLink({ route }: { route: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <a
+          href={route}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 font-mono text-xs text-muted-foreground hover:text-foreground"
+        >
+          {route}
+          <ExternalLink className="size-3" aria-hidden="true" />
+        </a>
+      </TooltipTrigger>
+      <TooltipContent>Open the served web capability</TooltipContent>
+    </Tooltip>
   );
 }
 

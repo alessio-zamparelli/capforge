@@ -120,7 +120,14 @@ export interface ShareChange {
 export interface CapInfo {
   name: string;
   description: string;
-  kind: "cli" | "web";
+  kind: "cli" | "web" | "both";
+  modes: ("cli" | "web")[];
+  runs_cli: boolean;
+  serves_web: boolean;
+  web_route: string | null;
+  cli_entrypoint: string | null;
+  web_entrypoint: string | null;
+  app: string;
   active: string | null;
   draft_ready: boolean;
   draft_error: string | null;
@@ -135,7 +142,10 @@ export interface TagInfo {
   created_at?: number;
   content_hash?: string;
   note?: string;
-  entrypoint?: string;
+  kind?: "cli" | "web" | "both";
+  modes?: ("cli" | "web")[];
+  cli_entrypoint?: string;
+  web_entrypoint?: string;
   active?: boolean;
 }
 

@@ -1,4 +1,4 @@
-"""Serving engine and web listener for web (`KIND = "web"`) capabilities.
+"""Serving engine and web listener for capabilities whose `KIND` includes `"web"`.
 
 One instance per capability, pinned to its active tag, spawned as a uvicorn
 child bound to 127.0.0.1 and reverse-proxied at `http://<host>:<web port>/cap/<name>/`.
@@ -217,7 +217,7 @@ def _registry_record(name: str) -> dict[str, Any] | None:
 class _Instance:
     name: str
     tag: str
-    entrypoint: str
+    web_entrypoint: str
     app_name: str
     packages: list[str]
     proc: subprocess.Popen[Any]
@@ -231,7 +231,7 @@ class _Instance:
         return {
             "name": self.name,
             "tag": self.tag,
-            "entrypoint": self.entrypoint,
+            "web_entrypoint": self.web_entrypoint,
             "app": self.app_name,
             "packages": list(self.packages),
             "endpoints": self.endpoints,
@@ -323,18 +323,18 @@ def _active_or_raise(name: str) -> tuple[str, dict[str, Any], Any]:
     cap = core.load_capability_at(name, source)
     if cap.error:
         raise CapError(f"Active tag {tag!r} is not runnable: {cap.error}")
-    if cap.kind != "web":
+    if not cap.serves_web or cap.web_entrypoint is None:
         raise CapError(
-            f"{name!r} is not a web capability (kind: {cap.kind}). "
-            "Only kind: web capabilities can be served."
+            f"{name!r} does not serve web (kind: {cap.kind}). "
+            'Only capabilities whose KIND includes "web" can be served.'
         )
-    return tag, {"entrypoint": cap.entrypoint, "app": cap.app_name}, source
+    return tag, {"web_entrypoint": cap.web_entrypoint, "app": cap.app_name}, source
 
 
 def _spawn(
     name: str,
     tag: str,
-    entrypoint: str,
+    web_entrypoint: str,
     app_name: str,
     *,
     public_url: str | None = None,
@@ -347,8 +347,8 @@ def _spawn(
     cap = core.load_capability_at(name, source)
     if cap.error:
         raise CapError(f"Version {tag!r} is not runnable: {cap.error}")
-    if cap.kind != "web":
-        raise CapError(f"Version {tag!r} is not a web capability (kind: {cap.kind})")
+    if not cap.serves_web:
+        raise CapError(f"Version {tag!r} does not serve web (kind: {cap.kind})")
     venv = core.ensure_venv(name, source, "prod")
     port = core._free_port()
     log_file = _log_path(name, tag)
@@ -390,7 +390,7 @@ def _spawn(
     instance = _Instance(
         name=name,
         tag=tag,
-        entrypoint=entrypoint,
+        web_entrypoint=web_entrypoint,
         app_name=app_name,
         packages=[],
         proc=proc,
@@ -507,7 +507,7 @@ def _start_locked(name: str) -> dict[str, Any]:
         raise CapError(
             "web serving is disabled: CAPFORGE_WEB_PORT=0 turns off the reverse proxy"
         )
-    instance = _spawn(name, tag, meta["entrypoint"], meta["app"])
+    instance = _spawn(name, tag, meta["web_entrypoint"], meta["app"])
     _persist_record(name, instance.record())
     return _status_of(name)
 
@@ -664,7 +664,11 @@ def restore() -> int:
                 _spawn(
                     name,
                     tag,
-                    str(record.get("entrypoint") or "app.py"),
+                    str(
+                        record.get("web_entrypoint")
+                        or record.get("entrypoint")
+                        or "app.py"
+                    ),
                     str(record.get("app") or "app"),
                     public_url=public_url(name),
                 )
@@ -951,7 +955,7 @@ def _restart_if_running(name: str) -> dict[str, Any]:
 def _restart_after_env(name: str) -> dict[str, Any]:
     """Environment and Landlock are fixed at spawn, so restart a live web child."""
     caps = _env_caps_for(name)
-    if not any(cap.kind == "web" for cap in caps):
+    if not any(cap.serves_web for cap in caps):
         return {"restarted": False}
     return _restart_if_running(name)
 
@@ -1014,6 +1018,12 @@ async def api_caps(request: Request) -> Response:
                     "name": cap.name,
                     "description": cap.description,
                     "kind": cap.kind,
+                    "runs_cli": cap.runs_cli,
+                    "serves_web": cap.serves_web,
+                    "web_route": core.cap_root_path(cap.name) + "/" if cap.serves_web else None,
+                    "cli_entrypoint": cap.cli_entrypoint,
+                    "web_entrypoint": cap.web_entrypoint,
+                    "app": cap.app_name,
                     "active": active,
                     "draft_ready": cap.draft_ready,
                     "draft_error": cap.error,
@@ -1277,6 +1287,12 @@ async def api_cap_detail(request: Request) -> Response:
             "name": name,
             "description": cap.description,
             "kind": cap.kind,
+            "runs_cli": cap.runs_cli,
+            "serves_web": cap.serves_web,
+            "web_route": core.cap_root_path(cap.name) + "/" if cap.serves_web else None,
+            "cli_entrypoint": cap.cli_entrypoint,
+            "web_entrypoint": cap.web_entrypoint,
+            "app": cap.app_name,
             "data": cap.data,
             "active": active.get("tag"),
             "active_content_hash": (active.get("content_hash") or "")[:12],

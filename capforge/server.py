@@ -15,7 +15,7 @@ from . import __version__, core, scaffold, versioning
 from . import staging as staging_service
 from .contract import CONTRACT
 from .core import (
-    WEB_KINDS,
+    SCAFFOLD_KINDS,
     CapError,
     cap_path,
     caps_dir,
@@ -198,6 +198,9 @@ def list_capabilities() -> dict:
                 "name": cap.name,
                 "description": cap.description,
                 "kind": cap.kind,
+                "modes": list(cap.modes),
+                "runs_cli": cap.runs_cli,
+                "serves_web": cap.serves_web,
                 "data": cap.data,
                 "active": active.get("tag"),
                 "draft_ready": cap.draft_ready,
@@ -231,8 +234,12 @@ def get_capability(name: str) -> dict:
         "git_url": _git_url(cap.name),
         "description": cap.description,
         "kind": cap.kind,
+        "modes": list(cap.modes),
+        "runs_cli": cap.runs_cli,
+        "serves_web": cap.serves_web,
         "data": cap.data,
-        "entrypoint": cap.entrypoint,
+        "cli_entrypoint": cap.cli_entrypoint,
+        "web_entrypoint": cap.web_entrypoint,
         "env": env_status(cap.name, caps_for),
         "shares": core.share_status(cap.name, caps_for),
         "draft_ready": cap.draft_ready,
@@ -250,10 +257,11 @@ def get_capability(name: str) -> dict:
 @mcp.tool
 def scaffold_capability(name: str, description: str, kind: str = "cli") -> dict:
     """Create a uv base project, publish `main` in a new bare repo, and materialise the draft.
-    The model then mints a token with staging(action='token') and clones the repository."""
+    `kind="both"` scaffolds both a CLI and a web entrypoint. The model then mints a token
+    with staging(action='token') and clones the repository."""
     kind = str(kind).strip().lower() or "cli"
-    if kind not in WEB_KINDS:
-        return _fail(f"kind must be one of {list(WEB_KINDS)}, got {kind!r}")
+    if kind not in SCAFFOLD_KINDS:
+        return _fail(f"kind must be one of {list(SCAFFOLD_KINDS)}, got {kind!r}")
     try:
         result = scaffold.create(name, description, kind)
     except CapError as exc:
@@ -370,7 +378,8 @@ def run_capability(name: str, args: dict | None = None) -> dict:
             "name": name,
             "version": tag or "draft",
             "mode": mode,
-            "entrypoint": source_cap.entrypoint,
+            "kind": source_cap.kind,
+            "cli_entrypoint": source_cap.cli_entrypoint,
             "env": "uv",
             "content_hash": str((active.get("content_hash") if tag else tree_hash(source)) or "")[:12],
             "data_dir": str(data_dir(name, tag)),
@@ -388,7 +397,7 @@ def run_capability(name: str, args: dict | None = None) -> dict:
 
 @mcp.tool
 def serve_capability(name: str, action: str = "status", tail: int | None = None) -> dict:
-    """Start, stop, restart, inspect or read logs for a web capability's ACTIVE tag."""
+    """Start, stop, restart, inspect or read logs for the ACTIVE tag's web entrypoint."""
     if RUNTIME_TRANSPORT == "stdio":
         return _fail(
             "web serving requires HTTP transport: run `capforge serve` without "

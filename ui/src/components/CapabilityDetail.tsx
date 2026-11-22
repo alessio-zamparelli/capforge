@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { RefreshCw, RotateCcw, Terminal } from "lucide-react";
+import { GitBranch, Globe, RefreshCw, RotateCcw, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { isAuthError } from "@/api";
@@ -92,7 +92,7 @@ export function CapabilityDetail({
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-          <Terminal data-icon="inline-start" />
+          <GitBranch className="size-4" aria-hidden="true" />
           Pipeline
           {pipeline?.state && (
             <StatusBadge warn={pipeline.state !== "promoted"}>{pipeline.state}</StatusBadge>
@@ -113,10 +113,39 @@ export function CapabilityDetail({
           </Alert>
         )}
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>kind {detail?.kind ?? "cli"}</span>
           <span>data {detail?.data ?? "version"}</span>
           <span>draft {detail?.draft_changed ? "changed" : "current"}</span>
           {detail?.active_content_hash && <span>hash {detail.active_content_hash}</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {detail?.runs_cli && (
+            <Badge variant="secondary" className="gap-1">
+              <Terminal data-icon="inline-start" />
+              CLI
+              <span className="font-mono text-[11px] font-normal">
+                {detail.cli_entrypoint ?? "main.py"}
+              </span>
+            </Badge>
+          )}
+          {detail?.serves_web && (
+            <Badge variant="outline" className="gap-1">
+              <Globe data-icon="inline-start" />
+              Web
+              <span className="font-mono text-[11px] font-normal">
+                {detail.web_entrypoint ?? "app.py"}:{detail.app}
+              </span>
+            </Badge>
+          )}
+          {detail?.serves_web && detail.web_route && (
+            <a
+              href={detail.web_route}
+              target="_blank"
+              rel="noreferrer"
+              className="font-mono text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              {detail.web_route}
+            </a>
+          )}
         </div>
       </div>
 

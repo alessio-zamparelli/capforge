@@ -95,7 +95,9 @@ def promote(
     if cap.error:
         raise CapError(f"Cannot promote {name!r}: {cap.error}")
     if not cap.draft_ready:
-        raise CapError(f"Cannot promote {name!r}: entrypoint {cap.entrypoint!r} is missing")
+        raise CapError(
+            f"Cannot promote {name!r}: {cap.error or 'a declared entrypoint is missing'}"
+        )
 
     with (nullcontext() if locked else cap_lock(name)):
         draft_hash = tree_hash(cap.path)
@@ -132,7 +134,10 @@ def promote(
         snap["env"] = "uv"
         snap["lock_hash"] = lock
         snap["python"] = PYTHON_VERSION
-        snap["entrypoint"] = cap.entrypoint
+        snap["kind"] = cap.kind
+        snap["modes"] = list(cap.modes)
+        snap["cli_entrypoint"] = cap.cli_entrypoint
+        snap["web_entrypoint"] = cap.web_entrypoint
         snap["note"] = note
         snap["git_source"] = git_source
         snap["pushed_by"] = pushed_by
@@ -150,7 +155,10 @@ def promote(
             "content_hash": snap["content_hash"],
             "env": snap["env"],
             "lock_hash": snap["lock_hash"],
-            "entrypoint": snap["entrypoint"],
+            "kind": snap["kind"],
+            "modes": snap["modes"],
+            "cli_entrypoint": snap["cli_entrypoint"],
+            "web_entrypoint": snap["web_entrypoint"],
             "previous": snap["previous"],
             "pruned": pruned,
             "version_path": snap["path"],
@@ -282,7 +290,10 @@ def list_tags(name: str) -> dict[str, Any]:
                 "created_at": t.get("created_at"),
                 "content_hash": (t.get("content_hash") or "")[:12],
                 "packages": t.get("packages") or [],
-                "entrypoint": t.get("entrypoint") or "",
+                "kind": t.get("kind") or "cli",
+                "modes": t.get("modes") or [],
+                "cli_entrypoint": t.get("cli_entrypoint") or "",
+                "web_entrypoint": t.get("web_entrypoint") or "",
                 "note": t.get("note") or "",
                 "active": t.get("tag") == active,
             }

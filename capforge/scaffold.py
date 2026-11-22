@@ -68,8 +68,8 @@ class Env(BaseModel):
     # API_KEY: str
 
 
-KIND = "cli"
-ENTRYPOINT = "main.py"
+KIND = ["cli"]
+CLI_ENTRYPOINT = "main.py"
 DATA = "version"
 # SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
 '''
@@ -88,8 +88,30 @@ class Env(BaseModel):
     # API_KEY: str
 
 
-KIND = "web"
-ENTRYPOINT = "app.py"
+KIND = ["web"]
+WEB_ENTRYPOINT = "app.py"
+APP = "app"
+DATA = "version"
+# SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
+'''
+
+DEPLOY_BOTH = '''\
+"""Deployment descriptor for {name}. Capforge reads this file; keep it declarative."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+
+class Env(BaseModel):
+    """Operator-set values, injected only into the active tag."""
+
+    # API_KEY: str
+
+
+KIND = ["cli", "web"]
+CLI_ENTRYPOINT = "main.py"
+WEB_ENTRYPOINT = "app.py"
 APP = "app"
 DATA = "version"
 # SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
@@ -266,8 +288,12 @@ def _valid_description(description: str) -> str:
 
 
 def _write_project(root: Path, name: str, description: str, kind: str) -> None:
-    web = kind == "web"
-    deps = '["fastapi", "uvicorn", "httpx", "pydantic"]' if web else '["pydantic"]'
+    modes = ("cli", "web") if kind == "both" else (kind,)
+    runs_cli = "cli" in modes
+    serves_web = "web" in modes
+    deps = (
+        '["fastapi", "uvicorn", "httpx", "pydantic"]' if serves_web else '["pydantic"]'
+    )
     (root / "pyproject.toml").write_text(
         PYPROJECT.format(name=name, dependencies=deps), encoding="utf-8"
     )
@@ -276,21 +302,17 @@ def _write_project(root: Path, name: str, description: str, kind: str) -> None:
     (root / "AGENTS.md").write_text(
         contract.AGENTS_TEMPLATE.replace("__CAPABILITY__", name), encoding="utf-8"
     )
-    (root / "deploy.py").write_text(
-        (DEPLOY_WEB if web else DEPLOY_CLI).format(name=name), encoding="utf-8"
-    )
-    if web:
-        (root / "app.py").write_text(APP.format(name=name), encoding="utf-8")
-        (root / "tests").mkdir()
-        (root / "tests" / "test_scaffold.py").write_text(
-            TEST_WEB.format(name=name), encoding="utf-8"
-        )
-    else:
+    template = DEPLOY_BOTH if len(modes) > 1 else (DEPLOY_WEB if serves_web else DEPLOY_CLI)
+    (root / "deploy.py").write_text(template.format(name=name), encoding="utf-8")
+    tests = root / "tests"
+    tests.mkdir()
+    if runs_cli:
         (root / "main.py").write_text(MAIN.format(name=name), encoding="utf-8")
-        (root / "tests").mkdir()
-        (root / "tests" / "test_scaffold.py").write_text(
-            TEST.format(name=name), encoding="utf-8"
-        )
+        (tests / "test_scaffold.py").write_text(TEST.format(name=name), encoding="utf-8")
+    if serves_web:
+        (root / "app.py").write_text(APP.format(name=name), encoding="utf-8")
+        web_test = tests / ("test_web.py" if runs_cli else "test_scaffold.py")
+        web_test.write_text(TEST_WEB.format(name=name), encoding="utf-8")
     (root / "SKILL.md").write_text(
         SKILL.format(name=name, description=description), encoding="utf-8"
     )
@@ -350,8 +372,8 @@ def create(name: str, description: str, kind: str = "cli") -> dict[str, Any]:
             f"Invalid capability name {name!r}. Use lowercase letters, digits and underscores, "
             "starting with a letter (max 64 chars)."
         )
-    if kind not in core.WEB_KINDS:
-        raise core.CapError(f"kind must be one of {list(core.WEB_KINDS)}")
+    if kind not in core.SCAFFOLD_KINDS:
+        raise core.CapError(f"kind must be one of {list(core.SCAFFOLD_KINDS)}")
     description = _valid_description(description)
     draft = core.cap_path(name)
     if draft.exists() or gitremote.repo_path(name).exists():
@@ -384,6 +406,7 @@ def create(name: str, description: str, kind: str = "cli") -> dict[str, Any]:
             "git_url": _git_url(name),
             "sha": sha,
             "kind": kind,
+            "modes": ["cli", "web"] if kind == "both" else [kind],
             "python": core.PYTHON_VERSION,
             "files": core.list_files(draft),
         }

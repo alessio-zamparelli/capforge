@@ -84,8 +84,8 @@ logic stays in the modules.
 ## 5. Authoring flow
 
 1. `scaffold_capability(name, description, kind)`:
-   - builds a uv project (`pyproject.toml`, `.python-version`, `SKILL.md`, `deploy.py`, entrypoint,
-     tests, `AGENTS.md`, `.gitignore`);
+   - builds a uv project (`pyproject.toml`, `.python-version`, `SKILL.md`, `deploy.py`, one or both
+     entrypoints, tests, `AGENTS.md`, `.gitignore`); `kind="both"` writes `main.py` and `app.py`;
    - runs `uv lock`;
    - commits and publishes `main` in `<state>/git/<name>.git` via a local fetch (no receive hook);
    - materialises the same tree as the server draft. An existing name/repo is refused; there is no
@@ -122,11 +122,14 @@ received -> extracting -> validating -> testing -> promoted | unchanged | failed
   guards: no symlinks/hardlinks/devices, no absolute/`..` members, no `.git`/`.venv`/
   `__pycache__`, bounded members/bytes/path length.
 - **Validating.** `SKILL.md` (name/description), `deploy.py`, `pyproject.toml`, `uv.lock`,
-  `.python-version`, entrypoint containment, `KIND`, optional `DATA`/`APP`/`SHARES` and the `Env`
-  model. `deploy.py` is parsed with `ast`, never imported. Legacy frontmatter
-  `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is rejected with a migration message.
-- **Testing.** `uv sync --frozen --group dev` into the test venv, pytest with capability coverage,
-  then a prod smoke run (or web boot probe). Red leaves the draft/active untouched.
+  `.python-version`, entrypoint containment, `KIND` (a list of `cli`/`web` modes), the matching
+  `CLI_ENTRYPOINT`/`WEB_ENTRYPOINT`, optional `DATA`/`APP`/`SHARES` and the `Env` model.
+  `deploy.py` is parsed with `ast`, never imported. Legacy frontmatter
+  `kind`/`entrypoint`/`app`/`data`/`env`/`packages` and a deploy.py `ENTRYPOINT` are rejected with
+  a migration message.
+- **Testing.** `uv sync --frozen --group dev` into the test venv, then the gates for each declared
+  mode: pytest, a web boot probe, and a CLI smoke run (always for hybrids). Red leaves the
+  draft/active untouched.
 - **Swapping/promoting.** One `cap_lock` critical section: verify hash, archive old draft with
   `os.rename`, rename the tree into place, snapshot, record `env: "uv"`, `lock_hash`, `python`,
   `git_source`, `pushed_by`, set `active`, prune, write state. Failure restores the old draft.

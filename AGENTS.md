@@ -73,26 +73,30 @@ never let `CapError` escape to MCP.
 ```text
 <caps>/<name>/
     SKILL.md            name, description and instructions; no deployment fields
-    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA,
-                        SHARES and Env (pydantic) fields; parsed with ast,
-                        never imported
+    deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT,
+                        WEB_ENTRYPOINT, APP, DATA, SHARES and Env (pydantic)
+                        fields; parsed with ast, never imported
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed
     .python-version     3.14
-    main.py | app.py    entrypoint (`ENTRYPOINT`), ASGI app (`KIND = "web"`, `APP`)
+    main.py | app.py    CLI entrypoint (`CLI_ENTRYPOINT`) and/or ASGI app
+                        (`WEB_ENTRYPOINT`, `APP`)
     tests/              optional; pytest runs when test_*.py exists
                         (the scaffold writes tests/test_scaffold.py)
     AGENTS.md           the full loop for the model; covers CLI and web
 ```
 
 `SKILL.md` frontmatter is `name` + `description`; the body is instructions. `deploy.py` is the
-machine-readable contract: literal `KIND` (`"cli"`/`"web"`), `ENTRYPOINT`, optional `APP`,
-`DATA` (`"version"`/`"shared"`), a literal `SHARES` dict of folder → `ro`/`rw` requests, plus an
+machine-readable contract: literal `KIND` (`"cli"`, `"web"`, or a list of both), the matching
+`CLI_ENTRYPOINT`/`WEB_ENTRYPOINT`, optional `APP`, `DATA` (`"version"`/`"shared"`), a literal
+`SHARES` dict of folder → `ro`/`rw` requests, plus an
 optional pydantic `Env` model whose fields declare operator-set variables. `core.parse_deploy_py`
 parses it with `ast` (no import, no execution);
 supported annotations are `str`, `int`, `float`, `bool` (unknown → `str`), and `Field(...)` may
 add `description`, `min_length`, `max_length`, `ge`, `le`. A field without a default is required.
-Frontmatter `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is refused with a migration error.
+Frontmatter `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is refused with a migration error;
+a deploy.py `ENTRYPOINT` is refused in favor of `CLI_ENTRYPOINT`/`WEB_ENTRYPOINT`. A hybrid
+(`KIND = ["cli", "web"]`) must declare both entrypoints.
 Env names are validated by `valid_env_name`; runtime-owned names (`PATH`, `HOME`, `CAPFORGE_*`,
 `PYTHON*`, `LD_*`, `UV_*`, …) are refused.
 

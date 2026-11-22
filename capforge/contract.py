@@ -23,11 +23,13 @@ into the server draft and promoted. There is no manual promote/test/install tool
 
     <name>/
         SKILL.md            name, description and instructions; no deployment fields
-        deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA, SHARES and Env
+        deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT, WEB_ENTRYPOINT,
+                            APP, DATA, SHARES and Env
         pyproject.toml      dependencies; requires-python = ">=3.14,<3.15"
         uv.lock             committed; `uv sync --frozen` is the only install path
         .python-version     3.14
-        main.py | app.py    entrypoint (`ENTRYPOINT`), ASGI object (`APP` for web)
+        main.py | app.py    CLI entrypoint (`CLI_ENTRYPOINT`) and/or ASGI app
+                            (`WEB_ENTRYPOINT`, `APP`)
         tests/              pytest; the dev group also has pytest-cov
         AGENTS.md           the loop, for the model
 
@@ -39,14 +41,21 @@ Add dependencies with `uv add` in the clone and commit the updated `uv.lock`. `u
 `deploy.py` is the machine-readable deployment descriptor. Capforge parses it statically (it never
 imports capability code), so keep the assignments literal:
 
-    KIND = "cli"            # "cli" or "web"
-    ENTRYPOINT = "main.py"  # app.py for web
-    DATA = "version"        # "version" or "shared"
-    APP = "app"             # web only; the ASGI object
-    SHARES = {              # cross-capability volumes; operator approval required
-        "datasets": "ro",   # read-only
-        "cache": "rw",      # read-write
+    KIND = ["cli"]                 # "cli", "web", or ["cli", "web"]
+    CLI_ENTRYPOINT = "main.py"     # required when KIND includes "cli"
+    WEB_ENTRYPOINT = "app.py"      # required when KIND includes "web"
+    DATA = "version"               # "version" or "shared"
+    APP = "app"                    # web only; the ASGI object
+    SHARES = {                     # cross-capability volumes; approval required
+        "datasets": "ro",          # read-only
+        "cache": "rw",             # read-write
     }
+
+`KIND` lists the surfaces the capability exposes. A CLI capability has
+`CLI_ENTRYPOINT`, a web capability has `WEB_ENTRYPOINT` and `APP`, and a hybrid
+lists both modes and declares both entrypoints. `KIND` and the declared
+entrypoints must agree. `ENTRYPOINT` was renamed: use `CLI_ENTRYPOINT` or
+`WEB_ENTRYPOINT`.
 
 `DATA = "shared"` is durable data owned by this capability. `SHARES` is different: it requests
 access to operator-owned folders that other capabilities may also use. See "Shared folders".
@@ -138,17 +147,19 @@ at import time or in a test.
    one. The environment is filtered otherwise; index settings are visible only to uv.
 5. Be fast. Calls time out (CAPFORGE_RUN_TIMEOUT, default 120s).
 6. Be deterministic. Same args plus the same data directory should give the same result.
-7. Leave nothing running. A resident service is `KIND = "web"` served with `serve_capability`.
+7. Leave nothing running. A resident service lists `"web"` in `KIND` and is served with
+   `serve_capability`.
 8. Filesystem access is confined by Landlock: own code/venv/system read, own data read/write,
    approved share folders only, everything else denied. Network/CPU/memory are not confined.
 
 ## Web capabilities
 
-`KIND = "web"` in `deploy.py` turns the project into a long-lived HTTP service. Put `fastapi`,
-`uvicorn` and `httpx` in `[project].dependencies`; `uvicorn` is required. `ENTRYPOINT = "app.py"`
+A `KIND` that includes `"web"` turns the project into a long-lived HTTP service. Put `fastapi`,
+`uvicorn` and `httpx` in `[project].dependencies`; `uvicorn` is required. `WEB_ENTRYPOINT = "app.py"`
 names the ASGI module; `APP` selects the object (default `app`). After promotion,
 `serve_capability` boots the active tag at `/cap/<name>/`; a promotion does not restart it until
-`restart`.
+`restart`. A hybrid (`KIND = ["cli", "web"]`) still exposes both surfaces: `run_capability` uses
+`CLI_ENTRYPOINT`, `serve_capability` uses `WEB_ENTRYPOINT`.
 
 The server boots the app with uvicorn `--root-path /cap/<name>` and exports
 `CAPFORGE_ROOT_PATH`. Do not pass `root_path=` to `FastAPI(...)`; it is deprecated. Use
@@ -173,7 +184,7 @@ directory; you work in a clone, commit, and push. There is no shared terminal mo
 
 1. `get_contract()` once.
 2. `list_capabilities()` for names, active tags and repository URLs.
-3. `scaffold_capability(name, description)`; pass `kind="web"` for an HTTP service.
+3. `scaffold_capability(name, description)`; pass `kind="web"` or `kind="both"` for an HTTP service.
 4. `staging(name, action="token")` returns a short-lived token, `git_url`, `basic_username` and
    `auth: "basic"`.
 5. Clone the repository and work in that clone. Use Basic auth with username `basic_username` and
@@ -189,11 +200,12 @@ Promotion is automatic on a green pipeline. `install_packages`, `test_capability
 ## Layout
 
     SKILL.md            name, description and instructions; no deployment fields
-    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA, SHARES and Env
+    deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT, WEB_ENTRYPOINT,
+                        APP, DATA, SHARES and Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
-    main.py | app.py    CLI entrypoint / ASGI app
+    main.py | app.py    CLI entrypoint and/or ASGI app
     tests/              pytest; dev group also has pytest-cov
     AGENTS.md           this file
 
@@ -202,14 +214,21 @@ Promotion is automatic on a green pipeline. `install_packages`, `test_capability
 `deploy.py` is the machine-readable contract. Capforge parses it statically, so keep the
 assignments literal:
 
-    KIND = "cli"            # "cli" or "web"
-    ENTRYPOINT = "main.py"  # app.py for web
-    DATA = "version"        # "version" or "shared"
-    APP = "app"             # web only; the ASGI object
-    SHARES = {              # cross-capability volumes; operator approval required
-        "datasets": "ro",   # read-only
-        "cache": "rw",      # read-write
+    KIND = ["cli"]                 # "cli", "web", or ["cli", "web"]
+    CLI_ENTRYPOINT = "main.py"     # required when KIND includes "cli"
+    WEB_ENTRYPOINT = "app.py"      # required when KIND includes "web"
+    DATA = "version"               # "version" or "shared"
+    APP = "app"                    # web only; the ASGI object
+    SHARES = {                     # cross-capability volumes; approval required
+        "datasets": "ro",          # read-only
+        "cache": "rw",             # read-write
     }
+
+`KIND` lists the surfaces the capability exposes. A CLI capability has
+`CLI_ENTRYPOINT`, a web capability has `WEB_ENTRYPOINT` and `APP`, and a hybrid
+lists both modes and declares both entrypoints. `KIND` and the declared
+entrypoints must agree. `ENTRYPOINT` was renamed: use `CLI_ENTRYPOINT` or
+`WEB_ENTRYPOINT`.
 
 `DATA = "shared"` is durable data owned by this capability. `SHARES` is different: it requests
 access to operator-owned folders that other capabilities may also use. See "Shared folders".
@@ -237,10 +256,11 @@ must never commit them.
 
 ## Web
 
-`KIND = "web"` requires `uvicorn` in `[project].dependencies` and an ASGI object
-(`ENTRYPOINT = "app.py"`, `APP = "app"`). After promotion,
+`KIND` including `"web"` requires `uvicorn` in `[project].dependencies` and an ASGI object
+(`WEB_ENTRYPOINT = "app.py"`, `APP = "app"`). After promotion,
 `serve_capability(name, action="start")` exposes it at `/cap/<name>/`. A later promotion does not
 restart it; use `restart`. Validate every request: anyone who can reach the proxy is a caller.
+A hybrid also keeps the CLI contract on `CLI_ENTRYPOINT`.
 
 The server boots uvicorn with `--root-path /cap/<name>` and exports `CAPFORGE_ROOT_PATH`. Do not
 pass `root_path=` to `FastAPI(...)`; it is deprecated. Read the env value if code needs the
@@ -292,7 +312,8 @@ pointer without touching the draft or repository. The push pipeline is the only 
 - No network by default; declare a real need in `SKILL.md`.
 - Be fast: calls time out (default 120s).
 - Be deterministic for `DATA = "version"`: same args plus the same data, same result.
-- Leave nothing running; a resident service is `KIND = "web"` served with `serve_capability`.
+- Leave nothing running; a resident service lists `"web"` in `KIND` and is served with
+  `serve_capability`.
 - Landlock confines filesystem access to your code/venv, system libraries, your data dirs and
   approved share folders; network/CPU/memory are not confined.
 """

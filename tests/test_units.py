@@ -65,19 +65,30 @@ def _skill(path, description: str = "d") -> None:
 def _deploy(
     path,
     *,
-    kind: str = "cli",
-    entrypoint: str = "main.py",
+    kind: str | list[str] = "cli",
+    cli_entrypoint: str | None = None,
+    web_entrypoint: str | None = None,
     app: str | None = None,
     data: str = "version",
     env: str = "",
     shares: str | None = None,
 ) -> None:
+    modes = [kind] if isinstance(kind, str) else list(kind)
+    if "cli" in modes and cli_entrypoint is None:
+        cli_entrypoint = "main.py"
+    if "web" in modes and web_entrypoint is None:
+        web_entrypoint = "app.py"
+    kind_literal = f'"{kind}"' if isinstance(kind, str) else str(modes).replace("'", '"')
     lines = ["from pydantic import BaseModel", "", "", "class Env(BaseModel):"]
     if env:
         lines.extend(f"    {line}" for line in env.strip().splitlines())
     else:
         lines.append("    pass")
-    lines.extend(["", "", f'KIND = "{kind}"', f'ENTRYPOINT = "{entrypoint}"'])
+    lines.extend(["", "", f"KIND = {kind_literal}"])
+    if cli_entrypoint is not None:
+        lines.append(f'CLI_ENTRYPOINT = "{cli_entrypoint}"')
+    if web_entrypoint is not None:
+        lines.append(f'WEB_ENTRYPOINT = "{web_entrypoint}"')
     if app is not None:
         lines.append(f'APP = "{app}"')
     lines.append(f'DATA = "{data}"')
@@ -90,19 +101,34 @@ def test_kind_parsing_and_validation(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()
     (cap / "app.py").write_text("app = None\n", encoding="utf-8")
+    (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
     (cap / "pyproject.toml").write_text(
         '[project]\nname="demo"\nversion="0.1.0"\nrequires-python=">=3.14,<3.15"\ndependencies=["uvicorn"]\n',
         encoding="utf-8",
     )
     _skill(cap)
-    _deploy(cap, kind="web", entrypoint="app.py")
+    _deploy(cap, kind="web", web_entrypoint="app.py")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.kind == "web"
+    assert loaded.modes == ("web",)
+    assert loaded.runs_cli is False
+    assert loaded.serves_web is True
+    assert loaded.web_entrypoint == "app.py"
+    assert loaded.cli_entrypoint is None
     assert loaded.app_name == "app"
     assert loaded.error is None
 
-    _deploy(cap, kind="worker", entrypoint="app.py")
-    assert "kind must be one of" in core.load_capability_at("demo", cap).error
+    _deploy(cap, kind=["cli", "web"])
+    loaded = core.load_capability_at("demo", cap)
+    assert loaded.kind == "both"
+    assert loaded.modes == ("cli", "web")
+    assert loaded.runs_cli is True and loaded.serves_web is True
+    assert loaded.cli_entrypoint == "main.py"
+    assert loaded.web_entrypoint == "app.py"
+    assert loaded.error is None
+
+    _deploy(cap, kind="worker", web_entrypoint="app.py")
+    assert "KIND entries must be one of" in core.load_capability_at("demo", cap).error
 
 
 def test_web_requires_uvicorn(tmp_path):
@@ -110,7 +136,7 @@ def test_web_requires_uvicorn(tmp_path):
     cap.mkdir()
     (cap / "app.py").write_text("app = None\n", encoding="utf-8")
     _skill(cap)
-    _deploy(cap, kind="web", entrypoint="app.py")
+    _deploy(cap, kind="web", web_entrypoint="app.py")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "uvicorn" in loaded.error
@@ -125,7 +151,7 @@ def test_web_rejects_non_identifier_app(tmp_path):
         encoding="utf-8",
     )
     _skill(cap)
-    _deploy(cap, kind="web", entrypoint="app.py", app="bad name")
+    _deploy(cap, kind="web", web_entrypoint="app.py", app="bad name")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "identifier" in loaded.error
@@ -133,7 +159,9 @@ def test_web_rejects_non_identifier_app(tmp_path):
 
 def test_web_child_carries_the_public_root_path(tmp_path, monkeypatch):
     monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
-    cap = core.Capability(name="demo", path=tmp_path, kind="web", app_name="app")
+    cap = core.Capability(
+        name="demo", path=tmp_path, kind="web", web_entrypoint="app.py", app_name="app"
+    )
     argv = core.web_child_argv(cap, tmp_path, 1234)
     assert argv[argv.index("--root-path") + 1] == "/cap/demo"
     env = core.web_child_env(cap, tag="v1", venv=tmp_path, port=1234)
@@ -173,8 +201,8 @@ def test_deploy_py_parses_typed_env_fields():
         "    RATIO: float = 0.5\n"
         "    OPTIONAL: str | None = None\n"
         "    RAW: bytes\n\n"
-        'KIND = "cli"\n'
-        'ENTRYPOINT = "main.py"\n'
+        'KIND = ["cli"]\n'
+        'CLI_ENTRYPOINT = "main.py"\n'
     )
     by_name = {item.name: item for item in spec.env}
     assert by_name["API_KEY"].type == "str"
@@ -193,23 +221,67 @@ def test_deploy_py_parses_typed_env_fields():
 
 def test_deploy_py_rejects_bad_input():
     with pytest.raises(core.CapError):
-        core.parse_deploy_py("KIND = os.environ['KIND']\nENTRYPOINT = 'main.py'\n")
+        core.parse_deploy_py("KIND = os.environ['KIND']\nCLI_ENTRYPOINT = 'main.py'\n")
     with pytest.raises(core.CapError):
         core.parse_deploy_py("def broken(:\n")
     with pytest.raises(core.CapError):
-        core.parse_deploy_py('ENTRYPOINT = "main.py"\n')
+        core.parse_deploy_py('CLI_ENTRYPOINT = "main.py"\n')
     with pytest.raises(core.CapError):
         core.parse_deploy_py('KIND = "cli"\n')
     with pytest.raises(core.CapError):
-        core.parse_deploy_py('KIND = "cli"\nENTRYPOINT = "main.py"\nDATA = "forever"\n')
-    with pytest.raises(core.CapError):
         core.parse_deploy_py(
-            'KIND = "cli"\nENTRYPOINT = "main.py"\nclass Env:\n    PATH: str\n'
+            'KIND = "cli"\nCLI_ENTRYPOINT = "main.py"\nDATA = "forever"\n'
         )
     with pytest.raises(core.CapError):
         core.parse_deploy_py(
-            'KIND = "cli"\nENTRYPOINT = "main.py"\nclass Env:\n    KEY: str\n    KEY: int\n'
+            'KIND = "cli"\nCLI_ENTRYPOINT = "main.py"\nclass Env:\n    PATH: str\n'
         )
+    with pytest.raises(core.CapError):
+        core.parse_deploy_py(
+            'KIND = "cli"\nCLI_ENTRYPOINT = "main.py"\n'
+            "class Env:\n    KEY: str\n    KEY: int\n"
+        )
+
+
+def test_deploy_py_requires_mode_entrypoints():
+    with pytest.raises(core.CapError, match="ENTRYPOINT was renamed"):
+        core.parse_deploy_py('KIND = "cli"\nENTRYPOINT = "main.py"\n')
+    with pytest.raises(core.CapError, match="CLI_ENTRYPOINT is missing"):
+        core.parse_deploy_py('KIND = ["cli"]\n')
+    with pytest.raises(core.CapError, match="WEB_ENTRYPOINT is missing"):
+        core.parse_deploy_py('KIND = ["web"]\n')
+    with pytest.raises(core.CapError, match="CLI_ENTRYPOINT is set"):
+        core.parse_deploy_py(
+            'KIND = ["web"]\nWEB_ENTRYPOINT = "app.py"\nCLI_ENTRYPOINT = "main.py"\n'
+        )
+    with pytest.raises(core.CapError, match="WEB_ENTRYPOINT is set"):
+        core.parse_deploy_py('KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\n'
+                             'WEB_ENTRYPOINT = "app.py"\n')
+    with pytest.raises(core.CapError, match="APP is only valid"):
+        core.parse_deploy_py('KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\nAPP = "app"\n')
+    with pytest.raises(core.CapError, match="more than once"):
+        core.parse_deploy_py('KIND = ["cli", "cli"]\nCLI_ENTRYPOINT = "main.py"\n')
+    with pytest.raises(core.CapError, match="at least one"):
+        core.parse_deploy_py("KIND = []\n")
+    with pytest.raises(core.CapError, match="KIND entries"):
+        core.parse_deploy_py('KIND = ["worker"]\n')
+
+
+def test_deploy_py_parses_both_modes():
+    spec = core.parse_deploy_py(
+        'from pydantic import BaseModel\n'
+        "class Env(BaseModel):\n    pass\n"
+        'KIND = ["cli", "web"]\n'
+        'CLI_ENTRYPOINT = "main.py"\n'
+        'WEB_ENTRYPOINT = "app.py"\n'
+        'APP = "server"\n'
+    )
+    assert spec.kind == "both"
+    assert spec.modes == ("cli", "web")
+    assert spec.runs_cli and spec.serves_web
+    assert spec.cli_entrypoint == "main.py"
+    assert spec.web_entrypoint == "app.py"
+    assert spec.app_name == "server"
 
 
 def test_execute_refuses_web_capabilities(tmp_path, monkeypatch):
@@ -674,7 +746,7 @@ def test_entrypoint_cannot_escape_the_capability(tmp_path):
     cap.mkdir()
     (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
     _skill(cap)
-    _deploy(cap, entrypoint="../escape.py")
+    _deploy(cap, cli_entrypoint="../escape.py")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "escapes" in loaded.error
@@ -684,7 +756,7 @@ def test_absolute_entrypoint_is_rejected(tmp_path):
     cap = tmp_path / "demo"
     cap.mkdir()
     _skill(cap)
-    _deploy(cap, entrypoint="/etc/passwd")
+    _deploy(cap, cli_entrypoint="/etc/passwd")
     loaded = core.load_capability_at("demo", cap)
     assert loaded.error is not None
     assert "escapes" in loaded.error
@@ -1071,21 +1143,21 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
 
 def test_deploy_py_parses_and_validates_shares():
     spec = core.parse_deploy_py(
-        'KIND = "cli"\nENTRYPOINT = "main.py"\n'
+        'KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\n'
         'SHARES = {"datasets": "ro", "index-cache": "rw"}\n'
     )
     assert [(item.name, item.access) for item in spec.shares] == [
         ("datasets", "ro"),
         ("index-cache", "rw"),
     ]
-    empty = core.parse_deploy_py('KIND = "cli"\nENTRYPOINT = "main.py"\n')
+    empty = core.parse_deploy_py('KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\n')
     assert empty.shares == ()
     for text in (
-        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = ["datasets"]\n',
-        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = {"Bad": "ro"}\n',
-        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = {"datasets": "write"}\n',
-        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = {"x": "ro", " x ": "rw"}\n',
-        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = get_shares()\n',
+        'KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\nSHARES = ["datasets"]\n',
+        'KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\nSHARES = {"Bad": "ro"}\n',
+        'KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\nSHARES = {"datasets": "write"}\n',
+        'KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\nSHARES = {"x": "ro", " x ": "rw"}\n',
+        'KIND = ["cli"]\nCLI_ENTRYPOINT = "main.py"\nSHARES = get_shares()\n',
     ):
         with pytest.raises(core.CapError):
             core.parse_deploy_py(text)
