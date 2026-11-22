@@ -1,6 +1,6 @@
 # Next
 
-Known limitations and deliberately deferred work for capforge 0.6.0. The design and current
+Known limitations and deliberately deferred work for capforge 0.7.0. The design and current
 guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Open items
@@ -39,16 +39,22 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `<state>/secrets/`; there is no at-rest encryption, rotation history, reveal or deletion
   workflow beyond the console. They are per capability and shared across tags, so a promoted push
   can read them at runtime. See `docs/ARCHITECTURE.md` §10.
-- **Shared data.** `DATA = "shared"` is unversioned and unsynchronized. Overlapping CLI calls and a
-  served web child can race; the capability must use SQLite/locks. Backups are the operator's job.
+- **Shared data.** `DATA = "shared"` and operator-approved `SHARES` folders are unversioned and
+  unsynchronized. Overlapping CLI calls and a served web child can race; the capability must use
+  SQLite/locks. Backups are the operator's job. There are no quotas, no automatic orphan-folder
+  cleanup, no restore workflow, and no per-tag grants.
+- **Shared-folder approvals.** Grants are per capability and survive promotions. There is no
+  approval history beyond the stored timestamp, no expiry, and no read-only token scope. Revoking
+  a grant restarts a desired-running web child but does not kill an in-flight CLI run.
 - **Logs.** One rotated generation per pipeline/scaffold; served child logs rotate at 5 MB. The
   console exposes bounded tails, but there is no log shipping or history.
 - **Console and capability origin.** `/ui`, `/api`, `/git` and `/cap` share the web listener. A
   served web capability's JavaScript can call the console API with the operator's session; the
   proxy strips cookies/headers, but same-origin isolation requires serving `/cap` on a different
   origin at the reverse proxy. Splitting the built-in listeners is deliberately deferred.
-- **Console.** The React bundle is served under `/ui/` and uses relative `/api` calls. It is not
-  covered by a browser test; route/asset behaviour is tested through ASGI.
+- **Console.** The React + shadcn bundle is served under `/ui/` and uses relative `/api` calls. It is
+  not covered by an automated browser test; route/asset behaviour and the share API are tested
+  through ASGI, with manual `agent-browser` smoke checks.
 - **Multi-replica.** State, locks and repos assume one host and a local filesystem. A shared
   state/lock backend is out of scope.
 - **Docker.** The image targets a modern kernel for Landlock. Old kernels require

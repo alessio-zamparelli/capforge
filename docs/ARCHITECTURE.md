@@ -1,6 +1,6 @@
 # Architecture
 
-Status: describes capforge **0.6.0**, the git-authored architecture. If code and this document
+Status: describes capforge **0.7.0**, the git-authored architecture. If code and this document
 disagree, the code wins; update this file in the same change.
 
 Related: [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),
@@ -107,9 +107,10 @@ The managed `pre-receive` hook checks the pipeline lock and the ref policy. It i
 non-HTTP local push; the route is authoritative for HTTP.
 
 Deletion is explicit: `delete_capability(name, confirm)` requires `confirm == name`, refuses while
-a push/pipeline is running, stops a served instance, and removes the draft, versions, venvs, data
-(including shared), repo, state, staging, logs, locks and token records. `capforge delete` is the
-operator equivalent.
+a push/pipeline is running, stops a served instance, and removes the draft, versions, venvs, its own
+data (including `DATA = "shared"`), repo, state, staging, logs, locks and token records. It revokes
+the capability's grants in cross-capability shared folders but keeps those folders and their data.
+`capforge delete` is the operator equivalent.
 
 ## 6. Pipeline
 
@@ -121,9 +122,9 @@ received -> extracting -> validating -> testing -> promoted | unchanged | failed
   guards: no symlinks/hardlinks/devices, no absolute/`..` members, no `.git`/`.venv`/
   `__pycache__`, bounded members/bytes/path length.
 - **Validating.** `SKILL.md` (name/description), `deploy.py`, `pyproject.toml`, `uv.lock`,
-  `.python-version`, entrypoint containment, `KIND`, optional `DATA`/`APP` and the `Env` model.
-  `deploy.py` is parsed with `ast`, never imported. Legacy frontmatter `kind`/`entrypoint`/`app`/
-  `data`/`env`/`packages` is rejected with a migration message.
+  `.python-version`, entrypoint containment, `KIND`, optional `DATA`/`APP`/`SHARES` and the `Env`
+  model. `deploy.py` is parsed with `ast`, never imported. Legacy frontmatter
+  `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is rejected with a migration message.
 - **Testing.** `uv sync --frozen --group dev` into the test venv, pytest with capability coverage,
   then a prod smoke run (or web boot probe). Red leaves the draft/active untouched.
 - **Swapping/promoting.** One `cap_lock` critical section: verify hash, archive old draft with
@@ -148,9 +149,14 @@ and runs one subprocess:
   `<state>/secrets/<name>.json`; optional fields fall back to their declared default, and only the
   active tag receives real values;
 - `CAPFORGE_DATA_DIR` per version, `CAPFORGE_SHARED_DATA_DIR` when `DATA = "shared"`,
-  `CAPFORGE_VERSION`, venv-first `PATH`;
+  `CAPFORGE_SHARES` for approved shared volumes, `CAPFORGE_VERSION`, venv-first `PATH`;
 - hard timeout on the process group; the group is killed after wait; detached strays are swept;
-- Landlock allowlist for filesystem access.
+- Landlock allowlist for filesystem access, including `ro` shares as read and `rw` shares as write.
+
+`SHARES` is a request list, not authorization. Resolution reads `<state>/state/shares.json`; a
+missing grant or a grant that differs from the request fails the run/serve closed. Tests and the web boot
+probe get fresh empty temporary share directories with the requested access, so pipeline logs never
+expose production shared data.
 
 A draft is used only before the first promotion, with a warning. Web capabilities are refused by
 `run_capability` and served instead. Tests and the web boot probe receive the declared default or a
@@ -170,6 +176,10 @@ scope instead.
 - `DATA = "shared"` adds `CAPFORGE_SHARED_DATA_DIR=<state>/data/<name>/shared/`: stable across tags,
   not pruned or snapshotted, not in `tree_hash`. The capability owns concurrency, migrations and
   backup expectations.
+- `SHARES` grants access to named, operator-owned folders under `<state>/shares/<name>/`. Grants
+  are per capability, shared across its tags, and fixed at spawn for a web child. `ro` is read-only
+  in Landlock; `rw` permits create/update/delete. The hub does not synchronize shared data, so the
+  capability owns locking. A grant removal or change restarts a desired-running web child.
 - Code trees are never data stores. Fixtures/templates committed in the repo are read-only at
   runtime.
 - The model cannot read `<state>`. CLI capabilities return file content/URLs in JSON; web
@@ -183,15 +193,17 @@ scope instead.
 <state>/versions/<name>/<tag>/              immutable snapshot
 <state>/venvs/<name>/<lock_hash>-py314[-test]/
 <state>/data/<name>/<tag>/                  per-version data
-<state>/data/<name>/shared/                 optional durable data
+<state>/data/<name>/shared/                 optional durable data (per capability)
+<state>/shares/<folder>/                    operator-owned cross-capability data
 <state>/state/<name>.json                   active + tags + pruned
+<state>/state/shares.json                   shared-folder census and grants
 <state>/secrets/<name>.json                 operator-set env values (0600)
 <state>/staging/<name>.json                 pipeline state
 <state>/git/<name>.git/                     bare repo
 <state>/logs/<name>/{pipeline,scaffold}.log
 <state>/served/registry.json                web desired state
 <state>/served/<name>/<tag>/server.log
-<state>/locks/                              cap/venv/push/pipeline locks
+<state>/locks/                              cap/venv/push/pipeline/share locks
 ```
 
 State writes are atomic; corrupt files are quarantined. Tags are immutable; the active tag is never
@@ -216,9 +228,14 @@ history and state plus `refs/capforge/processed` is the promotion record.
   injected only into its active run/serve process. Capability code can read what it is given at
   runtime, so this is a trust boundary around the operator-provided values, not a sandbox around
   model-authored code.
+- Shared grants are operator-only. Capability code can request a folder in `deploy.py` but has no
+  path to approve itself: `/api/shares` and `/api/caps/{name}/shares/{folder}` require the console
+  session and CSRF, and no MCP tool exposes them. All grantees can read all contents; `rw` is
+  mutual trust because any grantee can modify or delete data. Symlinks inside a share cannot escape
+  Landlock because rules are path-beneath and resolved at access time.
 - Landlock (`CAPFORGE_SANDBOX=require`) denies state, tokens, other capabilities, home, `/proc`,
-  `/sys`, `/tmp` and anything else not explicitly allowed. It is filesystem-only; network, CPU,
-  memory and ptrace are not confined.
+  `/sys`, `/tmp` and anything else not explicitly allowed, apart from the exact approved share
+  folders. It is filesystem-only; network, CPU, memory and ptrace are not confined.
 - Git packfiles are untrusted. `git http-backend` runs with a sanitized env, `fsckObjects`,
   `maxInputSize`, a hard timeout and a process-group kill. Keep git current.
 - `uv sync` executes third-party build backends. Sources are restricted; it runs with the install
@@ -227,10 +244,10 @@ history and state plus `refs/capforge/processed` is the promotion record.
 
 ## 11. Tests
 
-- `test_units.py` fast: parsing/state/hashes, routes, console auth, sandbox policy, ten tools, UI
-  mount.
+- `test_units.py` fast: parsing/state/hashes, share registry and census, routes, console auth,
+  sandbox policy, ten tools, UI mount.
 - `test_lifecycle.py` slow: scaffold, uv env, promote/rollback, push pipeline (green/red), data
-  isolation/shared data, Landlock denial, prune.
+  isolation/shared data, cross-capability `ro`/`rw` grants and Landlock denial, prune.
 - `test_web.py` slow: real uvicorn children, `/cap` proxy, restart/prune/restore, process-group
   kills, console.
 - CI/DoD: full suite with coverage floor 71% (measured 72.38%), ruff, mypy, ten-tool surface.

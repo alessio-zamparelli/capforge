@@ -71,6 +71,7 @@ class Env(BaseModel):
 KIND = "cli"
 ENTRYPOINT = "main.py"
 DATA = "version"
+# SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
 '''
 
 DEPLOY_WEB = '''\
@@ -91,6 +92,7 @@ KIND = "web"
 ENTRYPOINT = "app.py"
 APP = "app"
 DATA = "version"
+# SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
 '''
 
 TEST = '''\

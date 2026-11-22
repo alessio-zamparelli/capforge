@@ -72,6 +72,51 @@ export interface EnvChange {
   env: EnvInfo[];
 }
 
+export type ShareAccess = "ro" | "rw";
+
+export interface ShareStatus {
+  name: string;
+  requested: ShareAccess | null;
+  access: ShareAccess | null;
+  state: "pending" | "approved" | "unused";
+  approved_at: number | null;
+  weaker: boolean;
+}
+
+export interface ShareGrant {
+  cap: string;
+  access: ShareAccess;
+  approved_at: number;
+}
+
+export interface ShareRequest {
+  cap: string;
+  requested: ShareAccess | null;
+  access: ShareAccess | null;
+  state: "pending" | "approved" | "unused";
+  approved_at: number | null;
+}
+
+export interface ShareFolder {
+  name: string;
+  path: string;
+  exists: boolean;
+  created_at: number;
+  note: string;
+  size_bytes: number;
+  size_truncated: boolean;
+  grants: ShareGrant[];
+  requests: ShareRequest[];
+}
+
+export interface ShareChange {
+  ok: boolean;
+  restarted?: boolean;
+  restart_error?: string;
+  shares?: ShareStatus[];
+  folders?: ShareFolder[];
+}
+
 export interface CapInfo {
   name: string;
   description: string;
@@ -82,6 +127,7 @@ export interface CapInfo {
   draft_changed: boolean;
   served: ServedInfo | null;
   env: EnvInfo[];
+  shares: ShareStatus[];
 }
 
 export interface TagInfo {
@@ -190,4 +236,64 @@ export async function clearEnv(name: string, key: string): Promise<EnvChange> {
       { method: "DELETE", headers: { "X-CSRF": "1" } }
     )
   )) as EnvChange;
+}
+
+export async function shares(): Promise<ShareFolder[]> {
+  const body = (await jsonOrThrow(await fetch("../api/shares"))) as {
+    folders: ShareFolder[];
+  };
+  return body.folders;
+}
+
+export async function createShare(name: string, note: string): Promise<ShareChange> {
+  return (await jsonOrThrow(
+    await fetch("../api/shares", {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ name, note }),
+    })
+  )) as ShareChange;
+}
+
+export async function deleteShare(name: string, confirm: string): Promise<ShareChange> {
+  return (await jsonOrThrow(
+    await fetch(`../api/shares/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ confirm }),
+    })
+  )) as ShareChange;
+}
+
+export async function capShares(name: string): Promise<ShareStatus[]> {
+  const body = (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/shares`)
+  )) as { shares: ShareStatus[] };
+  return body.shares;
+}
+
+export async function approveShare(
+  name: string,
+  folder: string,
+  access: ShareAccess
+): Promise<ShareChange> {
+  return (await jsonOrThrow(
+    await fetch(
+      `../api/caps/${encodeURIComponent(name)}/shares/${encodeURIComponent(folder)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json", "X-CSRF": "1" },
+        body: JSON.stringify({ access }),
+      }
+    )
+  )) as ShareChange;
+}
+
+export async function revokeShare(name: string, folder: string): Promise<ShareChange> {
+  return (await jsonOrThrow(
+    await fetch(
+      `../api/caps/${encodeURIComponent(name)}/shares/${encodeURIComponent(folder)}`,
+      { method: "DELETE", headers: { "X-CSRF": "1" } }
+    )
+  )) as ShareChange;
 }

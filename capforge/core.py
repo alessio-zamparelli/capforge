@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +29,10 @@ log = logging.getLogger("capforge")
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Operator-owned shared volumes. Shorter and stricter than capability names so a
+# share name is always one safe path component.
+SHARE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+SHARE_ACCESS = ("ro", "rw")
 # Operator-managed environment names declared by the Env model in deploy.py.
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 # Legacy pip requirement syntax. Kept only for parsing old frontmatter and rejecting it.
@@ -77,6 +81,7 @@ ENV_RESERVED = frozenset(
         "CAPFORGE_VERSION",
         "CAPFORGE_DATA_DIR",
         "CAPFORGE_SHARED_DATA_DIR",
+        "CAPFORGE_SHARES",
         "CAPFORGE_SERVE_PORT",
         "CAPFORGE_PUBLIC_URL",
         "CAPFORGE_SERVE",
@@ -86,6 +91,8 @@ ENV_RESERVED = frozenset(
 ENV_RESERVED_PREFIXES = ("CAPFORGE_", "PYTHON", "LD_", "UV_")
 MAX_ENV_VARS = 32
 MAX_ENV_VALUE_BYTES = 16 * 1024
+MAX_SHARE_NOTE = 500
+MAX_SHARE_ENTRIES = 20_000
 # Tests and the web boot probe never receive real values; declared names get this
 # obvious placeholder so imports/settings objects still work without leaking secrets
 # into model-visible pipeline logs.
@@ -311,6 +318,24 @@ class EnvSpec:
     le: float | None = None
 
 
+@dataclass(frozen=True)
+class ShareSpec:
+    """One requested cross-capability shared volume from deploy.py."""
+
+    name: str
+    access: str = "ro"
+
+
+@dataclass(frozen=True)
+class ShareMount:
+    """A resolved share: the exact path handed to Landlock and the capability env."""
+
+    name: str
+    path: Path
+    access: str
+    requested: str = ""
+
+
 @dataclass
 class DeploySpec:
     """The deployment descriptor read from deploy.py."""
@@ -320,6 +345,7 @@ class DeploySpec:
     app_name: str = "app"
     data: str = "version"
     env: list[EnvSpec] = field(default_factory=list)
+    shares: tuple[ShareSpec, ...] = ()
 
 
 def _node_name(node: ast.AST) -> str:
@@ -363,6 +389,41 @@ def _literal_value(node: ast.AST, label: str) -> Any:
         return ast.literal_eval(node)
     except (ValueError, SyntaxError):
         raise CapError(f"deploy.py: {label} must be a literal value") from None
+
+
+def valid_share_name(name: str) -> str:
+    """Validate one shared-volume name; it becomes a single path component."""
+    text = str(name).strip()
+    if not SHARE_RE.match(text):
+        raise CapError(
+            f"Invalid shared folder name {name!r}. Use lowercase letters, digits, '-' and '_', "
+            "starting with a letter (max 64 chars)."
+        )
+    return text
+
+
+def _shares_from_value(value: Any) -> tuple[ShareSpec, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise CapError(
+            'deploy.py: SHARES must be a dict like {"datasets": "ro", "cache": "rw"}'
+        )
+    shares: list[ShareSpec] = []
+    seen: set[str] = set()
+    for raw_name, raw_access in value.items():
+        name = valid_share_name(raw_name if isinstance(raw_name, str) else str(raw_name))
+        if name in seen:
+            raise CapError(f"deploy.py: duplicate SHARES entry {name!r}")
+        seen.add(name)
+        access = str(raw_access).strip().lower() if isinstance(raw_access, str) else ""
+        if access not in SHARE_ACCESS:
+            raise CapError(
+                f"deploy.py: SHARES[{name!r}] must be one of {list(SHARE_ACCESS)}, "
+                f"got {raw_access!r}"
+            )
+        shares.append(ShareSpec(name=name, access=access))
+    return tuple(sorted(shares, key=lambda item: item.name))
 
 
 def _field_value(value: ast.expr | None) -> tuple[bool, Any, dict[str, Any]]:
@@ -422,10 +483,12 @@ def parse_deploy_py(text: str) -> DeploySpec:
         if isinstance(node, ast.Assign):
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 target = node.targets[0].id
-                if target in _DEPLOY_SCALARS:
+                if target in _DEPLOY_SCALARS or target == "SHARES":
                     values[target] = _literal_value(node.value, target)
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            if isinstance(node.target, ast.Name) and node.target.id in _DEPLOY_SCALARS:
+            if isinstance(node.target, ast.Name) and (
+                node.target.id in _DEPLOY_SCALARS or node.target.id == "SHARES"
+            ):
                 values[node.target.id] = _literal_value(node.value, node.target.id)
         elif isinstance(node, ast.ClassDef) and node.name == "Env":
             env_node = node
@@ -476,7 +539,15 @@ def parse_deploy_py(text: str) -> DeploySpec:
             )
     if len(specs) > MAX_ENV_VARS:
         raise CapError(f"env declares {len(specs)} variables; the limit is {MAX_ENV_VARS}.")
-    return DeploySpec(kind=kind, entrypoint=entrypoint, app_name=app_name, data=data, env=specs)
+    shares = _shares_from_value(values.get("SHARES"))
+    return DeploySpec(
+        kind=kind,
+        entrypoint=entrypoint,
+        app_name=app_name,
+        data=data,
+        env=specs,
+        shares=shares,
+    )
 
 
 # ------------------------------------------------------------------------- manifests
@@ -494,6 +565,7 @@ class Capability:
     app_name: str = "app"
     env: list[str] = field(default_factory=list)
     env_specs: list[EnvSpec] = field(default_factory=list)
+    shares: tuple[ShareSpec, ...] = ()
     body: str = ""
     error: str | None = None
 
@@ -575,6 +647,7 @@ def _load_from(name: str, path: Path) -> Capability:
     cap.app_name = spec.app_name
     cap.env_specs = spec.env
     cap.env = [item.name for item in spec.env]
+    cap.shares = spec.shares
     if cap.kind == "web":
         deps = _dependency_names(path)
         if "uvicorn" not in deps:
@@ -899,6 +972,453 @@ def env_status(name: str, caps: Iterable[Capability]) -> list[dict[str, Any]]:
         }
         for key in names
     ]
+
+
+# ------------------------------------------------------------------- shared volumes
+
+
+def shares_root(*, create: bool = True) -> Path:
+    """Root of operator-owned shared volumes; metadata lives under state/."""
+    path = _contained(state_dir(), state_dir() / "shares")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def share_path(name: str, *, create: bool = False) -> Path:
+    """Exact folder for one share. The name is always one safe path component."""
+    safe = valid_share_name(name)
+    root = shares_root()
+    path = _contained(root, root / safe)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+    return path
+
+
+def _share_registry_file() -> Path:
+    return _contained(state_dir(), state_dir() / "state" / "shares.json")
+
+
+def _quarantine_shares(path: Path) -> None:
+    dest = path.with_name(f"{path.stem}.corrupt-{time.time_ns()}{path.suffix}")
+    try:
+        path.replace(dest)
+        log.warning("quarantined corrupt shares registry %s -> %s", path, dest)
+    except OSError:
+        log.exception("could not quarantine corrupt shares registry %s", path)
+
+
+def _clean_share_record(record: Any) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    created = record.get("created_at")
+    note = record.get("note")
+    raw_grants = record.get("grants")
+    grants: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_grants, dict):
+        for raw_cap, raw_grant in raw_grants.items():
+            if not isinstance(raw_cap, str) or not NAME_RE.match(raw_cap):
+                continue
+            if not isinstance(raw_grant, dict):
+                continue
+            access = str(raw_grant.get("access") or "").strip().lower()
+            if access not in SHARE_ACCESS:
+                continue
+            grants[raw_cap] = {
+                "access": access,
+                "approved_at": int(raw_grant.get("approved_at") or 0),
+            }
+    return {
+        "created_at": int(created) if isinstance(created, int) else 0,
+        "note": note[:MAX_SHARE_NOTE] if isinstance(note, str) else "",
+        "grants": grants,
+    }
+
+
+def read_share_registry() -> dict[str, Any]:
+    """Folder census and grants. Reads are lock-free; writes replace atomically."""
+    path = _share_registry_file()
+    empty: dict[str, Any] = {"version": 1, "folders": {}}
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _quarantine_shares(path)
+        return empty
+    raw_folders = data.get("folders") if isinstance(data, dict) else None
+    if not isinstance(raw_folders, dict):
+        _quarantine_shares(path)
+        return empty
+    folders: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_record in raw_folders.items():
+        if not isinstance(raw_name, str) or not SHARE_RE.match(raw_name):
+            continue
+        record = _clean_share_record(raw_record)
+        if record is not None:
+            folders[raw_name] = record
+    return {"version": 1, "folders": folders}
+
+
+def _write_share_registry(data: dict[str, Any]) -> None:
+    path = _share_registry_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def share_lock() -> Iterator[None]:
+    """Serialise share-registry read-modify-write cycles across processes."""
+    with _file_lock(_contained(state_dir(), state_dir() / "locks" / "shares.lock")):
+        yield
+
+
+def _ensure_share_locked(data: dict[str, Any], name: str) -> dict[str, Any]:
+    folders = data.setdefault("folders", {})
+    record = folders.get(name)
+    if not isinstance(record, dict):
+        record = {"created_at": int(time.time()), "note": "", "grants": {}}
+        folders[name] = record
+    record.setdefault("grants", {})
+    share_path(name, create=True)
+    return record
+
+
+def create_share(name: str, note: str = "") -> dict[str, Any]:
+    """Create one operator-owned folder. The console is the only caller."""
+    safe = valid_share_name(name)
+    if not isinstance(note, str):
+        raise CapError("The shared folder note must be a string.")
+    note = note.strip()
+    if len(note) > MAX_SHARE_NOTE:
+        raise CapError(f"The shared folder note is limited to {MAX_SHARE_NOTE} characters.")
+    with share_lock():
+        data = read_share_registry()
+        if safe in data["folders"]:
+            raise CapError(f"Shared folder {safe!r} already exists.")
+        path = share_path(safe, create=True)
+        data["folders"][safe] = {
+            "created_at": int(time.time()),
+            "note": note,
+            "grants": {},
+        }
+        _write_share_registry(data)
+    log.info("share create folder=%s", safe)
+    return {"name": safe, "path": str(path), "created": True, "note": note}
+
+
+def delete_share(name: str, confirm: str) -> dict[str, Any]:
+    """Delete an empty, ungranted folder. Refuses while any grant remains."""
+    safe = valid_share_name(name)
+    if confirm != safe:
+        raise CapError("confirm must equal the shared folder name exactly")
+    with share_lock():
+        data = read_share_registry()
+        record = data["folders"].get(safe)
+        if record is None:
+            raise CapError(f"Shared folder {safe!r} does not exist.")
+        if record.get("grants"):
+            raise CapError(
+                f"Shared folder {safe!r} still has {len(record['grants'])} grant(s); "
+                "revoke them first."
+            )
+        path = share_path(safe)
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise CapError(f"Could not delete shared folder {safe!r}: {exc}") from exc
+        data["folders"].pop(safe, None)
+        _write_share_registry(data)
+    log.info("share delete folder=%s", safe)
+    return {"name": safe, "deleted": True}
+
+
+def set_share_grant(name: str, folder: str, access: str) -> dict[str, Any]:
+    """Approve or update one capability's access. Console-only by construction."""
+    cap = NAME_RE.match(name or "")
+    if not cap:
+        raise CapError(f"Invalid capability name {name!r}.")
+    safe = valid_share_name(folder)
+    if not cap_path(name).is_dir():
+        raise CapError(f"No capability named {name!r} exists.")
+    mode = str(access).strip().lower()
+    if mode not in SHARE_ACCESS:
+        raise CapError(f"access must be one of {list(SHARE_ACCESS)}, got {access!r}")
+    with share_lock():
+        data = read_share_registry()
+        record = data["folders"].get(safe)
+        if record is None:
+            raise CapError(
+                f"Shared folder {safe!r} does not exist. Create it in the console first."
+            )
+        record["grants"][name] = {"access": mode, "approved_at": int(time.time())}
+        _write_share_registry(data)
+        approved_at = record["grants"][name]["approved_at"]
+    log.info("share grant cap=%s folder=%s access=%s", name, safe, mode)
+    return {
+        "name": safe,
+        "cap": name,
+        "access": mode,
+        "approved_at": approved_at,
+        "path": str(share_path(safe)),
+    }
+
+
+def approve_share_request(name: str, folder: str, access: str) -> dict[str, Any]:
+    """Approve a declaration, creating the folder on first approval."""
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
+    if not cap_path(name).is_dir():
+        raise CapError(f"No capability named {name!r} exists.")
+    safe = valid_share_name(folder)
+    with share_lock():
+        data = read_share_registry()
+        _ensure_share_locked(data, safe)
+        _write_share_registry(data)
+    return set_share_grant(name, safe, access)
+
+
+def revoke_share_grant(name: str, folder: str) -> dict[str, Any]:
+    """Remove one grant. Absent grants are not an error."""
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
+    safe = valid_share_name(folder)
+    with share_lock():
+        data = read_share_registry()
+        record = data["folders"].get(safe)
+        removed = False
+        if record is not None:
+            removed = record["grants"].pop(name, None) is not None
+            if removed:
+                _write_share_registry(data)
+    log.info("share revoke cap=%s folder=%s removed=%s", name, safe, removed)
+    return {"name": safe, "cap": name, "revoked": removed}
+
+
+def revoke_all_grants(name: str) -> int:
+    """Drop every grant for a deleted capability; keep the folders and data."""
+    if not NAME_RE.match(name or ""):
+        raise CapError(f"Invalid capability name {name!r}.")
+    removed = 0
+    with share_lock():
+        data = read_share_registry()
+        for record in data["folders"].values():
+            if record["grants"].pop(name, None) is not None:
+                removed += 1
+        if removed:
+            _write_share_registry(data)
+    if removed:
+        log.info("share revoke-all cap=%s removed=%d", name, removed)
+    return removed
+
+
+def approved_shares(name: str) -> dict[str, dict[str, Any]]:
+    """Grants for one capability, keyed by folder. Shared across its tags."""
+    data = read_share_registry()
+    return {
+        folder: dict(record["grants"][name])
+        for folder, record in data["folders"].items()
+        if name in record.get("grants", {})
+    }
+
+
+def share_status(name: str, caps: Iterable[Capability]) -> list[dict[str, Any]]:
+    """Declared vs approved shares for one capability, for MCP and the console."""
+    declared: dict[str, str] = {}
+    for cap in caps:
+        for spec in cap.shares:
+            declared.setdefault(spec.name, spec.access)
+    granted = approved_shares(name)
+    out: list[dict[str, Any]] = []
+    for folder in sorted(set(declared) | set(granted)):
+        requested = declared.get(folder)
+        grant = granted.get(folder)
+        access = grant.get("access") if grant else None
+        state = "pending" if requested and not grant else "approved" if requested else "unused"
+        out.append(
+            {
+                "name": folder,
+                "requested": requested,
+                "access": access,
+                "state": state,
+                "approved_at": grant.get("approved_at") if grant else None,
+                "weaker": bool(
+                    requested and access and requested == "rw" and access != "rw"
+                ),
+            }
+        )
+    return out
+
+
+def _dir_usage(path: Path, limit: int = MAX_SHARE_ENTRIES) -> tuple[int, bool]:
+    """Bounded, non-following size walk so a census poll cannot run forever."""
+    total = 0
+    seen = 0
+    truncated = False
+    stack = [path]
+    while stack and not truncated:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > limit:
+                        truncated = True
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total, truncated
+
+
+def share_census(
+    requests: Mapping[str, Mapping[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Folders, grants and declared-but-unapproved requests.
+
+    `requests` is folder -> capability -> requested access. Pending requests for a
+    folder that does not exist yet are included so the console can create it on
+    approval.
+    """
+    data = read_share_registry()
+    wanted = requests or {}
+    names = sorted(set(data["folders"]) | set(wanted))
+    folders: list[dict[str, Any]] = []
+    for name in names:
+        record = data["folders"].get(name) or {
+            "created_at": 0,
+            "note": "",
+            "grants": {},
+        }
+        path = share_path(name)
+        exists = path.is_dir()
+        size, truncated = _dir_usage(path) if exists else (0, False)
+        grants = [
+            {
+                "cap": cap,
+                "access": grant["access"],
+                "approved_at": grant["approved_at"],
+            }
+            for cap, grant in sorted(record["grants"].items())
+        ]
+        requested = wanted.get(name) or {}
+        request_rows: list[dict[str, Any]] = []
+        for cap in sorted(set(requested) | set(record["grants"])):
+            grant = record["grants"].get(cap)
+            if cap in requested:
+                state = "approved" if grant else "pending"
+                request_access = requested[cap]
+            else:
+                state = "unused"
+                request_access = None
+            request_rows.append(
+                {
+                    "cap": cap,
+                    "requested": request_access,
+                    "access": grant["access"] if grant else None,
+                    "state": state,
+                    "approved_at": grant["approved_at"] if grant else None,
+                }
+            )
+        folders.append(
+            {
+                "name": name,
+                "path": str(path),
+                "exists": exists,
+                "created_at": record.get("created_at") or 0,
+                "note": record.get("note") or "",
+                "size_bytes": size,
+                "size_truncated": truncated,
+                "grants": grants,
+                "requests": request_rows,
+            }
+        )
+    return {"folders": folders}
+
+
+def resolve_shares(name: str, cap: Capability) -> tuple[ShareMount, ...]:
+    """Resolve declared shares to approved mounts or fail closed.
+
+    A declaration is only a request: no grant (or a weaker grant) blocks the run.
+    """
+    granted = approved_shares(name)
+    mounts: list[ShareMount] = []
+    for spec in cap.shares:
+        grant = granted.get(spec.name)
+        if grant is None:
+            raise CapError(
+                f"Shared folder {spec.name!r} is not approved for {name!r}; "
+                "approve it in the console at /ui/."
+            )
+        access = str(grant.get("access") or "")
+        if access != spec.access:
+            requested = "read-write" if spec.access == "rw" else "read-only"
+            approved = "read-write" if access == "rw" else "read-only"
+            raise CapError(
+                f"Shared folder {spec.name!r} is approved {approved} but {name!r} requests "
+                f"{requested}; approve {spec.access} or change the declaration."
+            )
+        mounts.append(
+            ShareMount(
+                name=spec.name,
+                path=share_path(spec.name, create=True),
+                access=access,
+                requested=spec.access,
+            )
+        )
+    return tuple(mounts)
+
+
+def test_share_mounts(cap: Capability, data: Path) -> tuple[ShareMount, ...]:
+    """Fresh empty directories for tests/probes: never production shared data."""
+    if not cap.shares:
+        return ()
+    root = _contained(data, data / "shares")
+    shutil.rmtree(root, ignore_errors=True)
+    mounts: list[ShareMount] = []
+    for spec in cap.shares:
+        path = _contained(root, root / spec.name)
+        path.mkdir(parents=True, exist_ok=True)
+        mounts.append(
+            ShareMount(name=spec.name, path=path, access=spec.access, requested=spec.access)
+        )
+    return tuple(mounts)
+
+
+def _apply_share_env(env: dict[str, str], mounts: Iterable[ShareMount]) -> None:
+    payload = {
+        mount.name: {"path": str(mount.path), "access": mount.access}
+        for mount in mounts
+    }
+    if payload:
+        env["CAPFORGE_SHARES"] = json.dumps(payload, sort_keys=True)
 
 
 def _apply_cap_env(env: dict[str, str], name: str, cap: Capability, *, tag: str | None) -> None:
@@ -1301,7 +1821,12 @@ def shared_data_dir(name: str, *, create: bool = True) -> Path:
 
 
 def _sandbox_policy(
-    source: Path, venv: Path, data: Path, *, shared: Path | None = None
+    source: Path,
+    venv: Path,
+    data: Path,
+    *,
+    shared: Path | None = None,
+    shares: Iterable[ShareMount] = (),
 ) -> sandbox.Policy:
     system = [Path(p) for p in ("/usr", "/usr/local", "/lib", "/lib64", "/bin", "/sbin")]
     base = Path(sys.base_prefix)
@@ -1321,6 +1846,11 @@ def _sandbox_policy(
     write = [Path(data)]
     if shared is not None:
         write.append(Path(shared))
+    for mount in shares:
+        if mount.access == "ro":
+            read.append(Path(mount.path))
+        else:
+            write.append(Path(mount.path))
     return sandbox.Policy(
         read=tuple(read),
         write=tuple(write),
@@ -1394,6 +1924,7 @@ def execute(
     packages: list[str] | None = None,
     timeout: int | None = None,
     data_tag: str | None = None,
+    share_mounts: tuple[ShareMount, ...] | None = None,
 ) -> ExecResult:
     """Run one capability entrypoint in a subprocess: JSON in on stdin, JSON out on stdout."""
     if cap.kind == "web":
@@ -1409,12 +1940,14 @@ def execute(
     scratch = data / ".tmp"
     scratch.mkdir(parents=True, exist_ok=True)
     shared = shared_data_dir(cap.name) if cap.data == "shared" else None
+    mounts = resolve_shares(cap.name, cap) if share_mounts is None else share_mounts
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
     env["CAPFORGE_VERSION"] = tag or "draft"
     env["CAPFORGE_DATA_DIR"] = str(data)
     if shared is not None:
         env["CAPFORGE_SHARED_DATA_DIR"] = str(shared)
+    _apply_share_env(env, mounts)
     env["TMPDIR"] = str(scratch)
     env["HOME"] = str(scratch)
     env["VIRTUAL_ENV"] = str(venv)
@@ -1425,7 +1958,7 @@ def execute(
     started = time.monotonic()
     cmd = _sandbox_command(
         [str(venv / "bin" / "python"), str(entry)],
-        _sandbox_policy(source, venv, data, shared=shared),
+        _sandbox_policy(source, venv, data, shared=shared, shares=mounts),
         cap.name,
     )
     code, stdout, stderr, timed_out = _run_process(
@@ -1524,6 +2057,7 @@ def run_tests(
             tag=None,
             timeout=timeout or test_timeout(),
             data_tag="test",
+            share_mounts=test_share_mounts(cap, data_dir(cap.name, "test")),
         )
     return _run_pytest(cap, source, timeout)
 
@@ -1540,12 +2074,14 @@ def _run_pytest(
     scratch = data / ".tmp"
     scratch.mkdir(parents=True, exist_ok=True)
     shared = shared_data_dir(cap.name) if cap.data == "shared" else None
+    mounts = test_share_mounts(cap, data)
     env = _base_env()
     env["CAPFORGE_CAP"] = cap.name
     env["CAPFORGE_VERSION"] = "test"
     env["CAPFORGE_DATA_DIR"] = str(data)
     if shared is not None:
         env["CAPFORGE_SHARED_DATA_DIR"] = str(shared)
+    _apply_share_env(env, mounts)
     env["TMPDIR"] = str(scratch)
     env["HOME"] = str(scratch)
     env["COVERAGE_FILE"] = str(data / ".coverage")
@@ -1566,7 +2102,7 @@ def _run_pytest(
             "no:cacheprovider",
             str(tests),
         ],
-        _sandbox_policy(source, venv, data, shared=shared),
+        _sandbox_policy(source, venv, data, shared=shared, shares=mounts),
         cap.name,
     )
     code, stdout, stderr, timed_out = _run_process(
@@ -1661,6 +2197,7 @@ def web_child_env(
     port: int,
     data_tag: str | None = None,
     public_url: str | None = None,
+    share_mounts: tuple[ShareMount, ...] | None = None,
 ) -> dict[str, str]:
     """Allowlisted environment for a web child: same rules as execute(), plus
     the serve-specific variables the app may read."""
@@ -1673,6 +2210,8 @@ def web_child_env(
     env["CAPFORGE_DATA_DIR"] = str(data)
     if cap.data == "shared":
         env["CAPFORGE_SHARED_DATA_DIR"] = str(shared_data_dir(cap.name))
+    mounts = resolve_shares(cap.name, cap) if share_mounts is None else share_mounts
+    _apply_share_env(env, mounts)
     env["TMPDIR"] = str(scratch)
     env["HOME"] = str(scratch)
     env["CAPFORGE_SERVE_PORT"] = str(port)
@@ -1700,12 +2239,15 @@ def probe_web_boot(
         raise CapError(f"Entrypoint {cap.entrypoint!r} is missing from {source}")
     venv = ensure_venv(cap.name, source, "prod")
     port = _free_port()
-    env = web_child_env(cap, tag=None, venv=venv, port=port, data_tag="test")
     data = data_dir(cap.name, "test")
+    mounts = test_share_mounts(cap, data)
+    env = web_child_env(
+        cap, tag=None, venv=venv, port=port, data_tag="test", share_mounts=mounts
+    )
     shared = shared_data_dir(cap.name) if cap.data == "shared" else None
     cmd = _sandbox_command(
         [str(venv / "bin" / "python"), *web_child_argv(cap, source, port)],
-        _sandbox_policy(source, venv, data, shared=shared),
+        _sandbox_policy(source, venv, data, shared=shared, shares=mounts),
         cap.name,
     )
     started = time.monotonic()

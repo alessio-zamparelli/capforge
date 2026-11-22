@@ -192,6 +192,7 @@ def list_capabilities() -> dict:
     for cap in discover():
         state = versioning.read_state(cap.name)
         active = state.get("active") or {}
+        caps_for = _env_caps(cap)
         out.append(
             {
                 "name": cap.name,
@@ -208,7 +209,8 @@ def list_capabilities() -> dict:
                 ),
                 "tags": len(state.get("tags") or []),
                 "git_url": _git_url(cap.name),
-                "env": env_status(cap.name, _env_caps(cap)),
+                "env": env_status(cap.name, caps_for),
+                "shares": core.share_status(cap.name, caps_for),
             }
         )
     return {"ok": True, "caps_dir": str(caps_dir()), "count": len(out), "capabilities": out}
@@ -221,6 +223,7 @@ def get_capability(name: str) -> dict:
     if err:
         return err
     state = versioning.read_state(cap.name)
+    caps_for = _env_caps(cap)
     return {
         "ok": True,
         "name": cap.name,
@@ -230,7 +233,8 @@ def get_capability(name: str) -> dict:
         "kind": cap.kind,
         "data": cap.data,
         "entrypoint": cap.entrypoint,
-        "env": env_status(cap.name, _env_caps(cap)),
+        "env": env_status(cap.name, caps_for),
+        "shares": core.share_status(cap.name, caps_for),
         "draft_ready": cap.draft_ready,
         "draft_error": cap.error,
         "draft_hash": tree_hash(cap.path) if cap.path.is_dir() else None,
@@ -477,9 +481,19 @@ def delete_capability(name: str, confirm: str) -> dict:
     if confirm != validated:
         return _fail("confirm must equal the capability name exactly")
     targets = _delete_targets(validated)
-    exists = any(path.exists() for path in targets) or bool(staging_service.read_state(validated))
+    exists = (
+        any(path.exists() for path in targets)
+        or bool(staging_service.read_state(validated))
+        or bool(core.approved_shares(validated))
+    )
     if not exists:
-        return {"ok": True, "deleted": False, "name": validated, "reason": "not found"}
+        return {
+            "ok": True,
+            "deleted": False,
+            "name": validated,
+            "reason": "not found",
+            "shares_revoked": 0,
+        }
 
     current = staging_service.read_state(validated)
     if current.get("state") and current.get("state") not in {
@@ -501,6 +515,7 @@ def delete_capability(name: str, confirm: str) -> dict:
             web.forget(validated)
             stopped = True
             with core.cap_lock(validated):
+                revoked = core.revoke_all_grants(validated)
                 staging_service.forget(validated)
                 staging_service.cleanup_backups(validated)
                 for target in targets:
@@ -516,8 +531,19 @@ def delete_capability(name: str, confirm: str) -> dict:
                         lock.unlink(missing_ok=True)
                     except OSError:
                         pass
-    log.info("delete cap=%s stopped=%s deleted=true", validated, stopped)
-    return {"ok": True, "deleted": True, "name": validated, "stopped": stopped}
+    log.info(
+        "delete cap=%s stopped=%s deleted=true shares_revoked=%d",
+        validated,
+        stopped,
+        revoked,
+    )
+    return {
+        "ok": True,
+        "deleted": True,
+        "name": validated,
+        "stopped": stopped,
+        "shares_revoked": revoked,
+    }
 
 
 @mcp.tool

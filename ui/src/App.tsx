@@ -1,7 +1,26 @@
 import { useCallback, useEffect, useState } from "react";
 import { KeyRound, ShieldOff } from "lucide-react";
-import * as api from "./api";
-import Dashboard from "./Dashboard";
+import * as api from "@/api";
+import Dashboard from "@/Dashboard";
+import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 
 export default function App() {
   const [phase, setPhase] = useState<"loading" | "login" | "dashboard" | "disabled">("loading");
@@ -18,26 +37,15 @@ export default function App() {
     setPhase("dashboard");
   }, []);
 
-  if (phase === "loading") {
-    return <Center>loading…</Center>;
-  }
-  if (phase === "disabled") {
-    return (
-      <Center>
-        <div className="flex flex-col items-center gap-3 text-center">
-          <ShieldOff className="h-10 w-10 text-muted-foreground" />          <p className="text-lg">Console disabled</p>
-          <p className="max-w-sm text-sm text-muted-foreground">
-            Set <code className="rounded bg-muted px-1">CAPFORGE_WEB_TOKEN</code> on the server to
-            enable the console. The capability proxy keeps working without it.
-          </p>
-        </div>
-      </Center>
-    );
-  }
-  if (phase === "login") {
-    return <Login onLogin={onLogin} />;
-  }
-  return <Dashboard onAuthLost={() => setPhase("login")} />;
+  return (
+    <TooltipProvider>
+      {phase === "loading" && <Center>loading…</Center>}
+      {phase === "disabled" && <Disabled />}
+      {phase === "login" && <Login onLogin={onLogin} />}
+      {phase === "dashboard" && <Dashboard onAuthLost={() => setPhase("login")} />}
+      <Toaster position="bottom-right" />
+    </TooltipProvider>
+  );
 }
 
 function Center({ children }: { children: React.ReactNode }) {
@@ -46,13 +54,37 @@ function Center({ children }: { children: React.ReactNode }) {
   );
 }
 
+function Disabled() {
+  return (
+    <Center>
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldOff data-icon="inline-start" />
+            Console disabled
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Alert>
+            <AlertTitle>Set an access token</AlertTitle>
+            <AlertDescription>
+              Set <code className="rounded bg-muted px-1">CAPFORGE_WEB_TOKEN</code> on the
+              server to enable the console. The capability proxy keeps working without it.
+            </AlertDescription>
+          </Alert>
+        </CardContent>
+      </Card>
+    </Center>
+  );
+}
+
 function Login({ onLogin }: { onLogin: (token: string) => Promise<void> }) {
   const [token, setToken] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
     setBusy(true);
     setError(null);
     try {
@@ -66,31 +98,46 @@ function Login({ onLogin }: { onLogin: (token: string) => Promise<void> }) {
 
   return (
     <div className="flex min-h-screen items-center justify-center p-6">
-      <form
-        onSubmit={submit}
-        className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-card p-6 text-card-foreground shadow-sm"
-      >
-        <div className="flex items-center gap-2">
-          <KeyRound className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-lg font-semibold">capforge console</h1>
-        </div>
-        <input
-          type="password"
-          autoFocus
-          placeholder="Access token"
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-hidden focus:ring-1 focus:ring-ring"
-        />
-        {error && <p className="text-sm text-red-400">{error}</p>}
-        <button
-          type="submit"
-          disabled={busy || !token}
-          className="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
-        >
-          {busy ? "Signing in…" : "Sign in"}
-        </button>
-      </form>
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <KeyRound data-icon="inline-start" />
+            capforge console
+          </CardTitle>
+          <CardDescription>Sign in with the operator token to manage capabilities.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={submit}>
+            <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="access-token">Access token</FieldLabel>
+                <Input
+                  id="access-token"
+                  type="password"
+                  autoFocus
+                  autoComplete="current-password"
+                  placeholder="Access token"
+                  value={token}
+                  onChange={(event) => setToken(event.target.value)}
+                />
+                <FieldDescription>
+                  The same value as <code className="rounded bg-muted px-1">CAPFORGE_WEB_TOKEN</code>.
+                </FieldDescription>
+              </Field>
+              {error && (
+                <Alert variant="destructive">
+                  <AlertTitle>Sign-in failed</AlertTitle>
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
+              <Button type="submit" disabled={busy || !token} className="w-full">
+                {busy && <Spinner data-icon="inline-start" />}
+                {busy ? "Signing in…" : "Sign in"}
+              </Button>
+            </FieldGroup>
+          </form>
+        </CardContent>
+      </Card>
     </div>
   );
 }

@@ -26,7 +26,8 @@
 The model scaffolds a capability as a **uv project**, publishes it as a git repository, clones it
 into its own workspace, edits, and pushes. Capforge tests the pushed tree in a state-owned uv
 environment and promotes it to an immutable tag on green. `run_capability` executes the active tag.
-There is no shared filesystem between the terminal and the server.
+There is no shared filesystem between the terminal and the server. Cross-capability folders are
+explicit, operator-approved shared volumes declared in `deploy.py`.
 
 A capability with `KIND = "web"` in `deploy.py` is a long-lived ASGI service. It is
 reverse-proxied at `http://<host>:8080/cap/<name>/`; the console is `/ui/`, the control API is
@@ -94,11 +95,14 @@ active tag.
 - Git clone/push is the authoring path; `scaffold_capability` creates the base repo.
 - Python is fixed at **3.14**; dependencies come from the project's `pyproject.toml` and
   `uv.lock` (`uv sync --frozen`).
-- Landlock confines capability and web children to their own code/venv, system libraries and
-  data directories. Git/uv children are tracked but not yet under Landlock (see `docs/NEXT.md`).
+- Landlock confines capability and web children to their own code/venv, system libraries, their
+  data directories and approved shared folders. Git/uv children are tracked but not yet under
+  Landlock (see `docs/NEXT.md`).
 - Per-capability pipeline/scaffold/served logs are bounded and exposed through MCP actions.
 - Operator-managed environment values are stored per capability and edited only in the console;
   the model declares `Env` fields in `deploy.py` but never reads or writes values.
+- Shared folders are operator-owned volumes. A capability declares `SHARES`; the operator
+  approves `ro`/`rw` in the console, with a census of folders and grantees.
 
 ## Install
 
@@ -236,7 +240,7 @@ commands; they are not MCP tools.
 ```text
 <name>/
     SKILL.md            name, description and instructions
-    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA, Env
+    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA, SHARES, Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
@@ -252,6 +256,10 @@ KIND = "cli"            # "cli" or "web"
 ENTRYPOINT = "main.py"  # app.py for web
 DATA = "version"        # "version" or "shared"
 APP = "app"             # web only; the ASGI object
+SHARES = {              # operator-approved cross-capability folders
+    "datasets": "ro",
+    "cache": "rw",
+}
 ```
 
 `SKILL.md` frontmatter carries only `name` and `description`; the deployment fields live in
@@ -264,6 +272,33 @@ for a stable `CAPFORGE_SHARED_DATA_DIR` across tags; it is unversioned, and the 
 concurrency, migrations and backup. Code trees are not writable. Landlock denies state, tokens,
 other capabilities, home, `/proc`, `/sys` and everything not explicitly allowed. Network, CPU and
 memory are not confined.
+
+### Shared folders
+
+`SHARES` requests named folders shared with other capabilities:
+
+```python
+SHARES = {"datasets": "ro", "index-cache": "rw"}
+```
+
+The declaration is only a request. The console at `/ui/` shows a census of folders, grants and
+pending requests; only the operator can approve, change or revoke access. Approved folders are
+injected as one JSON variable:
+
+```json
+CAPFORGE_SHARES={"datasets":{"path":"/.../shares/datasets","access":"ro"}}
+```
+
+`ro` is enforced by Landlock; `rw` permits create, update and delete. An unapproved declaration, or
+a grant that differs from the request, fails `run_capability`/`serve_capability` closed. Grants are per
+capability and shared across its tags. Tests and the web boot probe receive fresh empty temporary
+directories, never production data. Shared folders are unversioned and unsynchronized: use
+`flock`/SQLite when concurrent calls can race, and treat backups and quotas as operator work. A
+capability deletion revokes its grants but keeps the folder; a folder can only be deleted after
+every grant is revoked.
+
+`DATA = "shared"` is separate: it is that capability's own durable directory and no other
+capability can reach it.
 
 Served web apps are booted with uvicorn `--root-path /cap/<name>` and receive
 `CAPFORGE_ROOT_PATH`. Do not pass `root_path=` to `FastAPI(...)`; it is deprecated. Read the env
@@ -288,7 +323,7 @@ not accepted. Do not put the token in the URL. Clone and push use the same token
 After a green push, `serve_capability(name, action="start")` boots the active tag at
 `/cap/<name>/`. `restart` picks up a newly promoted tag; promotion alone does not restart it.
 Boot failures return the child log tail. The child is sandboxed by Landlock and writes only to
-its data directories.
+its data directories and approved shared folders.
 
 ## Storage
 
@@ -297,8 +332,10 @@ its data directories.
 <CAPFORGE_STATE_DIR>/versions/<name>/<tag>/   immutable snapshots
 <CAPFORGE_STATE_DIR>/venvs/<name>/<lock>-py314[-test]/
 <CAPFORGE_STATE_DIR>/data/<name>/<tag>/       per-version data (pruned with the tag)
-<CAPFORGE_STATE_DIR>/data/<name>/shared/      optional durable data
+<CAPFORGE_STATE_DIR>/data/<name>/shared/      optional durable data (per capability)
+<CAPFORGE_STATE_DIR>/shares/<folder>/         operator-owned cross-capability data
 <CAPFORGE_STATE_DIR>/state/<name>.json        active tag + tags
+<CAPFORGE_STATE_DIR>/state/shares.json        shared-folder census and grants
 <CAPFORGE_STATE_DIR>/staging/<name>.json      push pipeline state
 <CAPFORGE_STATE_DIR>/git/<name>.git/          bare receive/upload repository
 <CAPFORGE_STATE_DIR>/logs/<name>/*.log        pipeline/scaffold logs

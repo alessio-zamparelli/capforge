@@ -22,6 +22,8 @@ Constraints that drive the design; do not "fix" them casually:
 5. **Capability code is semi-trusted.** Landlock confines filesystem access; network/CPU/memory
    are not confined. Do not add the hub's own secrets to a capability environment; operator-set
    values are opt-in per capability via `Env` fields in `deploy.py` and `<state>/secrets/`.
+   Cross-capability folders are opt-in via `SHARES`, approved only in the console, and mapped to
+   exact `ro`/`rw` Landlock rules.
 6. **HTTP MCP requires `CAPFORGE_MCP_TOKEN`.** `/cap` and `/api` share the web origin, so treat
    served web capabilities as trusted or expose `/cap` on a different origin at the reverse proxy.
 
@@ -44,7 +46,7 @@ capforge/
 docs/ARCHITECTURE.md, docs/NEXT.md
 tests/test_lifecycle.py, test_web.py, test_units.py
 tools/mcp_probe.py
-ui/                  React + Vite + Tailwind console
+ui/                  React + Vite + shadcn/Tailwind console
 AGENTS.md.example    guide shipped inside a scaffolded repo
 Dockerfile, docker-compose.yml, .env.example
 ```
@@ -71,8 +73,9 @@ never let `CapError` escape to MCP.
 ```text
 <caps>/<name>/
     SKILL.md            name, description and instructions; no deployment fields
-    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA and
-                        Env (pydantic) fields; parsed with ast, never imported
+    deploy.py           deployment descriptor: KIND, ENTRYPOINT, APP, DATA,
+                        SHARES and Env (pydantic) fields; parsed with ast,
+                        never imported
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed
     .python-version     3.14
@@ -83,9 +86,10 @@ never let `CapError` escape to MCP.
 ```
 
 `SKILL.md` frontmatter is `name` + `description`; the body is instructions. `deploy.py` is the
-machine-readable contract: literal `KIND` (`"cli"`/`"web"`), `ENTRYPOINT`, optional `APP` and
-`DATA` (`"version"`/`"shared"`), plus an optional pydantic `Env` model whose fields declare
-operator-set variables. `core.parse_deploy_py` parses it with `ast` (no import, no execution);
+machine-readable contract: literal `KIND` (`"cli"`/`"web"`), `ENTRYPOINT`, optional `APP`,
+`DATA` (`"version"`/`"shared"`), a literal `SHARES` dict of folder → `ro`/`rw` requests, plus an
+optional pydantic `Env` model whose fields declare operator-set variables. `core.parse_deploy_py`
+parses it with `ast` (no import, no execution);
 supported annotations are `str`, `int`, `float`, `bool` (unknown → `str`), and `Field(...)` may
 add `description`, `min_length`, `max_length`, `ge`, `le`. A field without a default is required.
 Frontmatter `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is refused with a migration error.
@@ -98,12 +102,16 @@ Execution rules (`core.execute`):
 - parse the whole trimmed stdout, then the last non-empty line;
 - diagnostics on stderr; bounded capture (256 KiB tail);
 - filtered environment (`ENV_ALLOWLIST`), `CAPFORGE_DATA_DIR`, `CAPFORGE_VERSION`,
-  `CAPFORGE_SHARED_DATA_DIR` when enabled, venv-first `PATH`;
+  `CAPFORGE_SHARED_DATA_DIR` when enabled, `CAPFORGE_SHARES` for approved volumes, venv-first
+  `PATH`;
 - `Env` fields declared in `deploy.py` injected only for the active tag (`cap_env_values`); optional
   fields fall back to their declared default; tests, drafts and the web boot probe get defaults or
   type-shaped placeholders (`capforge-test-placeholder`, `0`, `0.0`, `false`), never real values;
 - a hard timeout on the process group; nothing survives the call; detached strays are swept;
-- Landlock: system/own-code/venv read, own data read/write, everything else denied.
+- Landlock: system/own-code/venv read, own data read/write, approved `ro` shares read and `rw`
+  shares write, everything else denied;
+- `SHARES` declarations are requests; `resolve_shares` fails closed without a grant or with a
+  grant that differs from the request, and tests/probes get empty temporary share dirs.
 
 Promotion is pipeline-only. `staging_latest`/`staging_logs` expose state and diagnostics.
 `capforge promote`/`test` are operator recovery/legacy commands, not model-facing tools.
@@ -120,7 +128,12 @@ Promotion is pipeline-only. `staging_latest`/`staging_logs` expose state and dia
 - Operator env values are `<state>/secrets/<name>.json` (mode `0600`, atomic, per capability and
   shared across tags). They are never in state JSON, tags, hashes or MCP output; only the console
   can write them, and a web instance restarts after a change.
-- Locks: per-capability `cap_lock`, per-lockfile venv locks, per-name push and pipeline locks.
+- Shared folders are `<state>/shares/<folder>/`; the census and grants are
+  `<state>/state/shares.json` (atomic, corrupt files quarantined). Grants are per capability and
+  shared across tags. Deleting a capability revokes its grants but keeps the folder; a folder is
+  deletable only with no grants. The `share_lock` lock covers registry mutations.
+- Locks: per-capability `cap_lock`, per-lockfile venv locks, per-name push and pipeline locks,
+  and `shares.lock`.
   **Never nest the same flock.** The draft swap and promotion are one `cap_lock` critical section;
   the worker uses `versioning.promote(locked=True)`.
 - Pruning keeps `CAPFORGE_KEEP_TAGS` (default 5) and never the active tag; it stops a pinned web
@@ -149,8 +162,9 @@ confined. Do not broaden the allowlist to make a test pass without documenting w
   `_contained` before touching disk. Never build a path from unsanitised model input.
 - Log runs/promotions at INFO with stable `key=value` fields. Never log tokens, `Authorization`,
   environment values or capability output bodies beyond the bounded log.
-- Keep `__version__` and `[project].version` equal (0.6.0).
-- Capabilities stay deterministic when `data: version`; shared data relaxes that by design.
+- Keep `__version__` and `[project].version` equal (0.7.0).
+- Capabilities stay deterministic when `data: version`; `DATA = "shared"` and `SHARES` relax that by
+  design and leave concurrency/backup to the capability and operator.
 - Use `track_child()` for every direct git/pytest/uv child so a concurrent stray sweep cannot kill
   it.
 
@@ -178,9 +192,10 @@ install`) and commit the lock. CI and the image use `--locked`/`--frozen-lockfil
 
 ## Tests
 
-`test_units.py` is fast: parsing/validation, state/quarantine, hashes, routes, console auth,
-sandbox policy, ten tools, UI mount. `test_lifecycle.py` (slow) scaffolds real uv projects, runs
-the pipeline, promotes, rolls back, tests data isolation/shared data and Landlock denial.
+`test_units.py` is fast: parsing/validation, state/quarantine, hashes, share registry and census,
+routes, console auth, sandbox policy, ten tools, UI mount. `test_lifecycle.py` (slow) scaffolds real
+uv projects, runs the pipeline, promotes, rolls back, tests data isolation/shared data,
+cross-capability `ro`/`rw` grants and Landlock denial.
 `test_web.py` (slow) boots real uvicorn children through `/cap`, tests restart/prune/restore,
 process-group kills and console routes. Do not mock subprocesses or uv; every test owns a temp
 caps/state. `-n auto` is safe because each test has its own dirs and the sweep is per-process.

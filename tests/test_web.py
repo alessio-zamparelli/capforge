@@ -663,3 +663,48 @@ def _alive(pid: int) -> bool:
         return False
     fields = stat[close + 2 :].split()
     return bool(fields) and fields[0] != "Z"
+
+
+def test_share_approval_gates_web_start_and_revoke_restarts(env):
+    root, server, web, core = env
+    made = server.scaffold_capability("shared_web", "Web service with a share.", kind="web")
+    assert made["ok"], made
+    cap = Path(made["path"])
+    (cap / "app.py").write_text(
+        _web_cap_source(
+            "shared_web",
+            "import json\n"
+            "import os\n"
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/shares')\n"
+            "def shares() -> dict:\n"
+            "    return json.loads(os.environ.get('CAPFORGE_SHARES', '{}'))\n"
+            "app.include_router(router)\n",
+        ),
+        encoding="utf-8",
+    )
+    with (cap / "deploy.py").open("a", encoding="utf-8") as handle:
+        handle.write('\nSHARES = {"webdata": "ro"}\n')
+    assert server.test_capability("shared_web")["ok"]
+    assert server.promote_capability("shared_web", tag="v1")["ok"]
+
+    pending = server.serve_capability("shared_web", action="start")
+    assert pending["ok"] is False
+    assert "not approved" in pending["error"]
+
+    core.create_share("webdata", "web share")
+    core.set_share_grant("shared_web", "webdata", "ro")
+    started = server.serve_capability("shared_web", action="start")
+    assert started["ok"] and started["status"] == "running", started
+    code, body = _asgi_get(web, "/cap/shared_web/shares")
+    assert code == 200
+    assert '"webdata"' in body
+    assert core.share_path("webdata").as_posix() in body
+    assert '"access":"ro"' in body.replace(" ", "")
+
+    core.revoke_share_grant("shared_web", "webdata")
+    restart = web._restart_after_share("shared_web")
+    assert restart["restarted"] is False
+    assert "not approved" in restart["restart_error"]
+    assert web._status_of("shared_web")["status"] == "stopped"

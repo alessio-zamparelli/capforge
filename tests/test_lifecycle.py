@@ -335,3 +335,81 @@ def test_prune_removes_per_version_data(env):
         versioning.promote("hello", tag=tag, force=True)
     assert not (root / "state" / "data" / "hello" / "v1").exists()
     assert s.list_tags("hello")["active"] == "v3"
+
+
+def test_cross_capability_shared_folder_requires_approval_and_honours_access(env):
+    root, s = env
+    from capforge import core, versioning
+
+    writer_main = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "json.loads(sys.stdin.read() or '{}')\n"
+        "shares = json.loads(os.environ.get('CAPFORGE_SHARES', '{}'))\n"
+        "entry = shares['shared-data']\n"
+        "path = Path(entry['path']) / 'value.txt'\n"
+        "path.write_text('from-writer')\n"
+        "json.dump({'access': entry['access'], 'read': path.read_text()}, sys.stdout)\n"
+    )
+    reader_main = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "json.loads(sys.stdin.read() or '{}')\n"
+        "entry = json.loads(os.environ['CAPFORGE_SHARES'])['shared-data']\n"
+        "path = Path(entry['path']) / 'value.txt'\n"
+        "json.dump({'access': entry['access'], 'value': path.read_text()}, sys.stdout)\n"
+    )
+    blocked_main = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "json.loads(sys.stdin.read() or '{}')\n"
+        "entry = json.loads(os.environ['CAPFORGE_SHARES'])['shared-data']\n"
+        "path = Path(entry['path']) / 'blocked.txt'\n"
+        "path.write_text('should-not-happen')\n"
+        "json.dump({'wrote': True}, sys.stdout)\n"
+    )
+
+    for name, main, access in (
+        ("writer", writer_main, "rw"),
+        ("reader", reader_main, "ro"),
+        ("blocked", blocked_main, "ro"),
+    ):
+        assert s.scaffold_capability(name, f"{name} share test")["ok"]
+        cap = root / "caps" / name
+        (cap / "main.py").write_text(main, encoding="utf-8")
+        (cap / "tests" / "test_scaffold.py").write_text(
+            "def test_ok():\n    assert True\n", encoding="utf-8"
+        )
+        with (cap / "deploy.py").open("a", encoding="utf-8") as handle:
+            handle.write(f'\nSHARES = {{"shared-data": "{access}"}}\n')
+
+    # Declaration is only a request: nothing is mounted before approval.
+    pending = s.run_capability("writer", {})
+    assert pending["ok"] is False
+    assert "not approved" in pending["error"]
+
+    core.create_share("shared-data", "cross-cap data")
+    core.set_share_grant("writer", "shared-data", "rw")
+    core.set_share_grant("reader", "shared-data", "ro")
+    core.set_share_grant("blocked", "shared-data", "ro")
+    for name in ("writer", "reader", "blocked"):
+        versioning.promote(name, tag="v1")
+
+    wrote = s.run_capability("writer", {})
+    assert wrote["ok"] is True, wrote
+    assert wrote["result"] == {"access": "rw", "read": "from-writer"}
+
+    read = s.run_capability("reader", {})
+    assert read["ok"] is True, read
+    assert read["result"] == {"access": "ro", "value": "from-writer"}
+
+    denied = s.run_capability("blocked", {})
+    assert denied["ok"] is False, denied
+    assert not (core.share_path("shared-data") / "blocked.txt").exists()
+
+    # Revocation is immediate for the next run; the folder and data remain.
+    core.revoke_share_grant("writer", "shared-data")
+    revoked = s.run_capability("writer", {})
+    assert revoked["ok"] is False
+    assert "not approved" in revoked["error"]
+    assert (core.share_path("shared-data") / "value.txt").read_text() == "from-writer"

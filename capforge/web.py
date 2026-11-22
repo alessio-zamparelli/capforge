@@ -354,15 +354,21 @@ def _spawn(
     log_file = _log_path(name, tag)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     _rotate_log(log_file)
+    mounts = core.resolve_shares(name, cap)
     env = core.web_child_env(
-        cap, tag=tag, venv=venv, port=port, public_url=public_url or public_url_of(name)
+        cap,
+        tag=tag,
+        venv=venv,
+        port=port,
+        public_url=public_url or public_url_of(name),
+        share_mounts=mounts,
     )
     env["CAPFORGE_SERVE"] = "1"
     data = core.data_dir(name, tag)
     shared = core.shared_data_dir(name) if cap.data == "shared" else None
     cmd = core._sandbox_command(
         [str(venv / "bin" / "python"), *core.web_child_argv(cap, source, port)],
-        core._sandbox_policy(source, venv, data, shared=shared),
+        core._sandbox_policy(source, venv, data, shared=shared, shares=mounts),
         name,
     )
     log.info("starting web cap=%s tag=%s port=%d", name, tag, port)
@@ -928,11 +934,8 @@ def _env_caps_for(name: str) -> list[core.Capability]:
     return caps
 
 
-def _restart_after_env(name: str) -> dict[str, Any]:
-    """Restart a running (or desired-running) web instance after an env change."""
-    caps = _env_caps_for(name)
-    if not any(cap.kind == "web" for cap in caps):
-        return {"restarted": False}
+def _restart_if_running(name: str) -> dict[str, Any]:
+    """Restart a running (or desired-running) web instance after a runtime change."""
     status = _status_of(name)
     if status.get("status") != "running" and status.get("desired") != "start":
         return {"restarted": False}
@@ -941,6 +944,41 @@ def _restart_after_env(name: str) -> dict[str, Any]:
     except CapError as exc:
         return {"restarted": False, "restart_error": str(exc)}
     return {"restarted": True, "served": served}
+
+
+def _restart_after_env(name: str) -> dict[str, Any]:
+    """Environment and Landlock are fixed at spawn, so restart a live web child."""
+    caps = _env_caps_for(name)
+    if not any(cap.kind == "web" for cap in caps):
+        return {"restarted": False}
+    return _restart_if_running(name)
+
+
+def _restart_after_share(name: str) -> dict[str, Any]:
+    """A grant change alters both CAPFORGE_SHARES and the Landlock policy."""
+    return _restart_if_running(name)
+
+
+def _share_requests() -> dict[str, dict[str, str]]:
+    """folder -> capability -> requested access, from draft and active tags."""
+    out: dict[str, dict[str, str]] = {}
+    for cap in core.list_capabilities():
+        caps = [cap]
+        tag = (versioning.read_state(cap.name).get("active") or {}).get("tag")
+        if tag:
+            source = versioning.version_path(cap.name, tag)
+            if source.is_dir():
+                active = core.load_capability_at(cap.name, source)
+                if not active.error:
+                    caps.append(active)
+        for item in caps:
+            for spec in item.shares:
+                out.setdefault(spec.name, {})[cap.name] = spec.access
+    return out
+
+
+def _share_census() -> dict[str, Any]:
+    return core.share_census(_share_requests())
 
 
 async def api_caps(request: Request) -> Response:
@@ -957,6 +995,7 @@ async def api_caps(request: Request) -> Response:
             state = versioning.read_state(cap.name)
             active = (state.get("active") or {}).get("tag")
             record = _registry_record(cap.name)
+            caps_for = _env_caps_for(cap.name)
             served = None
             if record is not None:
                 info = _status_of(cap.name)
@@ -983,7 +1022,8 @@ async def api_caps(request: Request) -> Response:
                         and state["active"]["content_hash"] != core.tree_hash(cap.path)
                     ),
                     "served": served,
-                    "env": core.env_status(cap.name, _env_caps_for(cap.name)),
+                    "env": core.env_status(cap.name, caps_for),
+                    "shares": core.share_status(cap.name, caps_for),
                 }
             )
         return out
@@ -1072,6 +1112,127 @@ async def api_env_var(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
+async def api_shares(request: Request) -> Response:
+    """Census of shared folders and grants, or create a new operator-owned folder."""
+    denied = _console_denied(request, write=request.method != "GET")
+    if denied is not None:
+        return denied
+    try:
+        if request.method == "GET":
+            payload = await run_in_threadpool(_share_census)
+            return JSONResponse({"ok": True, **payload})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = str(body.get("name") or "")
+        note = str(body.get("note") or "")
+        result = await run_in_threadpool(core.create_share, name, note)
+        census = await run_in_threadpool(_share_census)
+        return JSONResponse({**result, "ok": True, **census})
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_share(request: Request) -> Response:
+    """Delete one empty shared folder; `confirm` must equal its name."""
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    folder = request.path_params["folder"]
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    confirm = str(body.get("confirm") or "")
+    try:
+        result = await run_in_threadpool(core.delete_share, folder, confirm)
+        census = await run_in_threadpool(_share_census)
+        return JSONResponse({**result, "ok": True, **census})
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_cap_shares(request: Request) -> Response:
+    """Declared vs approved shares for one capability."""
+    denied = _console_denied(request, write=False)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    try:
+        core.load_capability(name)
+        caps = await run_in_threadpool(_env_caps_for, name)
+        return JSONResponse(
+            {"ok": True, "name": name, "shares": core.share_status(name, caps)}
+        )
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+
+
+async def api_cap_share(request: Request) -> Response:
+    """Approve, change or revoke one capability's grant for one folder."""
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    folder = request.path_params["folder"]
+    try:
+        core.load_capability(name)
+        caps = await run_in_threadpool(_env_caps_for, name)
+        requested: dict[str, str] = {}
+        for cap in caps:
+            for spec in cap.shares:
+                requested.setdefault(spec.name, spec.access)
+        if request.method == "DELETE":
+            result = await run_in_threadpool(core.revoke_share_grant, name, folder)
+            restart_info = (
+                await run_in_threadpool(_restart_after_share, name)
+                if result.get("revoked")
+                else {"restarted": False}
+            )
+        else:
+            if folder not in requested:
+                return JSONResponse(
+                    {"ok": False, "error": f"{folder!r} is not declared in deploy.py"},
+                    status_code=400,
+                )
+            try:
+                body = await request.json()
+            except ValueError:
+                body = {}
+            access = str(body.get("access") or "").strip().lower()
+            if access not in core.SHARE_ACCESS:
+                return JSONResponse(
+                    {"ok": False, "error": "access must be ro or rw"}, status_code=400
+                )
+            if access != requested[folder]:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"{folder!r} requests {requested[folder]}, so the grant must "
+                            f"match it (got {access})"
+                        ),
+                    },
+                    status_code=400,
+                )
+            result = await run_in_threadpool(
+                core.approve_share_request, name, folder, access
+            )
+            restart_info = await run_in_threadpool(_restart_after_share, name)
+        caps = await run_in_threadpool(_env_caps_for, name)
+        return JSONResponse(
+            {
+                **result,
+                **restart_info,
+                "ok": True,
+                "shares": core.share_status(name, caps),
+            }
+        )
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
 def _bounded_tail(value: str | None) -> int:
     try:
         requested = int(value) if value is not None else core.log_tail_bytes()
@@ -1095,6 +1256,7 @@ async def api_cap_detail(request: Request) -> Response:
         state = versioning.read_state(name)
         active = state.get("active") or {}
         record = _registry_record(name)
+        caps_for = _env_caps_for(name)
         served = None
         if record is not None:
             info = _status_of(name)
@@ -1135,7 +1297,8 @@ async def api_cap_detail(request: Request) -> Response:
             },
             "log": log,
             "served": served,
-            "env": core.env_status(name, _env_caps_for(name)),
+            "env": core.env_status(name, caps_for),
+            "shares": core.share_status(name, caps_for),
         }
 
     try:
@@ -1532,9 +1695,17 @@ def asgi_app() -> Starlette:
         Route("/readyz", readyz, methods=["GET"]),
         Route("/api/login", api_login, methods=["POST"]),
         Route("/api/session", api_session, methods=["GET"]),
+        Route("/api/shares", api_shares, methods=["GET", "POST"]),
+        Route("/api/shares/{folder}", api_share, methods=["DELETE"]),
         Route("/api/caps", api_caps, methods=["GET"]),
         Route("/api/caps/{name}/env", api_env, methods=["GET", "POST"]),
         Route("/api/caps/{name}/env/{var}", api_env_var, methods=["DELETE"]),
+        Route("/api/caps/{name}/shares", api_cap_shares, methods=["GET"]),
+        Route(
+            "/api/caps/{name}/shares/{folder}",
+            api_cap_share,
+            methods=["PUT", "DELETE"],
+        ),
         Route("/api/caps/{name}/logs", api_logs, methods=["GET"]),
         Route("/api/caps/{name}/rollback", api_rollback, methods=["POST"]),
         Route("/api/caps/{name}/delete", api_delete, methods=["POST"]),

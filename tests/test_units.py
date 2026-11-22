@@ -70,6 +70,7 @@ def _deploy(
     app: str | None = None,
     data: str = "version",
     env: str = "",
+    shares: str | None = None,
 ) -> None:
     lines = ["from pydantic import BaseModel", "", "", "class Env(BaseModel):"]
     if env:
@@ -80,6 +81,8 @@ def _deploy(
     if app is not None:
         lines.append(f'APP = "{app}"')
     lines.append(f'DATA = "{data}"')
+    if shares is not None:
+        lines.append(f"SHARES = {shares}")
     (path / "deploy.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -735,6 +738,15 @@ def _env_cap(
     return core.load_capability_at(name, cap)
 
 
+def _share_cap(root, name: str = "demo", shares: str = '{"datasets": "ro"}'):
+    cap = root / name
+    cap.mkdir(parents=True)
+    (cap / "main.py").write_text("print(1)\n", encoding="utf-8")
+    _skill(cap)
+    _deploy(cap, shares=shares)
+    return core.load_capability_at(name, cap)
+
+
 def test_env_declarations_are_parsed_and_validated(tmp_path):
     cap = _env_cap(tmp_path)
     assert cap.error is None
@@ -1052,3 +1064,255 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     )
     again = server.delete_capability(name, name)
     assert again["ok"] and again["deleted"] is False
+
+
+# ------------------------------------------------------------------ shared volumes
+
+
+def test_deploy_py_parses_and_validates_shares():
+    spec = core.parse_deploy_py(
+        'KIND = "cli"\nENTRYPOINT = "main.py"\n'
+        'SHARES = {"datasets": "ro", "index-cache": "rw"}\n'
+    )
+    assert [(item.name, item.access) for item in spec.shares] == [
+        ("datasets", "ro"),
+        ("index-cache", "rw"),
+    ]
+    empty = core.parse_deploy_py('KIND = "cli"\nENTRYPOINT = "main.py"\n')
+    assert empty.shares == ()
+    for text in (
+        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = ["datasets"]\n',
+        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = {"Bad": "ro"}\n',
+        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = {"datasets": "write"}\n',
+        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = {"x": "ro", " x ": "rw"}\n',
+        'KIND = "cli"\nENTRYPOINT = "main.py"\nSHARES = get_shares()\n',
+    ):
+        with pytest.raises(core.CapError):
+            core.parse_deploy_py(text)
+
+
+def test_share_registry_grants_census_and_delete(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    cap = _share_cap(tmp_path / "caps", "demo", '{"datasets": "ro"}')
+
+    created = core.create_share("datasets", "reference data")
+    assert created["created"] is True
+    assert (tmp_path / "state" / "shares" / "datasets").is_dir()
+    with pytest.raises(core.CapError):
+        core.create_share("datasets")
+
+    census = core.share_census({"datasets": {"demo": "ro"}})
+    folder = census["folders"][0]
+    assert folder["name"] == "datasets"
+    assert folder["note"] == "reference data"
+    assert folder["requests"][0]["state"] == "pending"
+    assert folder["requests"][0]["requested"] == "ro"
+
+    approved = core.approve_share_request("demo", "datasets", "ro")
+    assert approved["access"] == "ro"
+    status = core.share_status("demo", [cap])
+    assert status[0]["state"] == "approved"
+    assert status[0]["access"] == "ro"
+    assert status[0]["requested"] == "ro"
+    assert core.approved_shares("demo") == {
+        "datasets": {"access": "ro", "approved_at": approved["approved_at"]}
+    }
+
+    # Deleting a granted folder is refused; revoking makes it deletable.
+    with pytest.raises(core.CapError):
+        core.delete_share("datasets", "datasets")
+    with pytest.raises(core.CapError):
+        core.delete_share("datasets", "wrong")
+    assert core.revoke_share_grant("demo", "datasets")["revoked"] is True
+    deleted = core.delete_share("datasets", "datasets")
+    assert deleted["deleted"] is True
+    assert not (tmp_path / "state" / "shares" / "datasets").exists()
+    assert core.share_census({})["folders"] == []
+
+
+def test_share_resolution_fails_closed_and_builds_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    cap = _share_cap(
+        tmp_path / "caps", "demo", '{"datasets": "ro", "cache": "rw"}'
+    )
+    core.create_share("datasets")
+    core.create_share("cache")
+
+    with pytest.raises(core.CapError) as missing:
+        core.resolve_shares("demo", cap)
+    assert "not approved" in str(missing.value)
+
+    core.set_share_grant("demo", "datasets", "ro")
+    core.set_share_grant("demo", "cache", "ro")
+    with pytest.raises(core.CapError) as weaker:
+        core.resolve_shares("demo", cap)
+    assert "read-only" in str(weaker.value)
+
+    core.set_share_grant("demo", "cache", "rw")
+    mounts = core.resolve_shares("demo", cap)
+    by_name = {mount.name: mount for mount in mounts}
+    assert by_name["datasets"].access == "ro"
+    assert by_name["cache"].access == "rw"
+    assert core.share_path("datasets").is_dir()
+
+    policy = core._sandbox_policy(
+        tmp_path,
+        tmp_path / "venv",
+        tmp_path / "data",
+        shares=mounts,
+    )
+    assert by_name["datasets"].path in policy.read
+    assert by_name["cache"].path in policy.write
+
+    placeholders = core.test_share_mounts(cap, tmp_path / "data" / "test")
+    assert {mount.access for mount in placeholders} == {"ro", "rw"}
+    assert all(mount.path.is_dir() for mount in placeholders)
+    assert all(
+        str(tmp_path / "state" / "shares") not in str(mount.path)
+        for mount in placeholders
+    )
+
+
+def test_share_names_and_corrupt_registry_are_contained(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    for bad in ("../escape", "Upper", "with space", "..", ""):
+        with pytest.raises(core.CapError):
+            core.share_path(bad)
+    registry = tmp_path / "state" / "state" / "shares.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not json", encoding="utf-8")
+    assert core.read_share_registry() == {"version": 1, "folders": {}}
+    assert not registry.exists()
+    assert list(registry.parent.glob("shares.corrupt-*.json"))
+
+
+def test_console_share_api(tmp_path, monkeypatch):
+    import importlib
+
+    import anyio
+
+    import capforge.core as core_module
+    import capforge.web as web
+
+    # Later slow tests reload core; keep the exception class in web aligned with it.
+    importlib.reload(core_module)
+    importlib.reload(web)
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_TOKEN", "sekrit")
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    _share_cap(tmp_path / "caps", "demo", '{"datasets": "ro"}')
+
+    async def run() -> None:
+        async with _console_client(web.asgi_app()) as client:
+            assert (await client.get("/api/shares")).status_code == 401
+            login = await client.post("/api/login", json={"token": "sekrit"})
+            headers = {"cookie": f"capforge_session={login.cookies['capforge_session']}"}
+
+            census = await client.get("/api/shares", headers=headers)
+            assert census.status_code == 200
+            folder = census.json()["folders"][0]
+            assert folder["name"] == "datasets"
+            assert folder["exists"] is False
+            assert folder["requests"][0]["state"] == "pending"
+
+            # Approval needs CSRF.
+            assert (
+                await client.put(
+                    "/api/caps/demo/shares/datasets",
+                    headers=headers,
+                    json={"access": "ro"},
+                )
+            ).status_code == 403
+
+            bad_access = await client.put(
+                "/api/caps/demo/shares/datasets",
+                headers={**headers, "x-csrf": "1"},
+                json={"access": "write"},
+            )
+            assert bad_access.status_code == 400
+            upgraded = await client.put(
+                "/api/caps/demo/shares/datasets",
+                headers={**headers, "x-csrf": "1"},
+                json={"access": "rw"},
+            )
+            assert upgraded.status_code == 400
+
+            approved = await client.put(
+                "/api/caps/demo/shares/datasets",
+                headers={**headers, "x-csrf": "1"},
+                json={"access": "ro"},
+            )
+            assert approved.status_code == 200, approved.text
+            assert approved.json()["shares"][0]["state"] == "approved"
+            assert (tmp_path / "state" / "shares" / "datasets").is_dir()
+
+            undeclared = await client.put(
+                "/api/caps/demo/shares/other",
+                headers={**headers, "x-csrf": "1"},
+                json={"access": "ro"},
+            )
+            assert undeclared.status_code == 400
+
+            detail = await client.get("/api/caps/demo", headers=headers)
+            assert detail.json()["shares"][0]["state"] == "approved"
+            listed = await client.get("/api/caps/demo/shares", headers=headers)
+            assert listed.status_code == 200
+            assert listed.json()["shares"][0]["state"] == "approved"
+
+            revoked = await client.delete(
+                "/api/caps/demo/shares/datasets",
+                headers={**headers, "x-csrf": "1"},
+            )
+            assert revoked.status_code == 200, revoked.text
+            assert revoked.json()["revoked"] is True
+            assert revoked.json()["shares"][0]["state"] == "pending"
+
+            deleted = await client.request(
+                "DELETE",
+                "/api/shares/datasets",
+                headers={**headers, "x-csrf": "1"},
+                json={"confirm": "wrong"},
+            )
+            assert deleted.status_code == 400
+            deleted = await client.request(
+                "DELETE",
+                "/api/shares/datasets",
+                headers={**headers, "x-csrf": "1"},
+                json={"confirm": "datasets"},
+            )
+            assert deleted.status_code == 200, deleted.text
+            after = {item["name"]: item for item in deleted.json()["folders"]}
+            assert after["datasets"]["exists"] is False
+            assert after["datasets"]["requests"][0]["state"] == "pending"
+
+            created = await client.post(
+                "/api/shares",
+                headers={**headers, "x-csrf": "1"},
+                json={"name": "cache", "note": "scratch"},
+            )
+            assert created.status_code == 200, created.text
+            named = {item["name"]: item for item in created.json()["folders"]}
+            assert named["cache"]["note"] == "scratch"
+
+    anyio.run(run)
+
+
+def test_delete_capability_revokes_grants_but_keeps_folder(tmp_path, monkeypatch):
+    from capforge import server
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    _share_cap(tmp_path / "caps", "demo", '{"datasets": "ro"}')
+    core.create_share("datasets")
+    core.set_share_grant("demo", "datasets", "ro")
+
+    result = server.delete_capability("demo", "demo")
+    assert result["ok"] is True, result
+    assert result["shares_revoked"] == 1
+    assert (tmp_path / "state" / "shares" / "datasets").is_dir()
+    assert core.approved_shares("demo") == {}
