@@ -156,7 +156,7 @@ scope instead.
 
 - `CAPFORGE_DATA_DIR=<state>/data/<name>/<tag>/` (or `draft`/`test`): writable per-version data,
   removed when the tag is pruned. A new tag starts empty.
-- `data: shared` adds `CAPFORGE_SHARED_DATA_DIR=<state>/data/<name>/shared/`: stable across tags,
+- `DATA = "shared"` adds `CAPFORGE_SHARED_DATA_DIR=<state>/data/<name>/shared/`: stable across tags,
   not pruned or snapshotted, not in `tree_hash`. The capability owns concurrency, migrations and
   backup expectations.
 - Code trees are never data stores. Fixtures/templates committed in the repo are read-only at

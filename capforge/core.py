@@ -29,7 +29,7 @@ log = logging.getLogger("capforge")
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-# Operator-managed environment names declared in SKILL.md (`env: [NAME, ...]`).
+# Operator-managed environment names declared by the Env model in deploy.py.
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 # Legacy pip requirement syntax. Kept only for parsing old frontmatter and rejecting it.
 # The ASGI object name in `app:` frontmatter; it becomes half of a uvicorn

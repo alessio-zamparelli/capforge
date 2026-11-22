@@ -1,4 +1,4 @@
-"""Serving engine and web listener for `kind: web` capabilities.
+"""Serving engine and web listener for web (`KIND = "web"`) capabilities.
 
 One instance per capability, pinned to its active tag, spawned as a uvicorn
 child bound to 127.0.0.1 and reverse-proxied at `http://<host>:<web port>/<name>/<path>`.

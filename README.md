@@ -10,9 +10,9 @@ into its own workspace, edits, and pushes. Capforge tests the pushed tree in a s
 environment and promotes it to an immutable tag on green. `run_capability` executes the active tag.
 There is no shared filesystem between the terminal and the server.
 
-A capability with `kind: web` is a long-lived ASGI service. It is reverse-proxied at
-`http://<host>:8080/cap/<name>/`; the console is `/ui/`, the control API is `/api/`, and the git
-smart-HTTP ingress is `/git/<name>.git`.
+A capability with `KIND = "web"` in `deploy.py` is a long-lived ASGI service. It is
+reverse-proxied at `http://<host>:8080/cap/<name>/`; the console is `/ui/`, the control API is
+`/api/`, and the git smart-HTTP ingress is `/git/<name>.git`.
 
 ## Shape
 
@@ -25,7 +25,7 @@ smart-HTTP ingress is `/git/<name>.git`.
   data directories. Git/uv children are tracked but not yet under Landlock (see `docs/NEXT.md`).
 - Per-capability pipeline/scaffold/served logs are bounded and exposed through MCP actions.
 - Operator-managed environment values are stored per capability and edited only in the console;
-  the model can declare names but never read or write values.
+  the model declares `Env` fields in `deploy.py` but never reads or writes values.
 
 ## Install
 
@@ -124,7 +124,7 @@ With `--user`/rootless Docker, pre-chown the mounts.
 | `get_capability` | draft details, active tag, tags, data mode |
 | `scaffold_capability` | create the uv base project and bare repo; refuse an existing name |
 | `run_capability` | execute the active tag (or scaffold draft before first promotion) |
-| `serve_capability` | `start/stop/restart/status/logs` a `kind: web` active tag |
+| `serve_capability` | `start/stop/restart/status/logs` a web capability's active tag |
 | `staging` | `token` (Basic clone/push), `latest` (pipeline + log tail), `logs` |
 | `delete_capability` | stop and delete a capability and all server state; `confirm` must equal the name |
 | `rollback_capability` | move the active pointer; no draft or repo change |
@@ -186,10 +186,11 @@ not accepted. Do not put the token in the URL. Clone and push use the same token
 
 ## Web capabilities
 
-`kind: web` requires `uvicorn` in `[project].dependencies` and an ASGI `app`. After a green push,
-`serve_capability(name, action="start")` boots the active tag at `/cap/<name>/`. `restart` picks up
-a newly promoted tag; promotion alone does not restart it. Boot failures return the child log tail.
-The child is sandboxed by Landlock and writes only to its data directories.
+`KIND = "web"` in `deploy.py` requires `uvicorn` in `[project].dependencies` and an ASGI `app`.
+After a green push, `serve_capability(name, action="start")` boots the active tag at
+`/cap/<name>/`. `restart` picks up a newly promoted tag; promotion alone does not restart it.
+Boot failures return the child log tail. The child is sandboxed by Landlock and writes only to
+its data directories.
 
 ## Storage
 

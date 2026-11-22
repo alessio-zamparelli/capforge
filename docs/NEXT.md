@@ -32,7 +32,7 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `<state>/secrets/`; there is no at-rest encryption, rotation history, reveal or deletion
   workflow beyond the console. They are per capability and shared across tags, so a promoted push
   can read them at runtime. See `docs/ARCHITECTURE.md` §10.
-- **Shared data.** `data: shared` is unversioned and unsynchronized. Overlapping CLI calls and a
+- **Shared data.** `DATA = "shared"` is unversioned and unsynchronized. Overlapping CLI calls and a
   served web child can race; the capability must use SQLite/locks. Backups are the operator's job.
 - **Logs.** One rotated generation per pipeline/scaffold; served child logs rotate at 5 MB. There
   is no log shipping, history, or console log endpoint yet.

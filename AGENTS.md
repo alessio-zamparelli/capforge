@@ -21,7 +21,7 @@ Constraints that drive the design; do not "fix" them casually:
    `uv.lock` and `.python-version`. `uv sync --frozen` is the only install path.
 5. **Capability code is semi-trusted.** Landlock confines filesystem access; network/CPU/memory
    are not confined. Do not add the hub's own secrets to a capability environment; operator-set
-   values are opt-in per capability via `env:` and `<state>/secrets/`.
+   values are opt-in per capability via `Env` fields in `deploy.py` and `<state>/secrets/`.
 
 ## Layout
 

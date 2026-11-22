@@ -5,8 +5,9 @@
 #   docker compose up --build
 #
 # Then add http://<host>:8099/mcp as an MCP (Streamable HTTP) server in
-# Open WebUI. `kind: web` capabilities are served at http://<host>:8080/cap/<name>/
-# and the token-gated console lives at http://<host>:8080/ui/.
+# Open WebUI. Capabilities with KIND = "web" in deploy.py are served at
+# http://<host>:8080/cap/<name>/ and the token-gated console lives at
+# http://<host>:8080/ui/.
 #
 # Capabilities are git repositories. The caps directory is server-owned; the
 # model clones a repository instead of sharing a terminal mount. Host paths are
@@ -40,7 +41,9 @@ services:
       CAPFORGE_PORT: "8099"
       CAPFORGE_PATH: /mcp
       CAPFORGE_TRANSPORT: http
-      # Web listener: reverse proxy for kind: web capabilities + console.
+      # Web listener: reverse proxy for web capabilities + console. Served
+      # children get --root-path /cap/<name> and CAPFORGE_ROOT_PATH; injected
+      # by the server, not configured here.
       CAPFORGE_WEB_HOST: "0.0.0.0"
       CAPFORGE_WEB_PORT: "${CAPFORGE_WEB_PORT:-8080}"
       # Set a long random string to enable the console. Unset disables the
