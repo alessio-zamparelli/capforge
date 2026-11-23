@@ -191,6 +191,9 @@ uv run capforge test NAME
 cd ui && bun install --frozen-lockfile && bun run build
 ```
 
+pytest runs under xdist (`-n auto`) by default; pass `-n0` for a serial run. The suite is safe
+this way because every test owns its temp caps/state dirs and the stray sweep is per-process.
+
 `uv.lock` and `ui/bun.lock` are committed. After dependency changes run `uv lock` (or `bun
 install`) and commit the lock. CI and the image use `--locked`/`--frozen-lockfile`.
 

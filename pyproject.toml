@@ -38,7 +38,9 @@ packages = ["capforge"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# xdist is safe: every test owns its temp caps/state dirs and the stray sweep is
+# per-process (see AGENTS.md). Pass -n0 to debug a single test serially.
+addopts = "-ra -n auto"
 markers = [
     "slow: end-to-end tests that build real virtualenvs and subprocesses",
 ]

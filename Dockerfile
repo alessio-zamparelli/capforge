@@ -23,9 +23,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # git serves the capability receive/upload ingress and `list_tags` diffs.
 # util-linux provides `setpriv` and `prlimit`; the entrypoint drops privileges
-# after applying PUID/PGID.
+# after applying PUID/PGID. libatomic1 backs the compiler's __atomic builtins
+# on targets where the CPU cannot perform those operations natively.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git util-linux \
+ && apt-get install -y --no-install-recommends git util-linux libatomic1 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /uvx /bin/
