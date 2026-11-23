@@ -167,12 +167,36 @@ def test_delete_capability_stops_served_child(env):
     started = server.serve_capability("deleted", action="start")
     assert started["status"] == "running"
     result = server.delete_capability("deleted", "deleted")
-    assert result["ok"], result
-    assert result["deleted"] is True
-    assert server.get_capability("deleted")["ok"] is False
+    assert result["ok"] and result["pending"] is True, result
+    assert server.get_capability("deleted")["ok"] is True
+    assert server.get_capability("deleted")["pending_delete"] is not None
     assert "deleted" not in web._INSTANCES
+    assert web._registry_record("deleted")["desired"] == "stop"
+    assert (root / "caps" / "deleted").exists()
+
+    purged = server.purge_capability("deleted", "deleted")
+    assert purged["ok"] and purged["deleted"] is True
+    assert server.get_capability("deleted")["ok"] is False
     assert web._registry_record("deleted") is None
     assert not (root / "caps" / "deleted").exists()
+
+
+def test_restore_skips_a_pending_capability(env):
+    root, server, web, _core = env
+    _make_web_cap(env, "pendingcap")
+    assert server.serve_capability("pendingcap", action="start")["status"] == "running"
+    assert server.delete_capability("pendingcap", "pendingcap")["pending"] is True
+
+    # Simulate a crash between marking pending and recording desired=stop.
+    record = web._registry_record("pendingcap")
+    record["desired"] = "start"
+    web._persist_record("pendingcap", record)
+    assert web.restore() == 0
+    assert "pendingcap" not in web._INSTANCES
+    assert web._registry_record("pendingcap")["desired"] == "stop"
+
+    assert server.purge_capability("pendingcap", "pendingcap")["deleted"] is True
+    assert not (root / "caps" / "pendingcap").exists()
 
 
 def test_serve_refuses_draft_and_cli(env):

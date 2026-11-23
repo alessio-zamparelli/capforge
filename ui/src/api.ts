@@ -131,6 +131,11 @@ export interface CapInfo {
   active: string | null;
   draft_ready: boolean;
   draft_error: string | null;
+  pending_delete: {
+    requested_at: number;
+    requested_by: Record<string, string>;
+    reason: string;
+  } | null;
   draft_changed: boolean;
   served: ServedInfo | null;
   env: EnvInfo[];
@@ -212,6 +217,16 @@ export async function remove(name: string, confirm: string): Promise<unknown> {
       method: "POST",
       headers: { "content-type": "application/json", "X-CSRF": "1" },
       body: JSON.stringify({ confirm }),
+    })
+  );
+}
+
+export async function cancelDelete(name: string): Promise<unknown> {
+  return jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/cancel-delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({}),
     })
   );
 }

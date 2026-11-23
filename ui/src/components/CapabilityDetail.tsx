@@ -90,6 +90,15 @@ export function CapabilityDetail({
 
   return (
     <div className="flex flex-col gap-4">
+      {detail?.pending_delete && (
+        <Alert variant="destructive">
+          <AlertTitle>Pending deletion</AlertTitle>
+          <AlertDescription>
+            An operator requested deletion of this capability. Purge it to remove all state,
+            or cancel the request to keep it.
+          </AlertDescription>
+        </Alert>
+      )}
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
           <GitBranch className="size-4" aria-hidden="true" />

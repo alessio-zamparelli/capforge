@@ -235,12 +235,17 @@ L'healthcheck dell'immagine verifica `http://127.0.0.1:8080/readyz`; sovrascrivi
 | `run_capability` | esegue il tag attivo (o la draft scaffold prima della prima promozione) |
 | `serve_capability` | `start/stop/restart/status/logs` del tag attivo di una capability web |
 | `staging` | `token` (clone/push Basic), `latest` (pipeline + tail log), `logs` |
-| `delete_capability` | ferma ed elimina una capability e tutto lo stato server; `confirm` deve coincidere con il nome |
+| `delete_capability` | richiede l'eliminazione (stop + revoca token; `confirm` deve coincidere con il nome); l'operatore esegue la purge |
 | `rollback_capability` | sposta il puntatore attivo; non modifica draft o repository |
 | `list_tags` | tag, marcatore attivo, diff opzionale rispetto alla draft |
 
 Promozione e test avvengono solo nella pipeline. `capforge promote`/`capforge test` sono comandi di
 recupero per l'operatore; non sono tool MCP.
+
+`delete_capability` è una richiesta di eliminazione, non un'azione irreversibile del modello. Le
+capability in attesa vengono fermate e non possono essere eseguite, servite, pushate o ricevere
+token; l'operatore le elimina dalla console o con `capforge delete`, oppure annulla con
+`capforge cancel-delete`.
 
 ## Contratto della capability
 
@@ -377,6 +382,8 @@ uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=71
 uv run --locked ruff check .
 uv run --locked mypy capforge
 ```
+
+pytest usa xdist (`-n auto`) per impostazione predefinita; passa `-n0` per un'esecuzione seriale.
 
 La suite veloce copre parsing, validazione, stato, route, autenticazione della console, policy di
 sandbox e la superficie dei dieci tool. La suite lenta costruisce veri ambienti uv, repository git,

@@ -138,6 +138,10 @@ def _ttl() -> int:
 
 def mint(name: str, actor: dict[str, Any] | None = None) -> dict[str, Any]:
     core.cap_path(name)
+    if core.pending_delete(name):
+        raise core.CapError(
+            f"{name!r} is pending deletion; an operator must purge or cancel it first"
+        )
     actor = actor or {}
     if os.environ.get("CAPFORGE_REQUIRE_USER", "0").strip() == "1" and not actor.get("id"):
         raise core.CapError("An authenticated actor is required to mint a git token")
@@ -206,6 +210,24 @@ def verify(token: str, name: str) -> dict[str, Any] | None:
         record["last_used"] = now
         _write_tokens(tokens)
         return record
+
+
+def revoke_tokens(name: str) -> int:
+    """Drop every outstanding git token for one capability."""
+    removed = 0
+    with core._file_lock(core.state_dir() / "locks" / "staging-tokens.lock"):
+        tokens = _read_tokens()
+        kept = {
+            key: value
+            for key, value in tokens.items()
+            if value.get("name") != name
+        }
+        removed = len(tokens) - len(kept)
+        if removed:
+            _write_tokens(kept)
+    if removed:
+        log.info("revoked %d git token(s) cap=%s", removed, name)
+    return removed
 
 
 # -------------------------------------------------------------------------- state
@@ -420,6 +442,10 @@ def start(
     basic_username: str = "",
 ) -> dict[str, Any]:
     core.cap_path(name)
+    if core.pending_delete(name):
+        raise core.CapError(
+            f"{name!r} is pending deletion; an operator must purge or cancel it first"
+        )
     if not gitremote.repo_path(name).is_dir():
         raise core.CapError(f"No repository for {name!r}; scaffold it first")
     current = reconcile(name)

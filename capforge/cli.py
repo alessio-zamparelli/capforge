@@ -236,14 +236,24 @@ def _test(args: argparse.Namespace) -> int:
 
 
 def _delete(args: argparse.Namespace) -> int:
-    from .server import delete_capability
+    from .server import purge_capability
 
     if not args.yes:
-        answer = input(f"Delete capability {args.name!r} and all state? [y/N] ").strip().lower()
+        answer = input(
+            f"Permanently delete capability {args.name!r} and all state? [y/N] "
+        ).strip().lower()
         if answer not in {"y", "yes"}:
             print("aborted", file=sys.stderr)
             return 1
-    result = delete_capability(args.name, args.name)
+    result = purge_capability(args.name, args.name)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
+def _cancel_delete(args: argparse.Namespace) -> int:
+    from .server import cancel_delete
+
+    result = cancel_delete(args.name)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok") else 1
 
@@ -284,10 +294,18 @@ def main(argv: list[str] | None = None) -> int:
     test.add_argument("name")
     test.set_defaults(func=_test)
 
-    delete = sub.add_parser("delete", help="Delete a capability and all of its server state")
+    delete = sub.add_parser(
+        "delete", help="Permanently delete a capability and all of its server state"
+    )
     delete.add_argument("name")
     delete.add_argument("--yes", action="store_true", dest="yes")
     delete.set_defaults(func=_delete)
+
+    cancel_delete = sub.add_parser(
+        "cancel-delete", help="Cancel a pending deletion request"
+    )
+    cancel_delete.add_argument("name")
+    cancel_delete.set_defaults(func=_cancel_delete)
 
     tools = sub.add_parser("tools", help="Print the MCP tool schemas as JSON")
     tools.set_defaults(func=lambda _a: _print_tools())

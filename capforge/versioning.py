@@ -104,6 +104,10 @@ def promote(
         draft_hash = tree_hash(cap.path)
         lock = lock_hash(cap.path)
         state = read_state(name)
+        if state.get("pending_delete") is not None:
+            raise CapError(
+                f"{name!r} is pending deletion; an operator must purge or cancel it first"
+            )
         active = state.get("active")
         tags = list(state.get("tags") or [])
 

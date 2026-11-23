@@ -9,6 +9,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
@@ -78,6 +79,7 @@ function CapabilityCard({
 }) {
   const [open, setOpen] = useState(false);
   const served = cap.served;
+  const pending = cap.pending_delete !== null;
   const running = served?.status === "running";
   const envSet = cap.env.filter((item) => item.configured).length;
   const envMissing = cap.env.filter((item) => item.required && !item.configured).length;
@@ -110,6 +112,7 @@ function CapabilityCard({
           {cap.serves_web && <Badge variant="outline">Web</Badge>}
           {cap.serves_web && cap.web_route && <RouteLink route={cap.web_route} />}
           {cap.active && <Badge variant="secondary">{cap.active}</Badge>}
+          {pending && <StatusBadge warn>pending deletion</StatusBadge>}
           {cap.draft_changed && <StatusBadge warn>draft changed</StatusBadge>}
           {cap.env.length > 0 && (
             <StatusBadge warn={envMissing > 0}>
@@ -138,7 +141,7 @@ function CapabilityCard({
           <div className="flex shrink-0 items-center gap-1">
             <ActionButton
               label="Start"
-              disabled={running || busy !== null}
+              disabled={pending || running || busy !== null}
               busy={busy === `${cap.name}:start`}
               onClick={() => void onAct(cap.name, "start")}
             >
@@ -146,7 +149,7 @@ function CapabilityCard({
             </ActionButton>
             <ActionButton
               label="Stop"
-              disabled={!running || busy !== null}
+              disabled={pending || !running || busy !== null}
               busy={busy === `${cap.name}:stop`}
               onClick={() => void onAct(cap.name, "stop")}
             >
@@ -154,7 +157,7 @@ function CapabilityCard({
             </ActionButton>
             <ActionButton
               label="Restart"
-              disabled={busy !== null || (!running && !served)}
+              disabled={pending || busy !== null || (!running && !served)}
               busy={busy === `${cap.name}:restart`}
               onClick={() => void onAct(cap.name, "restart")}
             >
@@ -223,6 +226,7 @@ function CapabilityCard({
           <Separator />
           <DeleteCapability
             name={cap.name}
+            pending={pending}
             onChanged={onChanged}
             onAuthLost={onAuthLost}
           />
@@ -234,15 +238,34 @@ function CapabilityCard({
 
 function DeleteCapability({
   name,
+  pending,
   onChanged,
   onAuthLost,
 }: {
   name: string;
+  pending: boolean;
   onChanged: () => Promise<void>;
   onAuthLost: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  const cancel = async () => {
+    setBusy(true);
+    try {
+      await api.cancelDelete(name);
+      toast.success(`Cancelled deletion of ${name}.`);
+      await onChanged();
+    } catch (err) {
+      if (isAuthError(err)) {
+        onAuthLost();
+        return;
+      }
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const remove = async () => {
     setBusy(true);
@@ -264,16 +287,26 @@ function DeleteCapability({
 
   return (
     <div className="flex flex-wrap items-center justify-end gap-2">
-      <Button variant="destructive" size="sm" onClick={() => setOpen(true)}>
+      {pending && (
+        <Button variant="outline" size="sm" onClick={() => void cancel()} disabled={busy}>
+          <Undo2 data-icon="inline-start" />
+          Cancel deletion
+        </Button>
+      )}
+      <Button variant="destructive" size="sm" onClick={() => setOpen(true)} disabled={busy}>
         <Trash2 data-icon="inline-start" />
-        Delete
+        {pending ? "Purge" : "Delete"}
       </Button>
       <ConfirmDialog
         open={open}
         onOpenChange={setOpen}
-        title={`Delete ${name}?`}
-        description="This removes the capability, tags, environments and server state. Shared folders are kept, but their grants for this capability are revoked."
-        confirmLabel="Delete capability"
+        title={pending ? `Purge ${name}?` : `Delete ${name}?`}
+        description={
+          pending
+            ? "This permanently removes the capability, tags, environments, secrets and server state. This cannot be undone."
+            : "This removes the capability, tags, environments, secrets and server state. Shared folders are kept, but their grants for this capability are revoked."
+        }
+        confirmLabel={pending ? "Purge capability" : "Delete capability"}
         confirmText={name}
         busy={busy}
         onConfirm={remove}

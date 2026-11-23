@@ -19,6 +19,9 @@ have a shared filesystem mount. Work in a clone.
 The pipeline tests the pushed tree in a state-owned uv environment. Only a green push is swapped
 into the server draft and promoted. There is no manual promote/test/install tool.
 
+`delete_capability(name, confirm)` only requests deletion: it stops the served instance and revokes
+git tokens, but an operator must purge the capability in the console or with `capforge delete`.
+
 ## Project layout
 
     <name>/

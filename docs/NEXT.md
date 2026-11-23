@@ -33,8 +33,9 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - **`deploy.py` migration.** The 0.5.0 hard cut requires `deploy.py`; tags created by 0.4.x have
   no descriptor and are refused, so they cannot be rolled back to. Re-push the capability with a
   `deploy.py` and promote a new tag to migrate it.
-- **Capability deletion.** `delete_capability(name, confirm)` and `capforge delete` remove a
-  capability and its state; there is no undo/archive, and scaffold overwrite does not exist.
+- **Capability deletion.** `delete_capability(name, confirm)` only marks a capability pending; an
+  operator purges it via the console or `capforge delete` and can cancel via `capforge
+  cancel-delete`. There is no undo/archive after purge, and scaffold overwrite does not exist.
 - **Secrets.** Operator-managed env values are plaintext JSON with mode `0600` under
   `<state>/secrets/`; there is no at-rest encryption, rotation history, reveal or deletion
   workflow beyond the console. They are per capability and shared across tags, so a promoted push

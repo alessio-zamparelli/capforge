@@ -306,6 +306,32 @@ def test_execute_refuses_web_capabilities(tmp_path, monkeypatch):
     assert "serve_capability" in str(exc_info.value)
 
 
+def test_purge_refuses_a_live_run(tmp_path, monkeypatch):
+    from capforge import server
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    _env_cap(tmp_path / "caps")
+    core.write_state(
+        "demo",
+        {
+            "name": "demo",
+            "active": {"tag": "v1"},
+            "tags": [{"tag": "v1", "created_at": 1}],
+            "pruned": [],
+        },
+    )
+    with core.tag_run_lock("demo", "v1"):
+        blocked = server.purge_capability("demo", "demo")
+        assert blocked["ok"] is False
+        assert "run is in progress" in blocked["error"]
+        assert (tmp_path / "caps" / "demo").is_dir()
+
+    assert server.purge_capability("demo", "demo")["deleted"] is True
+    assert not (tmp_path / "caps" / "demo").exists()
+
+
 def test_prune_defers_a_version_with_a_live_run(tmp_path, monkeypatch):
     from capforge import versioning
 
@@ -1339,7 +1365,7 @@ def test_git_route_accepts_basic_and_rejects_bearer(tmp_path, monkeypatch):
     anyio.run(run)
 
 
-def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
+def test_delete_capability_requests_then_purges_all_state(tmp_path, monkeypatch):
 
     from capforge import core, server, staging
 
@@ -1370,8 +1396,21 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     staging.mint(name, {"id": "actor-1"})
 
     assert server.delete_capability(name, "wrong")["ok"] is False
-    result = server.delete_capability(name, name)
-    assert result["ok"] and result["deleted"] is True
+    requested = server.delete_capability(name, name)
+    assert requested["ok"] and requested["pending"] is True
+    assert requested["deleted"] is False and requested["already"] is False
+    assert (caps / name).exists()
+    assert (state / "versions" / name).exists()
+    assert (state / "secrets" / f"{name}.json").exists()
+    assert core.pending_delete(name) is not None
+    assert all(value.get("name") != name for value in staging._read_tokens().values())
+
+    repeated = server.delete_capability(name, name)
+    assert repeated["ok"] and repeated["already"] is True
+
+    assert server.purge_capability(name, "wrong")["ok"] is False
+    result = server.purge_capability(name, name)
+    assert result["ok"] and result["deleted"] is True and result["pending"] is False
     assert not (caps / name).exists()
     assert not (state / "versions" / name).exists()
     assert not (state / "git" / f"{name}.git").exists()
@@ -1379,12 +1418,86 @@ def test_delete_capability_removes_state_and_tokens(tmp_path, monkeypatch):
     assert not (state / "staging" / f"{name}.json").exists()
     assert not (state / "secrets" / f"{name}.json").exists()
     assert not backup.exists()
-    assert all(
-        value.get("name") != name
-        for value in staging._read_tokens().values()
-    )
-    again = server.delete_capability(name, name)
+    again = server.purge_capability(name, name)
     assert again["ok"] and again["deleted"] is False
+
+
+def test_pending_delete_blocks_model_actions_and_can_be_cancelled(tmp_path, monkeypatch):
+    from capforge import server
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    _env_cap(tmp_path / "caps")
+
+    assert server.delete_capability("demo", "demo")["pending"] is True
+    assert "pending deletion" in server.run_capability("demo")["error"]
+    assert "pending deletion" in server.serve_capability("demo", action="start")["error"]
+    assert "pending deletion" in server.staging("demo", action="token")["error"]
+    assert "pending deletion" in server.scaffold_capability("demo", "d")["error"]
+    assert "pending deletion" in server.promote_capability("demo")["error"]
+    assert "pending deletion" in server.rollback_capability("demo", "v1")["error"]
+
+    cancelled = server.cancel_delete("demo")
+    assert cancelled["ok"] is True and cancelled["cancelled"] is True
+    assert core.pending_delete("demo") is None
+    assert server.cancel_delete("demo")["cancelled"] is False
+
+
+def test_pending_delete_state_is_normalized(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    state = tmp_path / "state" / "state"
+    state.mkdir(parents=True)
+    path = state / "demo.json"
+    path.write_text(
+        json.dumps(
+            {
+                "pending_delete": {
+                    "requested_at": 123,
+                    "requested_by": {"id": "u1", "ignored": 4},
+                    "reason": "requested",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert core.pending_delete("demo") == {
+        "requested_at": 123,
+        "requested_by": {"id": "u1"},
+        "reason": "requested",
+    }
+
+    path.write_text(
+        json.dumps({"pending_delete": {"requested_at": "not-an-int"}}),
+        encoding="utf-8",
+    )
+    assert core.pending_delete("demo") is None
+
+
+def test_git_push_is_rejected_while_pending(tmp_path, monkeypatch):
+    import anyio
+    import httpx
+
+    import capforge.web as web
+
+    monkeypatch.setenv("CAPFORGE_CAPS_DIR", str(tmp_path / "caps"))
+    monkeypatch.setenv("CAPFORGE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CAPFORGE_WEB_UI", "0")
+    (tmp_path / "caps").mkdir()
+    core.mark_pending_delete("demo", {"id": "tester"})
+    monkeypatch.setattr(
+        web,
+        "_git_auth",
+        lambda request, name: {"actor": {"id": "tester"}, "auth_method": "basic"},
+    )
+
+    async def run() -> int:
+        transport = httpx.ASGITransport(app=web.asgi_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://probe") as client:
+            response = await client.post("/git/demo.git/git-receive-pack", content=b"push")
+            return response.status_code
+
+    assert anyio.run(run) == 409
 
 
 # ------------------------------------------------------------------ shared volumes
@@ -1632,7 +1745,7 @@ def test_delete_capability_revokes_grants_but_keeps_folder(tmp_path, monkeypatch
     core.create_share("datasets")
     core.set_share_grant("demo", "datasets", "ro")
 
-    result = server.delete_capability("demo", "demo")
+    result = server.purge_capability("demo", "demo")
     assert result["ok"] is True, result
     assert result["shares_revoked"] == 1
     assert (tmp_path / "state" / "shares" / "datasets").is_dir()

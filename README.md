@@ -228,12 +228,16 @@ With `--user`/rootless Docker, pre-chown the mounts. The image healthcheck probe
 | `run_capability` | execute the active tag (or scaffold draft before first promotion) |
 | `serve_capability` | `start/stop/restart/status/logs` a web capability's active tag |
 | `staging` | `token` (Basic clone/push), `latest` (pipeline + log tail), `logs` |
-| `delete_capability` | stop and delete a capability and all server state; `confirm` must equal the name |
+| `delete_capability` | request deletion (stop + revoke tokens; `confirm` must equal the name); an operator purges |
 | `rollback_capability` | move the active pointer; no draft or repo change |
 | `list_tags` | tags, active marker, optional draft diff |
 
 Promotion and testing are pipeline-only. `capforge promote`/`capforge test` are operator recovery
 commands; they are not MCP tools.
+
+`delete_capability` is a deletion request, not an irreversible model action. Pending capabilities
+are stopped and cannot run, serve, push or mint tokens; an operator purges them in the console or
+with `capforge delete`, or cancels the request with `capforge cancel-delete`.
 
 ## Capability contract
 
@@ -368,6 +372,8 @@ uv run --locked pytest -q --cov=capforge --cov-branch --cov-fail-under=71
 uv run --locked ruff check .
 uv run --locked mypy capforge
 ```
+
+pytest runs under xdist (`-n auto`) by default; pass `-n0` for a serial run.
 
 The fast suite covers parsing, validation, state, routes, console auth, sandbox policy and the
 ten-tool surface. The slow suite builds real uv envs, git repos, uvicorn children and a real

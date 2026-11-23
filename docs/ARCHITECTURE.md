@@ -106,11 +106,14 @@ report (HTTP 200 even for `ng`). `upload-pack` is read-only and does not take th
 The managed `pre-receive` hook checks the pipeline lock and the ref policy. It is a backstop for a
 non-HTTP local push; the route is authoritative for HTTP.
 
-Deletion is explicit: `delete_capability(name, confirm)` requires `confirm == name`, refuses while
-a push/pipeline is running, stops a served instance, and removes the draft, versions, venvs, its own
-data (including `DATA = "shared"`), repo, state, staging, logs, locks and token records. It revokes
-the capability's grants in cross-capability shared folders but keeps those folders and their data.
-`capforge delete` is the operator equivalent.
+Deletion is two-phase. `delete_capability(name, confirm)` requires `confirm == name`, refuses while
+a push/pipeline is running, writes a durable `pending_delete` marker, stops a served instance and
+revokes outstanding git tokens. Pending capabilities stay visible for inspection but cannot run,
+serve, push, mint tokens, scaffold, promote or roll back. The console and `capforge delete` are the
+operator purge path: they clear the marker and remove the draft, versions, venvs, its own data
+(including `DATA = "shared"`), repo, state, staging, logs, locks and token records, and revoke the
+capability's grants in cross-capability shared folders while keeping those folders and their data.
+`capforge cancel-delete` clears the marker without touching capability files.
 
 ## 6. Pipeline
 

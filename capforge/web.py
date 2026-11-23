@@ -473,6 +473,23 @@ def forget(name: str) -> dict[str, Any]:
     return {"stopped": stopped}
 
 
+def forget_locked(name: str) -> dict[str, Any]:
+    """`forget` for callers that already hold `cap_lock(name)`.
+
+    A nested flock in the same process would deadlock, so operator purge holds
+    cap_lock across the stop, registry removal and file cleanup.
+    """
+    stopped = False
+    with _engine_lock:
+        instance = _INSTANCES.get(name)
+    if instance is not None:
+        _stop_instance(instance)
+        stopped = True
+    _persist_record(name, None)
+    shutil.rmtree(core.state_dir() / "served" / name, ignore_errors=True)
+    return {"stopped": stopped}
+
+
 def _stop_instance(instance: _Instance) -> None:
     """SIGTERM the group, then SIGKILL after a grace period. Reaps the child and
     sweeps anything the instance had already re-parented to us, so nothing of it
@@ -502,6 +519,10 @@ def _stop_instance(instance: _Instance) -> None:
 
 
 def _start_locked(name: str) -> dict[str, Any]:
+    if core.pending_delete(name) is not None:
+        raise CapError(
+            f"{name!r} is pending deletion; an operator must purge or cancel it first"
+        )
     if name in _INSTANCES and _INSTANCES[name].proc.poll() is None:
         return {**_status_of(name), "warning": "already running"}
     tag, meta, _source = _active_or_raise(name)
@@ -648,6 +669,11 @@ def restore() -> int:
     restored = 0
     for name, record in read_registry().items():
         if record.get("desired") != "start":
+            continue
+        if core.pending_delete(name) is not None:
+            record["desired"] = "stop"
+            _persist_record(name, record)
+            log.info("not restoring cap=%s: pending deletion", name)
             continue
         tag = str(record.get("tag"))
         try:
@@ -1029,6 +1055,7 @@ async def api_caps(request: Request) -> Response:
                     "active": active,
                     "draft_ready": cap.draft_ready,
                     "draft_error": cap.error,
+                    "pending_delete": state.get("pending_delete"),
                     "draft_changed": bool(
                         active
                         and cap.draft_ready
@@ -1300,6 +1327,7 @@ async def api_cap_detail(request: Request) -> Response:
             "active_content_hash": (active.get("content_hash") or "")[:12],
             "draft_ready": cap.draft_ready,
             "draft_error": cap.error,
+            "pending_delete": state.get("pending_delete"),
             "draft_changed": bool(
                 active.get("content_hash")
                 and cap.draft_ready
@@ -1373,7 +1401,7 @@ async def api_rollback(request: Request) -> Response:
 
 
 async def api_delete(request: Request) -> Response:
-    """Delete a capability and all of its server state. Confirm with the exact name."""
+    """Purge a capability and all of its server state. Confirm with the exact name."""
     denied = _console_denied(request, write=True)
     if denied is not None:
         return denied
@@ -1385,7 +1413,19 @@ async def api_delete(request: Request) -> Response:
     confirm = str(payload.get("confirm") or "")
     from . import server as server_module
 
-    result = await run_in_threadpool(server_module.delete_capability, name, confirm)
+    result = await run_in_threadpool(server_module.purge_capability, name, confirm)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+async def api_cancel_delete(request: Request) -> Response:
+    """Cancel a pending deletion; leaves the capability and its state intact."""
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    from . import server as server_module
+
+    result = await run_in_threadpool(server_module.cancel_delete, name)
     return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
@@ -1629,6 +1669,12 @@ async def git_service(request: Request) -> Response:
     record = _git_auth(request, name)
     if record is None:
         return _unauthorized(name)
+    if service == "git-receive-pack" and core.pending_delete(name) is not None:
+        return Response(
+            "capability is pending deletion; pushes are disabled\n",
+            status_code=409,
+            media_type="text/plain",
+        )
     body_path = await _spool_body(request, _max_upload_bytes())
     if body_path is None:
         return Response("request body too large\n", status_code=413, media_type="text/plain")
@@ -1793,6 +1839,7 @@ def asgi_app() -> Starlette:
         Route("/api/caps/{name}/logs", api_logs, methods=["GET"]),
         Route("/api/caps/{name}/rollback", api_rollback, methods=["POST"]),
         Route("/api/caps/{name}/delete", api_delete, methods=["POST"]),
+        Route("/api/caps/{name}/cancel-delete", api_cancel_delete, methods=["POST"]),
         Route("/api/caps/{name}", api_cap_detail, methods=["GET"]),
         Route("/api/caps/{name}/{action}", api_control, methods=["POST"]),
         Route("/git/{name}.git/info/refs", git_info_refs, methods=["GET"]),

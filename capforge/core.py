@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -929,6 +929,29 @@ def read_state(name: str) -> dict[str, Any]:
         for item in (raw_pruned if isinstance(raw_pruned, list) else [])
         if isinstance(item, dict) and isinstance(item.get("tag"), str)
     ]
+    raw_pending = data.get("pending_delete")
+    if (
+        isinstance(raw_pending, dict)
+        and isinstance(raw_pending.get("requested_at"), int)
+        and not isinstance(raw_pending.get("requested_at"), bool)
+    ):
+        actor = raw_pending.get("requested_by")
+        clean_actor: dict[str, str] = {}
+        if isinstance(actor, dict):
+            clean_actor = {
+                str(key)[:64]: str(value)[:300]
+                for key, value in actor.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        elif isinstance(actor, str):
+            clean_actor = {"id": actor[:300]}
+        data["pending_delete"] = {
+            "requested_at": int(raw_pending["requested_at"]),
+            "requested_by": clean_actor,
+            "reason": str(raw_pending.get("reason") or "")[:MAX_SHARE_NOTE],
+        }
+    else:
+        data["pending_delete"] = None
     return data
 
 
@@ -938,6 +961,56 @@ def write_state(name: str, data: dict[str, Any]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
+
+
+def pending_delete(name: str) -> dict[str, Any] | None:
+    """Return the pending-deletion marker, if this capability is awaiting purge."""
+    pending = read_state(name).get("pending_delete")
+    return pending if isinstance(pending, dict) else None
+
+
+def mark_pending_delete(
+    name: str,
+    actor: dict[str, Any] | None = None,
+    reason: str = "",
+    *,
+    locked: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """Mark a capability for operator purge; returns (marker, created).
+
+    `locked=True` is for callers that already hold `cap_lock(name)` (operator
+    purge), avoiding a nested flock in the same process.
+    """
+    with (nullcontext() if locked else cap_lock(name)):
+        data = read_state(name)
+        existing = data.get("pending_delete")
+        if isinstance(existing, dict):
+            return existing, False
+        pending: dict[str, Any] = {
+            "requested_at": int(time.time()),
+            "requested_by": {
+                str(key)[:64]: str(value)[:300]
+                for key, value in (actor or {}).items()
+                if isinstance(value, str)
+            },
+            "reason": str(reason or "")[:MAX_SHARE_NOTE],
+        }
+        data["pending_delete"] = pending
+        write_state(name, data)
+    log.info("marked cap=%s for deletion actor=%s", name, pending["requested_by"].get("id"))
+    return pending, True
+
+
+def clear_pending_delete(name: str) -> bool:
+    """Cancel a pending deletion without touching the capability files."""
+    with cap_lock(name):
+        data = read_state(name)
+        if not isinstance(data.get("pending_delete"), dict):
+            return False
+        data["pending_delete"] = None
+        write_state(name, data)
+    log.info("cancelled pending deletion cap=%s", name)
+    return True
 
 
 # ---------------------------------------------------------------- capability environment

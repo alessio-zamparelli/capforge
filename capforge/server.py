@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import logging
 import shutil
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from .core import (
     sandbox_mode,
     serve_boot_timeout,
     state_dir,
+    tag_lock_path,
     test_timeout,
     tree_hash,
     try_file_lock,
@@ -212,6 +214,7 @@ def list_capabilities() -> dict:
                 ),
                 "tags": len(state.get("tags") or []),
                 "git_url": _git_url(cap.name),
+                "pending_delete": state.get("pending_delete"),
                 "env": env_status(cap.name, caps_for),
                 "shares": core.share_status(cap.name, caps_for),
             }
@@ -250,6 +253,7 @@ def get_capability(name: str) -> dict:
         "files": files[: core.MAX_LISTED_FILES],
         "files_truncated": files_truncated,
         "file_count": None if files_truncated else len(files),
+        "pending_delete": state.get("pending_delete"),
         "skill_md": (cap.path / "SKILL.md").read_text(encoding="utf-8", errors="replace")
         if (cap.path / "SKILL.md").is_file()
         else None,
@@ -266,6 +270,13 @@ def scaffold_capability(name: str, description: str, kind: str = "cli") -> dict:
     kind = str(kind).strip().lower() or "cli"
     if kind not in SCAFFOLD_KINDS:
         return _fail(f"kind must be one of {list(SCAFFOLD_KINDS)}, got {kind!r}")
+    try:
+        if core.pending_delete(cap_path(name).name) is not None:
+            return _fail(
+                f"{name!r} is pending deletion; an operator must purge or cancel it first"
+            )
+    except CapError as exc:
+        return _fail(str(exc))
     try:
         result = scaffold.create(name, description, kind)
     except CapError as exc:
@@ -286,6 +297,8 @@ def test_capability(name: str, args: dict | None = None) -> dict:
     cap, err = _cap_or_error(name)
     if err:
         return err
+    if core.pending_delete(cap.name) is not None:
+        return _fail(f"{name!r} is pending deletion; an operator must purge or cancel it first")
     if not cap.draft_ready:
         return _fail(f"Draft is not runnable: {cap.error}")
     from .core import run_tests
@@ -313,6 +326,8 @@ def promote_capability(
     cap, err = _cap_or_error(name)
     if err:
         return err
+    if core.pending_delete(cap.name) is not None:
+        return _fail(f"{name!r} is pending deletion; an operator must purge or cancel it first")
     if not cap.draft_ready:
         return _fail(f"Draft is not runnable: {cap.error}")
     if not skip_tests:
@@ -348,6 +363,8 @@ def run_capability(name: str, args: dict | None = None) -> dict:
         return _fail(str(exc))
     if not path.is_dir():
         return _fail(f"No capability named {name!r} in {caps_dir()}; scaffold it first.")
+    if core.pending_delete(name) is not None:
+        return _fail(f"{name!r} is pending deletion; an operator must purge or cancel it first")
 
     state = versioning.read_state(name)
     active = state.get("active") or {}
@@ -410,6 +427,8 @@ def serve_capability(name: str, action: str = "status", tail: int | None = None)
     action = str(action).strip().lower() or "status"
     if action not in ("start", "stop", "restart", "status", "logs"):
         return _fail(f"action must be one of start, stop, restart, status, logs; got {action!r}")
+    if action in {"start", "restart"} and core.pending_delete(name) is not None:
+        return _fail(f"{name!r} is pending deletion; an operator must purge or cancel it first")
     try:
         from . import web
 
@@ -481,11 +500,35 @@ def _delete_targets(name: str) -> list[Path]:
     ]
 
 
+def _delete_exists(name: str, targets: list[Path]) -> bool:
+    from . import staging as staging_service
+
+    return (
+        any(path.exists() for path in targets)
+        or bool(staging_service.read_state(name))
+        or bool(core.approved_shares(name))
+    )
+
+
+def _pipeline_busy(name: str) -> bool:
+    from . import staging as staging_service
+
+    current = staging_service.reconcile(name)
+    return bool(
+        current.get("state") and current.get("state") not in staging_service.TERMINAL_STATES
+    )
+
+
 @mcp.tool
-def delete_capability(name: str, confirm: str) -> dict:
-    """Delete a capability and all of its server-side state. `confirm` must equal `name`.
-    Stops a served instance first, refuses while a push or pipeline is running, and is
-    idempotent when the capability is already gone."""
+def delete_capability(
+    name: str, confirm: str, ctx: Context | None = None
+) -> dict:
+    """Request deletion of a capability. `confirm` must equal `name`.
+
+    The instance is stopped and outstanding git tokens are revoked, but no files
+    are removed: an operator must purge in the console or with `capforge delete`.
+    Refuses while a push or pipeline is running. A second request is idempotent.
+    """
     from . import staging as staging_service
 
     try:
@@ -495,64 +538,173 @@ def delete_capability(name: str, confirm: str) -> dict:
     if confirm != validated:
         return _fail("confirm must equal the capability name exactly")
     targets = _delete_targets(validated)
-    exists = (
-        any(path.exists() for path in targets)
-        or bool(staging_service.read_state(validated))
-        or bool(core.approved_shares(validated))
-    )
-    if not exists:
+    if not _delete_exists(validated, targets):
         return {
             "ok": True,
+            "pending": False,
             "deleted": False,
             "name": validated,
             "reason": "not found",
             "shares_revoked": 0,
         }
-
-    current = staging_service.reconcile(validated)
-    if current.get("state") and current.get("state") not in {
-        "promoted", "unchanged", "failed", "interrupted",
-    }:
+    if _pipeline_busy(validated):
         return _fail("a push pipeline is in progress; wait for it to finish")
 
     push = state_dir() / "locks" / f"{validated}-git-push.lock"
     pipeline = state_dir() / "locks" / f"{validated}-pipeline.lock"
     stopped = False
+    stop_error: str | None = None
+    revoked = 0
     with try_file_lock(push) as push_ok:
         if not push_ok:
             return _fail("a push is in progress; try again after it finishes")
         with try_file_lock(pipeline) as pipeline_ok:
             if not pipeline_ok:
                 return _fail("a pipeline is in progress; try again after it finishes")
-            from . import web
+            try:
+                pending, created = core.mark_pending_delete(
+                    validated, _actor(ctx), reason="model request"
+                )
+            except (CapError, OSError) as exc:
+                return _fail(f"Could not mark {validated!r} for deletion: {exc}")
+            try:
+                from . import web
 
-            web.forget(validated)
-            stopped = True
-            with core.cap_lock(validated):
-                revoked = core.revoke_all_grants(validated)
-                staging_service.forget(validated)
-                staging_service.cleanup_backups(validated)
-                for target in targets:
-                    if target.is_dir():
-                        shutil.rmtree(target, ignore_errors=True)
-                    else:
-                        target.unlink(missing_ok=True)
-                staging_root = core.cap_path(validated).parent / ".staging"
-                for leftover in staging_root.glob(f"{validated}-*"):
-                    shutil.rmtree(leftover, ignore_errors=True)
-                for lock in (state_dir() / "locks").glob(f"{validated}*.lock"):
-                    try:
-                        lock.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                stopped = bool(web.stop(validated).get("status") == "stopped")
+            except Exception as exc:  # a broken child must not undo the request
+                stop_error = str(exc)
+                log.warning("could not stop cap=%s for pending deletion: %s", validated, exc)
+            try:
+                revoked = staging_service.revoke_tokens(validated)
+            except OSError as exc:
+                log.warning("could not revoke tokens cap=%s: %s", validated, exc)
+
     log.info(
-        "delete cap=%s stopped=%s deleted=true shares_revoked=%d",
+        "delete-request cap=%s already=%s stopped=%s tokens_revoked=%d",
+        validated,
+        not created,
+        stopped,
+        revoked,
+    )
+    result: dict[str, Any] = {
+        "ok": True,
+        "pending": True,
+        "deleted": False,
+        "already": not created,
+        "name": validated,
+        "requested_at": pending["requested_at"],
+        "stopped": stopped,
+        "tokens_revoked": revoked,
+        "hint": (
+            "An operator must purge this capability in the console or with "
+            f"`capforge delete {validated}`; cancelling is also possible."
+        ),
+    }
+    if stop_error is not None:
+        result["stop_error"] = stop_error
+    return result
+
+
+def purge_capability(name: str, confirm: str) -> dict:
+    """Operator-only destructive delete. The console and CLI are the only callers."""
+    from . import staging as staging_service
+
+    try:
+        validated = cap_path(name).name
+    except CapError as exc:
+        return _fail(str(exc))
+    if confirm != validated:
+        return _fail("confirm must equal the capability name exactly")
+    targets = _delete_targets(validated)
+    if not _delete_exists(validated, targets):
+        return {
+            "ok": True,
+            "pending": False,
+            "deleted": False,
+            "name": validated,
+            "reason": "not found",
+            "shares_revoked": 0,
+        }
+    if _pipeline_busy(validated):
+        return _fail("a push pipeline is in progress; wait for it to finish")
+
+    push = state_dir() / "locks" / f"{validated}-git-push.lock"
+    pipeline = state_dir() / "locks" / f"{validated}-pipeline.lock"
+    stopped = False
+    revoked = 0
+    lock_files: list[Path] = []
+    with try_file_lock(push) as push_ok:
+        if not push_ok:
+            return _fail("a push is in progress; try again after it finishes")
+        with try_file_lock(pipeline) as pipeline_ok:
+            if not pipeline_ok:
+                return _fail("a pipeline is in progress; try again after it finishes")
+            # Lock ordering matches `versioning._prune`: cap_lock, then tag
+            # locks. A run holding a shared tag lock makes purge wait.
+            with core.cap_lock(validated):
+                state = core.read_state(validated)
+                active_tag = (state.get("active") or {}).get("tag")
+                tags = ["draft"]
+                if active_tag and active_tag != "draft":
+                    tags.append(str(active_tag))
+                with ExitStack() as stack:
+                    for tag in tags:
+                        free = stack.enter_context(
+                            try_file_lock(tag_lock_path(validated, tag))
+                        )
+                        if not free:
+                            return _fail(
+                                "a capability run is in progress; try again after it finishes"
+                            )
+                    try:
+                        core.mark_pending_delete(
+                            validated,
+                            {"id": "operator"},
+                            reason="operator purge",
+                            locked=True,
+                        )
+                    except (CapError, OSError) as exc:
+                        return _fail(f"Could not mark {validated!r} for purge: {exc}")
+                    from . import web
+
+                    try:
+                        stopped = bool(web.forget_locked(validated).get("stopped"))
+                    except Exception as exc:  # do not remove files under a live child
+                        return _fail(
+                            f"Could not stop the served instance for {validated!r}: {exc}"
+                        )
+                    revoked = core.revoke_all_grants(validated)
+                    staging_service.forget(validated)
+                    staging_service.cleanup_backups(validated)
+                    for target in targets:
+                        if target.is_dir():
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            target.unlink(missing_ok=True)
+                    staging_root = core.cap_path(validated).parent / ".staging"
+                    for leftover in staging_root.glob(f"{validated}-*"):
+                        shutil.rmtree(leftover, ignore_errors=True)
+                    lock_files = [
+                        lock
+                        for lock in (state_dir() / "locks").glob(f"{validated}*.lock")
+                        if lock.name != f"{validated}.lock"
+                    ]
+    # Tag/run/push locks are released before their files are removed; the
+    # capability cap_lock file is left in place.
+    for lock in lock_files:
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            pass
+    log.info(
+        "purge cap=%s stopped=%s deleted=true shares_revoked=%d",
         validated,
         stopped,
         revoked,
     )
     return {
         "ok": True,
+        "pending": False,
         "deleted": True,
         "name": validated,
         "stopped": stopped,
@@ -560,11 +712,30 @@ def delete_capability(name: str, confirm: str) -> dict:
     }
 
 
+def cancel_delete(name: str) -> dict:
+    """Operator-only: clear a pending deletion without touching capability files."""
+    try:
+        validated = cap_path(name).name
+    except CapError as exc:
+        return _fail(str(exc))
+    try:
+        cancelled = core.clear_pending_delete(validated)
+    except (CapError, OSError) as exc:
+        return _fail(f"Could not cancel deletion for {validated!r}: {exc}")
+    log.info("delete-cancel cap=%s cancelled=%s", validated, cancelled)
+    return {"ok": True, "pending": False, "cancelled": cancelled, "name": validated}
+
+
 @mcp.tool
 def rollback_capability(name: str, tag: str) -> dict:
     """Make an older tag active again. Does not touch the draft or the repository."""
     try:
-        result = versioning.rollback(cap_path(name).name, tag)
+        validated = cap_path(name).name
+        if core.pending_delete(validated) is not None:
+            return _fail(
+                f"{name!r} is pending deletion; an operator must purge or cancel it first"
+            )
+        result = versioning.rollback(validated, tag)
     except CapError as exc:
         return _fail(str(exc))
     result["ok"] = True
