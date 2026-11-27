@@ -115,10 +115,22 @@ def test_llm_provider_crud_and_default():
     assert llm.read_secret("fake") is None
 
 
+def test_llm_accepts_plain_http_provider():
+    llm.upsert_provider(
+        {
+            "id": "lan",
+            "base_url": "http://llm.internal:11434/v1",
+            "models": ["m"],
+        }
+    )
+    described = llm.describe()
+    assert described["default"] == {"provider": "lan", "model": "m"}
+    assert described["providers"][0]["base_url"] == "http://llm.internal:11434/v1"
+
+
 def test_llm_rejects_bad_providers():
     bad = [
         {"id": "Bad", "base_url": "https://x/v1", "models": ["m"]},
-        {"id": "p", "base_url": "http://example.com/v1", "models": ["m"]},
         {"id": "p", "base_url": "https://x/v1", "models": []},
         {"id": "p", "base_url": "https://x/v1?q=1", "models": ["m"]},
         {"id": "p", "base_url": "https://x/v1", "models": ["m"], "auth": "weird"},

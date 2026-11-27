@@ -44,7 +44,6 @@ AUTH_MODES = ("bearer", "header", "none")
 MODEL_ID_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,200}$")
 HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 GENERATION_PATHS = ("/v1/chat/completions", "/v1/responses")
-LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # Requests and responses that must not be forwarded by the gateway.
 _DROP_REQUEST = {
@@ -152,8 +151,6 @@ def _base_url(value: Any) -> str:
     parsed = urlsplit(raw)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise core.CapError("LLM provider base_url must be an absolute http(s) URL")
-    if parsed.scheme == "http" and (parsed.hostname or "") not in LOOPBACK_HOSTS:
-        raise core.CapError("LLM provider base_url must use https unless it is loopback")
     if parsed.query or parsed.fragment:
         raise core.CapError("LLM provider base_url cannot contain a query or fragment")
     return raw

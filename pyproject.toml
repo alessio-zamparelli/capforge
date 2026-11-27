@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "capforge"
-version = "0.8.0"
+version = "0.8.1"
 description = "Deterministic, versioned capabilities exposed over MCP for Open WebUI + Open Terminal"
 readme = "README.md"
 license = "Apache-2.0"

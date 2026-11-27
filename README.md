@@ -350,7 +350,9 @@ A capability opts into model access with `LLM = True` in `deploy.py` (any `KIND`
 adds one or more OpenAI-compatible providers on the **Models** tab: a label, a base URL, the auth
 mode (bearer, a custom header, or none), the API key and the model ids. One model is the global
 default and is pre-selected for every capability; the operator can override it per capability and
-the override wins over a capability's own request.
+the override wins over a capability's own request. A provider base URL may be `http://` or
+`https://`; prefer HTTPS because the provider key is sent to that endpoint and plain HTTP exposes
+it on the network.
 
 Capability code never receives a provider key. It receives a short-lived capability token and the
 hub runs a loopback-only gateway:

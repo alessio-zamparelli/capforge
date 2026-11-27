@@ -1,6 +1,6 @@
 # Architecture
 
-Status: describes capforge **0.8.0**, the git-authored architecture. If code and this document
+Status: describes capforge **0.8.1**, the git-authored architecture. If code and this document
 disagree, the code wins; update this file in the same change.
 
 Related: [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),
@@ -194,7 +194,9 @@ the per-capability override (`<state>/llm/caps/<name>.json`) and a `ThreadingHTT
 `/v1/chat/completions`, `/v1/responses` and `/v1/models` to an OpenAI-compatible provider, injects
 the provider credential and forces `model` to the operator's resolution (capability override,
 otherwise global default). A token is revoked when the CLI run or web child stops. Capability code
-never sees the provider key, and only the operator can change the selection.
+never sees the provider key, and only the operator can change the selection. Provider base URLs may
+be HTTP or HTTPS; HTTPS is recommended because the gateway sends the provider credential to that
+endpoint, so plain HTTP exposes it on the wire.
 
 `oidc.py` owns `<state>/oidc.json`, client secrets under `<state>/secrets/oidc/`, and the HMAC
 session key `<state>/auth.key` (generated on first use, mode `0600`). Discovery documents are

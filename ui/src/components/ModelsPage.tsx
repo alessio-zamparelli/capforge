@@ -519,7 +519,7 @@ export function ModelsPage({ onAuthLost }: { onAuthLost: () => void }) {
                     autoComplete="off"
                   />
                   <FieldDescription>
-                    Must be https unless it is a loopback address.
+                    Absolute http(s) URL. HTTPS is recommended; plain HTTP sends the provider key unencrypted.
                   </FieldDescription>
                 </Field>
                 <Field>

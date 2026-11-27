@@ -1,6 +1,6 @@
 # Next
 
-Known limitations and deliberately deferred work for capforge 0.8.0. The design and current
+Known limitations and deliberately deferred work for capforge 0.8.1. The design and current
 guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Open items

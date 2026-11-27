@@ -360,7 +360,9 @@ Una capability abilita l'accesso ai modelli con `LLM = True` in `deploy.py` (qua
 L'operatore aggiunge provider compatibili OpenAI nella scheda **Models**: etichetta, base URL,
 modalità di autenticazione (bearer, header personalizzato o nessuna), chiave API e id dei modelli.
 Un modello è il default globale ed è preselezionato per ogni capability; l'operatore può
-sovrascriverlo per singola capability.
+sovrascriverlo per singola capability. La base URL del provider può essere `http://` o `https://`;
+preferisci HTTPS perché la chiave del provider viene inviata a quell'endpoint e HTTP in chiaro la
+espone sulla rete.
 
 Il codice della capability non riceve mai la chiave del provider. Riceve un token di capability di
 breve durata e il hub esegue un gateway solo su loopback:
