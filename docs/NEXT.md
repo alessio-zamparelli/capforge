@@ -18,8 +18,8 @@ guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   sync, role model, refresh token, back-channel logout, or provider-initiated logout. Sessions are
   bearer cookies with no server-side revocation list; rotating `<state>/auth.key` (or restarting)
   invalidates them. Discovery is cached for an hour and a provider outage fails login closed.
-  `CAPFORGE_PUBLIC_URL` must be set explicitly; a reverse-proxy path prefix is not supported for
-  the callback.
+  `CAPFORGE_PUBLIC_URL` must be set explicitly; post-login redirects are root-relative, so a
+  reverse-proxy path prefix is not supported for OIDC.
 - **Capability cookies.** The proxy drops upstream `Set-Cookie`, so a served capability cannot set
   its own session cookies; it must rely on the forwarded `X-Capforge-User*` identity.
 - **Landlock coverage.** Capability, pytest and served web children use Landlock. `git
