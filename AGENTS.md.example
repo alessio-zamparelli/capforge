@@ -24,7 +24,7 @@ Promotion is automatic on a green pipeline. `install_packages`, `test_capability
 
     SKILL.md            name, description and instructions; no deployment fields
     deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT, WEB_ENTRYPOINT,
-                        APP, DATA, SHARES and Env
+                        APP, DATA, SHARES, LLM, AUTH and Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
@@ -46,6 +46,8 @@ assignments literal:
         "datasets": "ro",          # read-only
         "cache": "rw",             # read-write
     }
+    LLM = False                    # True to call the hub's model gateway
+    AUTH = {"provider": "corp"}    # web only; operator-configured OIDC provider
 
 `KIND` lists the surfaces the capability exposes. A CLI capability has
 `CLI_ENTRYPOINT`, a web capability has `WEB_ENTRYPOINT` and `APP`, and a hybrid
@@ -110,6 +112,25 @@ not production data. Shared folders are unversioned and unsynchronized: use `flo
 concurrent calls can race, and let the operator handle backups.
 
 `DATA = "shared"` is separate: it is this capability's own `CAPFORGE_SHARED_DATA_DIR`.
+
+## Models (LLM)
+
+Set `LLM = True` to call a language model. The hub runs the gateway; you never receive a provider
+key and never choose the model. Every run gets `CAPFORGE_LLM_BASE_URL`, `CAPFORGE_LLM_TOKEN`,
+`CAPFORGE_LLM_MODEL`, `CAPFORGE_LLM_PROVIDER` and `CAPFORGE_LLM_API=openai`. Point an
+OpenAI-compatible client at the base URL and use the token as the API key. The gateway forwards
+`/v1/chat/completions`, `/v1/responses` and `/v1/models`, forces the operator-selected model and
+rejects a different `model` value. Do not hard-code a model. Tests and the boot probe receive
+placeholder values.
+
+## Authentication (web)
+
+`AUTH = {"provider": "corp"}` gates a served capability behind an operator-configured OIDC
+provider. Optional `allow_emails`, `allow_domains`, `allow_groups` restrict access (any match
+grants it), and `public_paths` lists unauthenticated paths such as `/health`. `AUTH = "corp"` is
+shorthand. The hub runs the flow at `/cap/<name>/__auth/login` and forwards the identity as
+`X-Capforge-User` (base64url JSON) and `X-Capforge-User-Email`. Client-supplied `X-Capforge-*`
+headers are stripped, so trust these only behind the hub. Do not implement your own login.
 
 ## Testing
 

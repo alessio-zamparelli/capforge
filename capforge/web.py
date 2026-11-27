@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import html
 import json
 import logging
 import os
@@ -34,17 +35,24 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import __version__, core, versioning
+from . import __version__, core, llm, oidc, versioning
 from .core import CapError
 
 log = logging.getLogger("capforge")
@@ -228,6 +236,8 @@ class _Instance:
     started_at: int
     endpoints: list[dict[str, Any]] = field(default_factory=list)
     desired: str = "start"
+    auth: core.AuthSpec | None = None
+    llm_token: str | None = None
 
     def record(self) -> dict[str, Any]:
         return {
@@ -241,6 +251,7 @@ class _Instance:
             "desired": self.desired,
             "pid": self.proc.pid,
             "port": self.port,
+            "auth": self.auth.provider if self.auth else None,
         }
 
 
@@ -351,6 +362,11 @@ def _spawn(
         raise CapError(f"Version {tag!r} is not runnable: {cap.error}")
     if not cap.serves_web:
         raise CapError(f"Version {tag!r} does not serve web (kind: {cap.kind})")
+    if cap.auth is not None and oidc.get_provider(cap.auth.provider) is None:
+        raise CapError(
+            f"{name!r} requires the OIDC provider {cap.auth.provider!r}, "
+            "which is not configured in the console"
+        )
     venv = core.ensure_venv(name, source, "prod")
     port = core._free_port()
     log_file = _log_path(name, tag)
@@ -366,6 +382,8 @@ def _spawn(
         share_mounts=mounts,
     )
     env["CAPFORGE_SERVE"] = "1"
+    if cap.llm:
+        env.update(llm.runtime_env(cap))
     data = core.data_dir(name, tag)
     shared = core.shared_data_dir(name) if cap.data == "shared" else None
     cmd = core._sandbox_command(
@@ -387,6 +405,7 @@ def _spawn(
         )
     except OSError as exc:
         handle.close()
+        llm.revoke(env.get("CAPFORGE_LLM_TOKEN"))
         raise CapError(f"Could not start uvicorn for {name!r}: {exc}") from exc
     core.register_owned(proc.pid)
     instance = _Instance(
@@ -399,12 +418,15 @@ def _spawn(
         port=port,
         log_handle=handle,
         started_at=int(time.time()),
+        auth=cap.auth,
+        llm_token=env.get("CAPFORGE_LLM_TOKEN"),
     )
     deadline = time.monotonic() + core.serve_boot_timeout()
     while True:
         if proc.poll() is not None:
             core.unregister_owned(proc.pid)
             handle.close()
+            llm.revoke(env.get("CAPFORGE_LLM_TOKEN"))
             raise CapError(
                 f"uvicorn for {name!r} exited during boot (code {proc.returncode}):\n"
                 f"{_log_tail(log_file)}"
@@ -426,6 +448,7 @@ def _spawn(
                 pass
             core.unregister_owned(proc.pid)
             handle.close()
+            llm.revoke(env.get("CAPFORGE_LLM_TOKEN"))
             raise CapError(
                 f"{name!r} did not answer HTTP within {core.serve_boot_timeout()}s "
                 f"(boot budget CAPFORGE_SERVE_BOOT_TIMEOUT):\n{_log_tail(log_file)}"
@@ -512,6 +535,7 @@ def _stop_instance(instance: _Instance) -> None:
         instance.log_handle.close()
     except OSError:
         pass
+    llm.revoke(instance.llm_token)
     with _engine_lock:
         _INSTANCES.pop(instance.name, None)
     core.sweep_stray_children()
@@ -736,6 +760,7 @@ def shutdown() -> None:
         log.info("shut down %d served instance(s)", len(instances))
     with _engine_lock:
         _INSTANCES.clear()
+    llm.shutdown()
 
 
 def running_venv_names(name: str) -> set[str]:
@@ -993,6 +1018,93 @@ def _restart_after_share(name: str) -> dict[str, Any]:
     return _restart_if_running(name)
 
 
+# ----------------------------------------------------------------------------- auth
+
+
+def _auth_status(cap: core.Capability) -> dict[str, Any] | None:
+    if cap.auth is None:
+        return None
+    return {
+        "provider": cap.auth.provider,
+        "configured": oidc.get_provider(cap.auth.provider) is not None,
+        "allow_emails": list(cap.auth.allow_emails),
+        "allow_domains": list(cap.auth.allow_domains),
+        "allow_groups": list(cap.auth.allow_groups),
+        "public_paths": list(cap.auth.public_paths),
+        "login_url": f"/cap/{cap.name}/__auth/login",
+    }
+
+
+def _public_path(spec: core.AuthSpec, path: str) -> bool:
+    normalized = "/" + path.lstrip("/")
+    for prefix in spec.public_paths:
+        if prefix == "/" or normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _safe_next(name: str, raw: Any) -> str:
+    """Only allow a path under this capability; never an absolute URL."""
+    prefix = f"/cap/{name}/"
+    text = str(raw or "")
+    if not text.startswith(prefix) or ".." in text or "\r" in text or "\n" in text:
+        return prefix
+    parsed = urlsplit(text)
+    if parsed.scheme or parsed.netloc:
+        return prefix
+    return text
+
+
+def _cookie_secure() -> bool:
+    return public_base().startswith("https://")
+
+
+def _auth_page(status: int, title: str, detail: str) -> HTMLResponse:
+    safe_title = html.escape(title)
+    safe_detail = html.escape(detail)
+    body = (
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>"
+        f"{safe_title}</title></head><body><h1>{safe_title}</h1>"
+        f"<p>{safe_detail}</p></body></html>"
+    )
+    return HTMLResponse(body, status_code=status)
+
+
+async def _cap_session(
+    request: Request, name: str, instance: _Instance
+) -> tuple[dict[str, Any] | None, Response | None]:
+    """Return the verified session, or the response that gates the request."""
+    spec = instance.auth
+    if spec is None:
+        return None, None
+    if _public_path(spec, request.path_params.get("path", "")):
+        return None, None
+    if oidc.get_provider(spec.provider) is None:
+        return None, JSONResponse(
+            {"error": f"OIDC provider {spec.provider!r} is not configured"},
+            status_code=503,
+        )
+    raw = request.cookies.get(oidc.session_cookie_name(name))
+    session = oidc.read_session(raw, name) if raw else None
+    if session is None:
+        if request.method in ("GET", "HEAD") and "text/html" in request.headers.get(
+            "accept", ""
+        ):
+            next_path = request.url.path
+            if request.url.query:
+                next_path = f"{next_path}?{request.url.query}"
+            target = f"/cap/{name}/__auth/login?next={quote(next_path, safe='/')}"
+            return None, RedirectResponse(target, status_code=303)
+        return None, JSONResponse({"error": "authentication required"}, status_code=401)
+    if not oidc.is_allowed(session, spec):
+        return None, _auth_page(
+            403,
+            "Access denied",
+            "Your identity is not allowed to use this capability.",
+        )
+    return session, None
+
+
 def _share_requests() -> dict[str, dict[str, str]]:
     """folder -> capability -> requested access, from draft and active tags."""
     out: dict[str, dict[str, str]] = {}
@@ -1065,6 +1177,9 @@ async def api_caps(request: Request) -> Response:
                     "served": served,
                     "env": core.env_status(cap.name, caps_for),
                     "shares": core.share_status(cap.name, caps_for),
+                    "auth": _auth_status(cap),
+                    "llm_declared": cap.llm,
+                    "llm": llm.selection_status(cap.name) if cap.llm else None,
                 }
             )
         return out
@@ -1347,6 +1462,9 @@ async def api_cap_detail(request: Request) -> Response:
             "served": served,
             "env": core.env_status(name, caps_for),
             "shares": core.share_status(name, caps_for),
+            "auth": _auth_status(cap),
+            "llm_declared": cap.llm,
+            "llm": llm.selection_status(name) if cap.llm else None,
         }
 
     try:
@@ -1427,6 +1545,295 @@ async def api_cancel_delete(request: Request) -> Response:
 
     result = await run_in_threadpool(server_module.cancel_delete, name)
     return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+def _restart_llm_instances() -> None:
+    """Provider/default changes can change the effective model of live children."""
+    with _engine_lock:
+        names = [name for name, inst in _INSTANCES.items() if inst.proc.poll() is None]
+    for name in names:
+        try:
+            caps = _env_caps_for(name)
+        except CapError:
+            continue
+        if not any(cap.llm for cap in caps):
+            continue
+        try:
+            restart(name)
+        except CapError as exc:
+            log.warning("llm config restart failed cap=%s error=%s", name, exc)
+
+
+async def api_llm(request: Request) -> Response:
+    denied = _console_denied(request, write=False)
+    if denied is not None:
+        return denied
+    payload = await run_in_threadpool(llm.describe)
+    return JSONResponse({"ok": True, **payload})
+
+
+async def api_llm_provider(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    provider = request.path_params["pid"]
+    try:
+        if request.method == "DELETE":
+            result = await run_in_threadpool(llm.delete_provider, provider)
+        else:
+            payload = await request.json()
+            payload["id"] = provider
+            result = await run_in_threadpool(llm.upsert_provider, payload)
+        await run_in_threadpool(_restart_llm_instances)
+        return JSONResponse({"ok": True, "provider": result, **llm.describe()})
+    except (CapError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_llm_secret(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    try:
+        payload = await request.json()
+        result = await run_in_threadpool(
+            llm.set_secret, request.path_params["pid"], str(payload.get("value") or "")
+        )
+        return JSONResponse({"ok": True, **result})
+    except (CapError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_llm_default(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    try:
+        payload = await request.json()
+        result = await run_in_threadpool(
+            llm.set_default,
+            str(payload.get("provider") or ""),
+            str(payload.get("model") or ""),
+        )
+        await run_in_threadpool(_restart_llm_instances)
+        return JSONResponse({"ok": True, **result, **llm.describe()})
+    except (CapError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_llm_test(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    try:
+        result = await run_in_threadpool(llm.test_provider, request.path_params["pid"])
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+
+async def api_cap_llm(request: Request) -> Response:
+    denied = _console_denied(request, write=request.method != "GET")
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    try:
+        core.cap_path(name)
+        if request.method == "GET":
+            return JSONResponse({"ok": True, "llm": llm.selection_status(name)})
+        if request.method == "DELETE":
+            status = await run_in_threadpool(llm.clear_selection, name)
+        else:
+            payload = await request.json()
+            status = await run_in_threadpool(
+                llm.set_selection,
+                name,
+                str(payload.get("provider") or ""),
+                str(payload.get("model") or ""),
+            )
+        restarted = await run_in_threadpool(_restart_if_running, name)
+        return JSONResponse({"ok": True, "llm": status, **restarted})
+    except (CapError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_oidc(request: Request) -> Response:
+    denied = _console_denied(request, write=False)
+    if denied is not None:
+        return denied
+    payload = await run_in_threadpool(oidc.describe, public_base())
+    return JSONResponse({"ok": True, **payload})
+
+
+async def api_oidc_provider(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    provider = request.path_params["pid"]
+    try:
+        if request.method == "DELETE":
+            result = await run_in_threadpool(oidc.delete_provider, provider)
+        else:
+            payload = await request.json()
+            payload["id"] = provider
+            result = await run_in_threadpool(oidc.upsert_provider, payload)
+        return JSONResponse(
+            {"ok": True, "provider": result, **oidc.describe(public_base())}
+        )
+    except (CapError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_oidc_secret(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    try:
+        payload = await request.json()
+        result = await run_in_threadpool(
+            oidc.set_secret, request.path_params["pid"], str(payload.get("value") or "")
+        )
+        return JSONResponse({"ok": True, **result})
+    except (CapError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def api_oidc_test(request: Request) -> Response:
+    denied = _console_denied(request, write=True)
+    if denied is not None:
+        return denied
+    try:
+        result = await oidc.test_provider(request.path_params["pid"])
+    except CapError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
+# ----------------------------------------------------------------------------- auth
+
+
+async def cap_auth_login(request: Request) -> Response:
+    """Start the OIDC flow for one served capability."""
+    name = request.path_params["name"]
+    if not core.NAME_RE.match(name):
+        return _auth_page(404, "Not found", "Unknown capability.")
+    try:
+        _tag, _meta, source = _active_or_raise(name)
+    except CapError as exc:
+        return _auth_page(404, "Not available", str(exc))
+    cap = core.load_capability_at(name, source)
+    if cap.auth is None:
+        return RedirectResponse(f"/cap/{name}/", status_code=303)
+    if not os.environ.get("CAPFORGE_PUBLIC_URL", "").strip():
+        return _auth_page(
+            503,
+            "OIDC unavailable",
+            "CAPFORGE_PUBLIC_URL must be set to the public origin to build the redirect URI.",
+        )
+    provider = oidc.get_provider(cap.auth.provider)
+    if provider is None:
+        return _auth_page(
+            503,
+            "OIDC unavailable",
+            f"The provider {cap.auth.provider!r} is not configured in the console.",
+        )
+    next_path = _safe_next(name, request.query_params.get("next"))
+    try:
+        target, cookie = await oidc.authorization_url(
+            provider, name, next_path, public_base()
+        )
+    except CapError as exc:
+        log.warning("oidc login failed cap=%s provider=%s error=%s", name, provider["id"], exc)
+        return _auth_page(502, "OIDC unavailable", "The identity provider could not be reached.")
+    response = RedirectResponse(target, status_code=303)
+    response.set_cookie(
+        oidc.STATE_COOKIE,
+        cookie,
+        max_age=oidc.STATE_TTL,
+        path="/__auth",
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(),
+    )
+    return response
+
+
+async def cap_auth_logout(request: Request) -> Response:
+    name = request.path_params["name"]
+    response = RedirectResponse("/__auth/logged-out", status_code=303)
+    if core.NAME_RE.match(name):
+        response.delete_cookie(oidc.session_cookie_name(name), path=f"/cap/{name}/")
+    return response
+
+
+async def oidc_callback(request: Request) -> Response:
+    """Single callback shared by every capability and provider."""
+    state = oidc.read_state(request.cookies.get(oidc.STATE_COOKIE))
+    if state is None:
+        return _auth_page(400, "Sign-in expired", "Start the sign-in again from the capability.")
+    if request.query_params.get("error"):
+        return _auth_page(400, "Sign-in failed", "The identity provider refused the request.")
+    expected = str(state.get("state") or "")
+    received = str(request.query_params.get("state") or "")
+    if not expected or not hmac.compare_digest(expected, received):
+        return _auth_page(400, "Sign-in failed", "The state parameter did not match.")
+    name = str(state.get("cap") or "")
+    provider_id = str(state.get("provider") or "")
+    if not core.NAME_RE.match(name):
+        return _auth_page(400, "Sign-in failed", "The sign-in state is invalid.")
+    try:
+        _tag, _meta, source = _active_or_raise(name)
+    except CapError as exc:
+        return _auth_page(404, "Not available", str(exc))
+    cap = core.load_capability_at(name, source)
+    if cap.auth is None or cap.auth.provider != provider_id:
+        return _auth_page(
+            400, "Sign-in failed", "The capability's auth policy changed; start again."
+        )
+    provider = oidc.get_provider(provider_id)
+    if provider is None:
+        return _auth_page(
+            503, "OIDC unavailable", f"The provider {provider_id!r} is not configured."
+        )
+    code = str(request.query_params.get("code") or "")
+    if not code:
+        return _auth_page(400, "Sign-in failed", "The identity provider returned no code.")
+    try:
+        tokens = await oidc.exchange_code(
+            provider, code, str(state.get("verifier") or ""), public_base()
+        )
+        identity = await oidc.fetch_identity(provider, tokens)
+    except CapError as exc:
+        log.warning(
+            "oidc callback failed cap=%s provider=%s error=%s", name, provider_id, exc
+        )
+        return _auth_page(
+            502, "Sign-in failed", "The identity provider did not complete the exchange."
+        )
+    if not oidc.is_allowed(identity, cap.auth):
+        log.info("oidc denied cap=%s provider=%s", name, provider_id)
+        return _auth_page(
+            403, "Access denied", "Your identity is not allowed to use this capability."
+        )
+    ttl = int(provider["session_ttl"])
+    session = oidc.make_session(name, provider_id, identity, ttl)
+    response = RedirectResponse(_safe_next(name, state.get("next")), status_code=303)
+    response.set_cookie(
+        oidc.session_cookie_name(name),
+        session,
+        max_age=ttl,
+        path=f"/cap/{name}/",
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(),
+    )
+    response.delete_cookie(oidc.STATE_COOKIE, path="/__auth")
+    log.info("oidc login cap=%s provider=%s", name, provider_id)
+    return response
+
+
+async def oidc_logged_out(request: Request) -> Response:
+    return _auth_page(200, "Signed out", "You can close this tab or sign in again.")
 
 
 # ----------------------------------------------------------------------------- git
@@ -1744,6 +2151,9 @@ async def proxy(request: Request) -> Response:
             },
             status_code=404,
         )
+    session, denied = await _cap_session(request, name, instance)
+    if denied is not None:
+        return denied
     if _declared_too_large(request, MAX_PROXY_BODY):
         return JSONResponse({"error": "request body too large"}, status_code=413)
     headers = {
@@ -1756,6 +2166,9 @@ async def proxy(request: Request) -> Response:
     headers["host"] = f"127.0.0.1:{instance.port}"
     headers["x-capforge-capability"] = name
     headers["x-capforge-version"] = instance.tag
+    if session is not None:
+        headers["x-capforge-user"] = oidc.identity_header(session)
+        headers["x-capforge-user-email"] = str(session.get("email") or "")
     client: httpx.AsyncClient = request.app.state.proxy_client
     upstream = httpx.URL(f"http://127.0.0.1:{instance.port}/{path}").copy_merge_params(
         request.query_params
@@ -1837,11 +2250,21 @@ def asgi_app() -> Starlette:
             methods=["PUT", "DELETE"],
         ),
         Route("/api/caps/{name}/logs", api_logs, methods=["GET"]),
+        Route("/api/caps/{name}/llm", api_cap_llm, methods=["GET", "PUT", "DELETE"]),
         Route("/api/caps/{name}/rollback", api_rollback, methods=["POST"]),
         Route("/api/caps/{name}/delete", api_delete, methods=["POST"]),
         Route("/api/caps/{name}/cancel-delete", api_cancel_delete, methods=["POST"]),
         Route("/api/caps/{name}", api_cap_detail, methods=["GET"]),
         Route("/api/caps/{name}/{action}", api_control, methods=["POST"]),
+        Route("/api/llm", api_llm, methods=["GET"]),
+        Route("/api/llm/default", api_llm_default, methods=["PUT"]),
+        Route("/api/llm/providers/{pid}", api_llm_provider, methods=["PUT", "DELETE"]),
+        Route("/api/llm/providers/{pid}/secret", api_llm_secret, methods=["PUT"]),
+        Route("/api/llm/providers/{pid}/test", api_llm_test, methods=["POST"]),
+        Route("/api/oidc", api_oidc, methods=["GET"]),
+        Route("/api/oidc/providers/{pid}", api_oidc_provider, methods=["PUT", "DELETE"]),
+        Route("/api/oidc/providers/{pid}/secret", api_oidc_secret, methods=["PUT"]),
+        Route("/api/oidc/providers/{pid}/test", api_oidc_test, methods=["POST"]),
         Route("/git/{name}.git/info/refs", git_info_refs, methods=["GET"]),
         Route("/git/{name}.git/{service}", git_service, methods=["POST"]),
     ]
@@ -1849,6 +2272,10 @@ def asgi_app() -> Starlette:
     if dist is not None:
         routes.append(Route("/ui", ui_redirect, methods=["GET"]))
         routes.append(Mount("/ui", StaticFiles(directory=dist, html=True), name="ui"))
+    routes.append(Route("/__auth/callback", oidc_callback, methods=["GET"]))
+    routes.append(Route("/__auth/logged-out", oidc_logged_out, methods=["GET"]))
+    routes.append(Route("/cap/{name}/__auth/login", cap_auth_login, methods=["GET"]))
+    routes.append(Route("/cap/{name}/__auth/logout", cap_auth_logout, methods=["GET"]))
     routes.append(Route("/cap/{name}", proxy_redirect, methods=ALL_METHODS))
     routes.append(Route("/cap/{name}/{path:path}", proxy, methods=ALL_METHODS))
     if dist is not None:

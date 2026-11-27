@@ -1,6 +1,6 @@
 # Architecture
 
-Status: describes capforge **0.7.1**, the git-authored architecture. If code and this document
+Status: describes capforge **0.8.0**, the git-authored architecture. If code and this document
 disagree, the code wins; update this file in the same change.
 
 Related: [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),
@@ -44,6 +44,11 @@ Two uvicorn servers in one process, one signal set:
 | `/api/caps/<name>/rollback` | move the active tag |
 | `/api/caps/<name>/delete` | delete the capability (exact-name confirm) |
 | `/api/caps/<name>/env` | env status (GET) / set one value (POST, write-only) |
+| `/api/caps/<name>/llm` | effective model (GET) / override (PUT/DELETE) |
+| `/api/llm`, `/api/llm/providers/<id>` | LLM providers, models and default |
+| `/api/oidc`, `/api/oidc/providers/<id>` | OIDC providers and discovery test |
+| `/cap/<name>/__auth/{login,logout}` | OIDC sign-in for one capability |
+| `/__auth/callback`, `/__auth/logged-out` | shared OIDC callback and signed-out page |
 | `/git/<name>.git/info/refs` | git advertisement (upload-pack or receive-pack) |
 | `/git/<name>.git/git-upload-pack` | clone/fetch |
 | `/git/<name>.git/git-receive-pack` | push |
@@ -70,14 +75,17 @@ versioning.py  snapshot, promote, prune, rollback, list_tags, diff
 gitremote.py   bare repo init/config/managed hook, archive extraction, refs, gc
 scaffold.py    base uv project, uv lock, initial commit, publish main
 staging.py     git tokens, staging state, bounded logs, async push pipeline
+llm.py         provider registry, per-cap model selection, loopback gateway
+oidc.py        provider registry, discovery, PKCE flow, signed sessions
 contract.py    CONTRACT text only
-web.py         /ui /api /git /cap, console, git CGI bridge, serve engine
+web.py         /ui /api /git /cap, console, git CGI bridge, serve engine, OIDC routes
 server.py      FastMCP and the ten tools
 cli.py         serve | doctor | tools | promote | test
 ```
 
 Dependency rules: `core`, `versioning`, `contract`, `staging`, `scaffold`, `gitremote` are
-stdlib-only (gitremote uses the git binary). `web.py` owns starlette/httpx; `server.py` owns
+stdlib-only (gitremote uses the git binary). `web.py` owns starlette/httpx; `llm.py` and `oidc.py`
+own httpx and are imported lazily by `core` (stdlib-only at import time); `server.py` owns
 fastmcp. `versioning` imports `web` lazily for prune/venv GC. `server.py` is an adapter; business
 logic stays in the modules.
 
@@ -156,6 +164,9 @@ and runs one subprocess:
   active tag receives real values;
 - `CAPFORGE_DATA_DIR` per version, `CAPFORGE_SHARED_DATA_DIR` when `DATA = "shared"`,
   `CAPFORGE_SHARES` for approved shared volumes, `CAPFORGE_VERSION`, venv-first `PATH`;
+- when `LLM = True`, `CAPFORGE_LLM_BASE_URL`, `CAPFORGE_LLM_TOKEN`, `CAPFORGE_LLM_MODEL`,
+  `CAPFORGE_LLM_PROVIDER` and `CAPFORGE_LLM_API=openai` from the hub gateway; tests and the boot
+  probe get placeholders;
 - hard timeout on the process group; the group is killed after wait; detached strays are swept;
 - Landlock allowlist for filesystem access, including `ro` shares as read and `rw` shares as write.
 
@@ -174,6 +185,25 @@ Web children are booted with uvicorn `--root-path /cap/<name>` and `CAPFORGE_ROO
 strips the prefix before forwarding, so app routes stay unprefixed. This replaces the deprecated
 `FastAPI(root_path=...)` parameter: FastAPI derives `/docs` and `/openapi.json` URLs from the ASGI
 scope instead.
+
+## 7b. Model gateway
+
+`llm.py` owns the provider registry (`<state>/llm.json`), keys (`<state>/secrets/llm/<provider>.json`),
+the per-capability override (`<state>/llm/caps/<name>.json`) and a `ThreadingHTTPServer` bound to
+`127.0.0.1:0`. The gateway accepts only a capability token minted for the run, proxies
+`/v1/chat/completions`, `/v1/responses` and `/v1/models` to an OpenAI-compatible provider, injects
+the provider credential and forces `model` to the operator's resolution (capability override,
+otherwise global default). A token is revoked when the CLI run or web child stops. Capability code
+never sees the provider key, and only the operator can change the selection.
+
+`oidc.py` owns `<state>/oidc.json`, client secrets under `<state>/secrets/oidc/`, and the HMAC
+session key `<state>/auth.key` (generated on first use, mode `0600`). Discovery documents are
+cached for an hour. The flow is Authorization Code + PKCE with `state`/`nonce` in a signed
+short-lived cookie; the code is exchanged over TLS and the identity comes from userinfo. ID-token
+signatures are not verified because userinfo is fetched with the token minted by the provider over
+TLS, which keeps the dependency set at httpx. Sessions are signed cookies scoped to
+`/cap/<name>/`, so one capability cannot use another's session. Allow lists (`emails`/`domains`/
+`groups`) are evaluated on the verified identity at the proxy.
 
 ## 8. Data
 
@@ -204,6 +234,12 @@ scope instead.
 <state>/state/<name>.json                   active + tags + pruned
 <state>/state/shares.json                   shared-folder census and grants
 <state>/secrets/<name>.json                 operator-set env values (0600)
+<state>/secrets/llm/<provider>.json         LLM provider key (0600)
+<state>/secrets/oidc/<provider>.json        OIDC client secret (0600)
+<state>/llm.json                            LLM providers, models and default
+<state>/llm/caps/<name>.json                per-capability model override
+<state>/oidc.json                           OIDC providers
+<state>/auth.key                            OIDC session signing key (0600)
 <state>/staging/<name>.json                 pipeline state
 <state>/git/<name>.git/                     bare repo
 <state>/logs/<name>/{pipeline,scaffold}.log
@@ -221,7 +257,8 @@ history and state plus `refs/capforge/processed` is the promotion record.
 
 - MCP `:8099` requires `CAPFORGE_MCP_TOKEN` for HTTP transport; clients send
   `Authorization: Bearer <token>`. `--transport stdio` is local and does not need it.
-- `/api` needs the console token and CSRF on writes. `/ui` is public. `/cap` is public by design.
+- `/api` needs the console token and CSRF on writes. `/ui` is public. A capability with `AUTH`
+  gates `/cap/<name>/` behind OIDC; without `AUTH` it is public by design.
 - `/cap` and `/api` share an origin. The proxy strips `Cookie`, `Authorization`, `X-CSRF`, incoming
   `x-capforge-*` and upstream `Set-Cookie`, but a served capability's own JavaScript can still call
   `/api` with the operator's session. Treat web capabilities as trusted, or expose `/cap` on a
@@ -239,6 +276,11 @@ history and state plus `refs/capforge/processed` is the promotion record.
   session and CSRF, and no MCP tool exposes them. All grantees can read all contents; `rw` is
   mutual trust because any grantee can modify or delete data. Symlinks inside a share cannot escape
   Landlock because rules are path-beneath and resolved at access time.
+- LLM provider keys and OIDC client secrets are write-only through the console, stored under
+  `<state>/secrets/` at mode `0600`, and never injected into a capability. The gateway is
+  loopback-only and requires a per-run capability token; the operator's model selection is
+  enforced server-side. OIDC sessions are signed with `<state>/auth.key`; deleting it invalidates
+  every session on the next restart.
 - Landlock (`CAPFORGE_SANDBOX=require`) denies state, tokens, other capabilities, home, `/proc`,
   `/sys`, `/tmp` and anything else not explicitly allowed, apart from the exact approved share
   folders. It is filesystem-only; network, CPU, memory and ptrace are not confined.

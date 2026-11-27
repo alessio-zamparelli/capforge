@@ -1,10 +1,27 @@
 # Next
 
-Known limitations and deliberately deferred work for capforge 0.7.1. The design and current
+Known limitations and deliberately deferred work for capforge 0.8.0. The design and current
 guarantees are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Open items
 
+- **LLM providers.** Only OpenAI-compatible endpoints are supported; native Anthropic/Gemini
+  translation is deliberately out of scope. There is no token/usage accounting, per-capability
+  quota, retry policy, or streaming backpressure beyond the raw passthrough. Provider keys are
+  plaintext at mode `0600` (same as `Env` secrets) with no rotation history. A capability could
+  still call any reachable model endpoint directly because network egress is not confined.
+- **Model selection.** The operator's selection is enforced at the gateway, but a capability can
+  read `CAPFORGE_LLM_MODEL` and tailor prompts to it. There is no per-tag selection history and no
+  automatic re-resolution when a provider is renamed; a stale selection falls back to the default
+  and is flagged in the console.
+- **OIDC.** ID-token signatures are not verified (userinfo is the trust anchor). There is no group
+  sync, role model, refresh token, back-channel logout, or provider-initiated logout. Sessions are
+  bearer cookies with no server-side revocation list; rotating `<state>/auth.key` (or restarting)
+  invalidates them. Discovery is cached for an hour and a provider outage fails login closed.
+  `CAPFORGE_PUBLIC_URL` must be set explicitly; a reverse-proxy path prefix is not supported for
+  the callback.
+- **Capability cookies.** The proxy drops upstream `Set-Cookie`, so a served capability cannot set
+  its own session cookies; it must rely on the forwarded `X-Capforge-User*` identity.
 - **Landlock coverage.** Capability, pytest and served web children use Landlock. `git
   http-backend`, `git archive` and `uv sync` are tracked but not yet under a Landlock policy.
   Closing that gap should not require new dependencies.

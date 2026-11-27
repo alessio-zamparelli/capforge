@@ -29,6 +29,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { AuthPanel, ModelPanel } from "@/components/CapabilityAccess";
 import { CapabilityDetail } from "@/components/CapabilityDetail";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EnvPanel } from "@/components/EnvPanel";
@@ -220,6 +221,25 @@ function CapabilityCard({
                 onChanged={onChanged}
                 onAuthLost={onAuthLost}
               />
+            </>
+          )}
+
+          {cap.llm_declared && (
+            <>
+              <Separator />
+              <ModelPanel
+                name={cap.name}
+                selection={cap.llm}
+                onChanged={onChanged}
+                onAuthLost={onAuthLost}
+              />
+            </>
+          )}
+
+          {cap.auth && (
+            <>
+              <Separator />
+              <AuthPanel name={cap.name} auth={cap.auth} />
             </>
           )}
 

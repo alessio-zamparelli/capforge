@@ -13,7 +13,9 @@ import {
 } from "@/components/ui/empty";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AuthPage } from "@/components/AuthPage";
 import { CapabilityList } from "@/components/CapabilityList";
+import { ModelsPage } from "@/components/ModelsPage";
 import { SharesPage } from "@/components/SharesPage";
 
 const POLL_MS = 3000;
@@ -68,7 +70,7 @@ export default function Dashboard({ onAuthLost }: { onAuthLost: () => void }) {
         <div>
           <h1 className="text-xl font-semibold">capforge console</h1>
           <p className="text-sm text-muted-foreground">
-            Capabilities, tags, environment and operator-approved shared folders.
+            Capabilities, tags, environment, models, identity providers and shared folders.
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => void refresh()}>
@@ -80,6 +82,8 @@ export default function Dashboard({ onAuthLost }: { onAuthLost: () => void }) {
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="capabilities">Capabilities</TabsTrigger>
+          <TabsTrigger value="models">Models</TabsTrigger>
+          <TabsTrigger value="auth">Authentication</TabsTrigger>
           <TabsTrigger value="shares">Shared folders</TabsTrigger>
         </TabsList>
 
@@ -116,6 +120,14 @@ export default function Dashboard({ onAuthLost }: { onAuthLost: () => void }) {
               onAuthLost={onAuthLost}
             />
           )}
+        </TabsContent>
+
+        <TabsContent value="models">
+          <ModelsPage onAuthLost={onAuthLost} />
+        </TabsContent>
+
+        <TabsContent value="auth">
+          <AuthPage onAuthLost={onAuthLost} />
         </TabsContent>
 
         <TabsContent value="shares">

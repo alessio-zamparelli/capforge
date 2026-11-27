@@ -140,6 +140,9 @@ export interface CapInfo {
   served: ServedInfo | null;
   env: EnvInfo[];
   shares: ShareStatus[];
+  auth: AuthInfo | null;
+  llm_declared: boolean;
+  llm: LlmSelection | null;
 }
 
 export interface TagInfo {
@@ -321,4 +324,256 @@ export async function revokeShare(name: string, folder: string): Promise<ShareCh
       { method: "DELETE", headers: { "X-CSRF": "1" } }
     )
   )) as ShareChange;
+}
+
+// ------------------------------------------------------------------ models (LLM)
+
+export interface LlmModel {
+  id: string;
+  label: string;
+}
+
+export type LlmAuth = "bearer" | "header" | "none";
+
+export interface LlmProvider {
+  id: string;
+  label: string;
+  base_url: string;
+  auth: LlmAuth;
+  header_name: string;
+  models: LlmModel[];
+  api_key_configured: boolean;
+}
+
+export interface LlmRef {
+  provider: string;
+  model: string;
+}
+
+export interface LlmConfig {
+  default: LlmRef | null;
+  providers: LlmProvider[];
+}
+
+export interface LlmSelection {
+  provider: string;
+  provider_label: string;
+  model: string;
+  model_label: string;
+  source: "cap" | "default";
+  stale: boolean;
+}
+
+export interface LlmProviderInput {
+  label: string;
+  base_url: string;
+  auth: LlmAuth;
+  header_name?: string;
+  models: string[];
+}
+
+export async function llm(): Promise<LlmConfig> {
+  const body = (await jsonOrThrow(await fetch("../api/llm"))) as { ok: boolean } & LlmConfig;
+  return { default: body.default, providers: body.providers };
+}
+
+export async function saveLlmProvider(
+  id: string,
+  input: LlmProviderInput
+): Promise<LlmConfig> {
+  const body = (await jsonOrThrow(
+    await fetch(`../api/llm/providers/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify(input),
+    })
+  )) as { ok: boolean } & LlmConfig;
+  return { default: body.default, providers: body.providers };
+}
+
+export async function deleteLlmProvider(id: string): Promise<LlmConfig> {
+  const body = (await jsonOrThrow(
+    await fetch(`../api/llm/providers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "X-CSRF": "1" },
+    })
+  )) as { ok: boolean } & LlmConfig;
+  return { default: body.default, providers: body.providers };
+}
+
+export async function setLlmSecret(id: string, value: string): Promise<void> {
+  await jsonOrThrow(
+    await fetch(`../api/llm/providers/${encodeURIComponent(id)}/secret`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ value }),
+    })
+  );
+}
+
+export async function setLlmDefault(provider: string, model: string): Promise<LlmConfig> {
+  const body = (await jsonOrThrow(
+    await fetch("../api/llm/default", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ provider, model }),
+    })
+  )) as { ok: boolean } & LlmConfig;
+  return { default: body.default, providers: body.providers };
+}
+
+export async function testLlmProvider(
+  id: string
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  return (await jsonOrThrow(
+    await fetch(`../api/llm/providers/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+      headers: { "X-CSRF": "1" },
+    })
+  )) as { ok: boolean; status?: number; error?: string };
+}
+
+export interface CapLlmChange {
+  ok: boolean;
+  llm: LlmSelection | null;
+  restarted?: boolean;
+  restart_error?: string;
+}
+
+export async function capLlm(name: string): Promise<LlmSelection | null> {
+  const body = (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/llm`)
+  )) as { llm: LlmSelection | null };
+  return body.llm;
+}
+
+export async function setCapLlm(
+  name: string,
+  provider: string,
+  model: string
+): Promise<CapLlmChange> {
+  return (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/llm`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ provider, model }),
+    })
+  )) as CapLlmChange;
+}
+
+export async function clearCapLlm(name: string): Promise<CapLlmChange> {
+  return (await jsonOrThrow(
+    await fetch(`../api/caps/${encodeURIComponent(name)}/llm`, {
+      method: "DELETE",
+      headers: { "X-CSRF": "1" },
+    })
+  )) as CapLlmChange;
+}
+
+// --------------------------------------------------------------------- auth (OIDC)
+
+export interface OidcProvider {
+  id: string;
+  label: string;
+  issuer: string;
+  client_id: string;
+  scopes: string[];
+  token_auth: "basic" | "post";
+  session_ttl: number;
+  email_claim: string;
+  name_claim: string;
+  groups_claim: string;
+  client_secret_configured: boolean;
+  redirect_uri: string;
+}
+
+export interface OidcConfig {
+  redirect_uri: string;
+  providers: OidcProvider[];
+}
+
+export interface OidcProviderInput {
+  label: string;
+  issuer: string;
+  client_id: string;
+  scopes: string[];
+  token_auth: "basic" | "post";
+  session_ttl: number;
+  email_claim: string;
+  name_claim: string;
+  groups_claim: string;
+}
+
+export interface AuthInfo {
+  provider: string;
+  configured: boolean;
+  allow_emails: string[];
+  allow_domains: string[];
+  allow_groups: string[];
+  public_paths: string[];
+  login_url: string;
+}
+
+export async function oidc(): Promise<OidcConfig> {
+  const body = (await jsonOrThrow(await fetch("../api/oidc"))) as {
+    ok: boolean;
+  } & OidcConfig;
+  return { redirect_uri: body.redirect_uri, providers: body.providers };
+}
+
+export async function saveOidcProvider(
+  id: string,
+  input: OidcProviderInput
+): Promise<OidcConfig> {
+  const body = (await jsonOrThrow(
+    await fetch(`../api/oidc/providers/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify(input),
+    })
+  )) as { ok: boolean } & OidcConfig;
+  return { redirect_uri: body.redirect_uri, providers: body.providers };
+}
+
+export async function deleteOidcProvider(id: string): Promise<OidcConfig> {
+  const body = (await jsonOrThrow(
+    await fetch(`../api/oidc/providers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "X-CSRF": "1" },
+    })
+  )) as { ok: boolean } & OidcConfig;
+  return { redirect_uri: body.redirect_uri, providers: body.providers };
+}
+
+export async function setOidcSecret(id: string, value: string): Promise<void> {
+  await jsonOrThrow(
+    await fetch(`../api/oidc/providers/${encodeURIComponent(id)}/secret`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "X-CSRF": "1" },
+      body: JSON.stringify({ value }),
+    })
+  );
+}
+
+export async function testOidcProvider(id: string): Promise<{
+  ok: boolean;
+  issuer?: string;
+  authorization_endpoint?: string;
+  token_endpoint?: string;
+  userinfo_endpoint?: string;
+  error?: string;
+}> {
+  return (await jsonOrThrow(
+    await fetch(`../api/oidc/providers/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+      headers: { "X-CSRF": "1" },
+    })
+  )) as {
+    ok: boolean;
+    issuer?: string;
+    authorization_endpoint?: string;
+    token_endpoint?: string;
+    userinfo_endpoint?: string;
+    error?: string;
+  };
 }

@@ -35,6 +35,8 @@ SHARE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 SHARE_ACCESS = ("ro", "rw")
 # Operator-managed environment names declared by the Env model in deploy.py.
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# Operator-managed LLM/OIDC provider ids. One safe path component, no dots.
+PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # Legacy pip requirement syntax. Kept only for parsing old frontmatter and rejecting it.
 # The ASGI object name in `app:` frontmatter; it becomes half of a uvicorn
 # "module:variable" argument, so it must be a plain Python identifier.
@@ -89,12 +91,19 @@ ENV_RESERVED = frozenset(
         "CAPFORGE_SERVE_PORT",
         "CAPFORGE_PUBLIC_URL",
         "CAPFORGE_SERVE",
+        "CAPFORGE_LLM_BASE_URL",
+        "CAPFORGE_LLM_TOKEN",
+        "CAPFORGE_LLM_MODEL",
+        "CAPFORGE_LLM_PROVIDER",
+        "CAPFORGE_LLM_API",
         *ENV_ALLOWLIST,
     }
 )
 ENV_RESERVED_PREFIXES = ("CAPFORGE_", "PYTHON", "LD_", "UV_")
 MAX_ENV_VARS = 32
 MAX_ENV_VALUE_BYTES = 16 * 1024
+MAX_AUTH_ALLOW = 100
+MAX_PUBLIC_PATHS = 50
 MAX_SHARE_NOTE = 500
 MAX_SHARE_ENTRIES = 20_000
 # Tests and the web boot probe never receive real values; declared names get this
@@ -321,7 +330,9 @@ def parse_skill_md(text: str) -> tuple[dict[str, Any], str]:
 
 # ------------------------------------------------------------- deploy.py descriptor
 
-_DEPLOY_SCALARS = frozenset({"KIND", "CLI_ENTRYPOINT", "WEB_ENTRYPOINT", "APP", "DATA"})
+_DEPLOY_SCALARS = frozenset(
+    {"KIND", "CLI_ENTRYPOINT", "WEB_ENTRYPOINT", "APP", "DATA", "LLM"}
+)
 _ENV_ANNOTATIONS = {
     "str": "str",
     "SecretStr": "str",
@@ -371,6 +382,17 @@ class ShareMount:
     requested: str = ""
 
 
+@dataclass(frozen=True)
+class AuthSpec:
+    """OIDC gate requested by a web capability in deploy.py."""
+
+    provider: str
+    allow_emails: tuple[str, ...] = ()
+    allow_domains: tuple[str, ...] = ()
+    allow_groups: tuple[str, ...] = ()
+    public_paths: tuple[str, ...] = ()
+
+
 @dataclass
 class DeploySpec:
     """The deployment descriptor read from deploy.py."""
@@ -382,6 +404,8 @@ class DeploySpec:
     data: str = "version"
     env: list[EnvSpec] = field(default_factory=list)
     shares: tuple[ShareSpec, ...] = ()
+    auth: AuthSpec | None = None
+    llm: bool = False
 
     @property
     def kind(self) -> str:
@@ -473,6 +497,54 @@ def _shares_from_value(value: Any) -> tuple[ShareSpec, ...]:
             )
         shares.append(ShareSpec(name=name, access=access))
     return tuple(sorted(shares, key=lambda item: item.name))
+
+
+def _auth_strings(
+    value: Any, label: str, *, lower: bool = False, limit: int = MAX_AUTH_ALLOW
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise CapError(f"deploy.py: AUTH {label} must be a list of strings")
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if not text or "\n" in text or "\r" in text:
+            raise CapError(f"deploy.py: AUTH {label} entries must be non-empty one-line strings")
+        if lower:
+            text = text.lower()
+        if text not in out:
+            out.append(text)
+    if len(out) > limit:
+        raise CapError(f"deploy.py: AUTH {label} has more than {limit} entries")
+    return tuple(out)
+
+
+def _auth_from_value(value: Any) -> AuthSpec | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = {"provider": value}
+    if not isinstance(value, dict):
+        raise CapError(
+            'deploy.py: AUTH must be a provider name or a dict like {"provider": "corp"}'
+        )
+    allowed = {"provider", "allow_emails", "allow_domains", "allow_groups", "public_paths"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise CapError(f"deploy.py: AUTH has unknown keys {sorted(unknown)}")
+    provider = valid_provider_id(value.get("provider"))
+    paths = _auth_strings(value.get("public_paths"), "public_paths", limit=MAX_PUBLIC_PATHS)
+    for path in paths:
+        if not path.startswith("/") or ".." in path or "//" in path or "\x00" in path:
+            raise CapError(f"deploy.py: AUTH public_paths entry {path!r} is not a safe path")
+    return AuthSpec(
+        provider=provider,
+        allow_emails=_auth_strings(value.get("allow_emails"), "allow_emails", lower=True),
+        allow_domains=_auth_strings(value.get("allow_domains"), "allow_domains", lower=True),
+        allow_groups=_auth_strings(value.get("allow_groups"), "allow_groups"),
+        public_paths=paths,
+    )
 
 
 def _field_value(value: ast.expr | None) -> tuple[bool, Any, dict[str, Any]]:
@@ -567,7 +639,7 @@ def parse_deploy_py(text: str) -> DeploySpec:
                         "deploy.py: ENTRYPOINT was renamed; use CLI_ENTRYPOINT for KIND "
                         '"cli" and WEB_ENTRYPOINT for KIND "web"'
                     )
-                if target in _DEPLOY_SCALARS or target == "SHARES":
+                if target in _DEPLOY_SCALARS or target in ("SHARES", "AUTH"):
                     values[target] = _literal_value(node.value, target)
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             if isinstance(node.target, ast.Name) and node.target.id == "ENTRYPOINT":
@@ -576,7 +648,7 @@ def parse_deploy_py(text: str) -> DeploySpec:
                     '"cli" and WEB_ENTRYPOINT for KIND "web"'
                 )
             if isinstance(node.target, ast.Name) and (
-                node.target.id in _DEPLOY_SCALARS or node.target.id == "SHARES"
+                node.target.id in _DEPLOY_SCALARS or node.target.id in ("SHARES", "AUTH")
             ):
                 values[node.target.id] = _literal_value(node.value, node.target.id)
         elif isinstance(node, ast.ClassDef) and node.name == "Env":
@@ -635,6 +707,12 @@ def parse_deploy_py(text: str) -> DeploySpec:
     if len(specs) > MAX_ENV_VARS:
         raise CapError(f"env declares {len(specs)} variables; the limit is {MAX_ENV_VARS}.")
     shares = _shares_from_value(values.get("SHARES"))
+    llm = values.get("LLM", False)
+    if not isinstance(llm, bool):
+        raise CapError("deploy.py: LLM must be True or False")
+    auth = _auth_from_value(values.get("AUTH"))
+    if auth is not None and not serves_web:
+        raise CapError('deploy.py: AUTH is only valid when KIND includes "web"')
     return DeploySpec(
         modes=modes,
         cli_entrypoint=cli_entrypoint,
@@ -643,6 +721,8 @@ def parse_deploy_py(text: str) -> DeploySpec:
         data=data,
         env=specs,
         shares=shares,
+        auth=auth,
+        llm=llm,
     )
 
 
@@ -664,6 +744,8 @@ class Capability:
     env: list[str] = field(default_factory=list)
     env_specs: list[EnvSpec] = field(default_factory=list)
     shares: tuple[ShareSpec, ...] = ()
+    auth: AuthSpec | None = None
+    llm: bool = False
     body: str = ""
     error: str | None = None
 
@@ -763,6 +845,17 @@ def valid_env_name(name: str) -> str:
     return text
 
 
+def valid_provider_id(value: Any) -> str:
+    """Validate an LLM/OIDC provider id; it becomes one path component."""
+    text = str(value or "").strip()
+    if not PROVIDER_ID_RE.match(text):
+        raise CapError(
+            f"Invalid provider id {value!r}. Use lowercase letters, digits, '-' and '_', "
+            "starting with a letter or digit (max 40 chars)."
+        )
+    return text
+
+
 _LEGACY_FRONTMATTER = ("kind", "entrypoint", "app", "data", "env")
 
 
@@ -807,6 +900,8 @@ def _load_from(name: str, path: Path) -> Capability:
     cap.env_specs = spec.env
     cap.env = [item.name for item in spec.env]
     cap.shares = spec.shares
+    cap.auth = spec.auth
+    cap.llm = spec.llm
     project_error = _validate_project(path)
     if project_error is not None:
         cap.error = project_error
@@ -2264,6 +2359,16 @@ def _execute_locked(
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
     _apply_cap_env(env, cap.name, cap, tag=tag)
+    llm_module: Any = None
+    llm_token: str | None = None
+    if cap.llm:
+        from . import llm as llm_module
+
+        if tag is None:
+            env.update(llm_module.test_env())
+        else:
+            env.update(llm_module.runtime_env(cap, ttl=(timeout or run_timeout()) + 60))
+            llm_token = env.get("CAPFORGE_LLM_TOKEN")
 
     payload = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
     started = time.monotonic()
@@ -2272,13 +2377,17 @@ def _execute_locked(
         _sandbox_policy(source, venv, data, shared=shared, shares=mounts),
         cap.name,
     )
-    code, stdout, stderr, timed_out = _run_process(
-        cmd,
-        cwd=source,
-        env=env,
-        payload=payload,
-        timeout=timeout or run_timeout(),
-    )
+    try:
+        code, stdout, stderr, timed_out = _run_process(
+            cmd,
+            cwd=source,
+            env=env,
+            payload=payload,
+            timeout=timeout or run_timeout(),
+        )
+    finally:
+        if llm_module is not None and llm_token:
+            llm_module.revoke(llm_token)
     sweep_stray_children()
     duration = int((time.monotonic() - started) * 1000)
     if timed_out:
@@ -2423,6 +2532,10 @@ def _run_pytest(
     env["COVERAGE_FILE"] = str(data / ".coverage")
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}:{env['PATH']}"
+    if cap.llm:
+        from . import llm
+
+        env.update(llm.test_env())
     # Model-authored tests and their output are visible to the model: never inject
     # real values here, only harmless placeholders for declared names.
     env.update(cap_env_placeholders(cap))
@@ -2593,6 +2706,10 @@ def probe_web_boot(
     env = web_child_env(
         cap, tag=None, venv=venv, port=port, data_tag="test", share_mounts=mounts
     )
+    if cap.llm:
+        from . import llm
+
+        env.update(llm.test_env())
     shared = shared_data_dir(cap.name) if cap.data == "shared" else None
     cmd = _sandbox_command(
         [str(venv / "bin" / "python"), *web_child_argv(cap, source, port)],

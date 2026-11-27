@@ -72,6 +72,7 @@ KIND = ["cli"]
 CLI_ENTRYPOINT = "main.py"
 DATA = "version"
 # SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
+# LLM = True  # call the hub model gateway; the operator picks the model
 '''
 
 DEPLOY_WEB = '''\
@@ -93,6 +94,8 @@ WEB_ENTRYPOINT = "app.py"
 APP = "app"
 DATA = "version"
 # SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
+# LLM = True  # call the hub model gateway; the operator picks the model
+# AUTH = {{"provider": "corp"}}  # require OIDC sign-in; configure the provider in the console
 '''
 
 DEPLOY_BOTH = '''\
@@ -115,6 +118,8 @@ WEB_ENTRYPOINT = "app.py"
 APP = "app"
 DATA = "version"
 # SHARES = {{"datasets": "ro"}}  # operator-approved cross-capability folders
+# LLM = True  # call the hub model gateway; the operator picks the model
+# AUTH = {{"provider": "corp"}}  # require OIDC sign-in; configure the provider in the console
 '''
 
 TEST = '''\

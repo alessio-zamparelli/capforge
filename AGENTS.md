@@ -39,12 +39,15 @@ capforge/
     gitremote.py    bare repo init/config/hook, archive materialisation, refs, gc
     scaffold.py     uv base project, uv lock, initial commit, publish main
     staging.py      git tokens, staging state, bounded logs, async push pipeline
+    llm.py          LLM providers, per-cap model selection, loopback gateway
+    oidc.py         OIDC providers, discovery, PKCE flow, signed sessions
     contract.py     CONTRACT text and the scaffolded AGENTS template (strings only)
-    web.py          :8080 /ui /api /git /cap, console, git CGI bridge, serve engine
+    web.py          :8080 /ui /api /git /cap, console, git CGI bridge, serve engine,
+                    OIDC routes
     server.py       FastMCP instance and the ten tools
     cli.py          serve | doctor | tools | promote | test
 docs/ARCHITECTURE.md, docs/NEXT.md
-tests/test_lifecycle.py, test_web.py, test_units.py
+tests/test_llm_oidc.py, test_lifecycle.py, test_web.py, test_units.py
 tools/mcp_probe.py
 ui/                  React + Vite + shadcn/Tailwind console
 AGENTS.md.example    guide shipped inside a scaffolded repo
@@ -54,7 +57,8 @@ Dockerfile, docker-compose.yml, .env.example
 Data flow: `server.py` is a thin adapter over `core`, `versioning`, `scaffold`, `staging`,
 `gitremote`; `web.py` owns transport and the serve engine. `core`, `versioning`, `contract`,
 `staging`, `scaffold`, `gitremote` are stdlib-only (gitremote uses the git binary). `web.py` owns
-starlette/httpx; `server.py` owns fastmcp. `versioning` imports `web` only lazily.
+starlette/httpx; `llm.py` and `oidc.py` own httpx and are imported lazily from `core`; `server.py`
+owns fastmcp. `versioning` imports `web` only lazily.
 
 ## The ten tools
 
@@ -74,8 +78,8 @@ never let `CapError` escape to MCP.
 <caps>/<name>/
     SKILL.md            name, description and instructions; no deployment fields
     deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT,
-                        WEB_ENTRYPOINT, APP, DATA, SHARES and Env (pydantic)
-                        fields; parsed with ast, never imported
+                        WEB_ENTRYPOINT, APP, DATA, SHARES, LLM, AUTH and Env
+                        (pydantic) fields; parsed with ast, never imported
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed
     .python-version     3.14
@@ -90,8 +94,10 @@ never let `CapError` escape to MCP.
 machine-readable contract: literal `KIND` (`"cli"`, `"web"`, or a list of both), the matching
 `CLI_ENTRYPOINT`/`WEB_ENTRYPOINT`, optional `APP`, `DATA` (`"version"`/`"shared"`), a literal
 `SHARES` dict of folder → `ro`/`rw` requests, plus an
-optional pydantic `Env` model whose fields declare operator-set variables. `core.parse_deploy_py`
-parses it with `ast` (no import, no execution);
+optional pydantic `Env` model whose fields declare operator-set variables. `LLM = True` (any
+kind) opts into the hub gateway; `AUTH = {...}` (web only) requests OIDC and accepts a provider
+name shorthand, allow lists and `public_paths`. `core.parse_deploy_py` parses it with `ast` (no
+import, no execution);
 supported annotations are `str`, `int`, `float`, `bool` (unknown → `str`), and `Field(...)` may
 add `description`, `min_length`, `max_length`, `ge`, `le`. A field without a default is required.
 Frontmatter `kind`/`entrypoint`/`app`/`data`/`env`/`packages` is refused with a migration error;
@@ -111,6 +117,9 @@ Execution rules (`core.execute`):
 - `Env` fields declared in `deploy.py` injected only for the active tag (`cap_env_values`); optional
   fields fall back to their declared default; tests, drafts and the web boot probe get defaults or
   type-shaped placeholders (`capforge-test-placeholder`, `0`, `0.0`, `false`), never real values;
+- with `LLM = True`, the active run/web child gets five `CAPFORGE_LLM_*` values from the loopback
+  gateway (base URL, per-run token, operator-selected model, provider, `openai`); tests, drafts and
+  the boot probe get placeholders. The provider key never enters the capability environment;
 - a hard timeout on the process group; nothing survives the call; detached strays are swept;
 - Landlock: system/own-code/venv read, own data read/write, approved `ro` shares read and `rw`
   shares write, everything else denied;
@@ -129,6 +138,13 @@ Promotion is pipeline-only. `staging_latest`/`staging_logs` expose state and dia
 - `rollback_capability` only moves the pointer.
 - State is `<state>/state/<name>.json`; writes are atomic (temp + `Path.replace`), corrupt files
   are quarantined as `<name>.corrupt-<ns>.json`.
+- LLM config is `<state>/llm.json`, keys `<state>/secrets/llm/<provider>.json`, per-cap selection
+  `<state>/llm/caps/<name>.json`. OIDC config is `<state>/oidc.json`, client secrets
+  `<state>/secrets/oidc/<provider>.json`, session key `<state>/auth.key` (`0600`). Only the console
+  writes keys; they are never in state JSON, tags, hashes or MCP output.
+- OIDC sessions are signed cookies scoped to `/cap/<name>/`; the proxy forwards
+  `X-Capforge-User*` and strips client-supplied `x-capforge-*` headers. A missing provider fails
+  `serve`/start closed; a missing LLM model/key fails `run`/`serve` closed.
 - Operator env values are `<state>/secrets/<name>.json` (mode `0600`, atomic, per capability and
   shared across tags). They are never in state JSON, tags, hashes or MCP output; only the console
   can write them, and a web instance restarts after a change.
@@ -166,7 +182,7 @@ confined. Do not broaden the allowlist to make a test pass without documenting w
   `_contained` before touching disk. Never build a path from unsanitised model input.
 - Log runs/promotions at INFO with stable `key=value` fields. Never log tokens, `Authorization`,
   environment values or capability output bodies beyond the bounded log.
-- Keep `__version__` and `[project].version` equal (0.7.1).
+- Keep `__version__` and `[project].version` equal (0.8.0).
 - Capabilities stay deterministic when `data: version`; `DATA = "shared"` and `SHARES` relax that by
   design and leave concurrency/backup to the capability and operator.
 - Use `track_child()` for every direct git/pytest/uv child so a concurrent stray sweep cannot kill
@@ -200,7 +216,10 @@ install`) and commit the lock. CI and the image use `--locked`/`--frozen-lockfil
 ## Tests
 
 `test_units.py` is fast: parsing/validation, state/quarantine, hashes, share registry and census,
-routes, console auth, sandbox policy, ten tools, UI mount. `test_lifecycle.py` (slow) scaffolds real
+routes, console auth, sandbox policy, ten tools, UI mount. `test_llm_oidc.py` is fast: deploy
+parsing, provider/selection stores, the gateway (fake upstream on loopback), OIDC discovery/PKCE
+against a local provider, signed sessions and allow lists, and the console APIs. `test_lifecycle.py`
+(slow) scaffolds real
 uv projects, runs the pipeline, promotes, rolls back, tests data isolation/shared data,
 cross-capability `ro`/`rw` grants and Landlock denial.
 `test_web.py` (slow) boots real uvicorn children through `/cap`, tests restart/prune/restore,

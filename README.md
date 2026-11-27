@@ -51,6 +51,8 @@ reverse-proxied at `http://<host>:8080/cap/<name>/`; the console is `/ui/`, the 
 - [Capability contract](#capability-contract)
 - [Git authentication](#git-authentication)
 - [Web capabilities](#web-capabilities)
+- [Models (LLM)](#models-llm)
+- [Capability authentication](#capability-authentication)
 - [Storage](#storage)
 - [Tests](#tests)
 
@@ -145,7 +147,7 @@ uv run capforge tools                    # ten tool schemas
 | `CAPFORGE_MAX_UPLOAD_BYTES` | 64 MiB | push spool / `receive.maxInputSize` |
 | `CAPFORGE_LOG_MAX_BYTES` / `_TAIL_BYTES` | 1 MiB / 64 KiB | log rotation and MCP tail |
 | `CAPFORGE_WEB_HOST` / `_WEB_PORT` | `0.0.0.0` / `8080` | web listener; `0` disables `/ui`, `/api`, `/git` and `/cap` |
-| `CAPFORGE_PUBLIC_URL` | derived | externally reachable base, including any proxy prefix |
+| `CAPFORGE_PUBLIC_URL` | derived | externally reachable base, including any proxy prefix; required for OIDC |
 | `CAPFORGE_WEB_TOKEN` | unset | console/control token; unset disables `/api` |
 | `CAPFORGE_WEB_UI` / `_UI_DIR` | `1` / `ui/dist` | console bundle or JSON index |
 | `CAPFORGE_MCP_TOKEN` | required | bearer token for HTTP MCP (`stdio` exempt) |
@@ -342,6 +344,69 @@ A hybrid (`KIND = ["cli", "web"]`) also keeps `run_capability` on `CLI_ENTRYPOIN
 Boot failures return the child log tail. The child is sandboxed by Landlock and writes only to
 its data directories and approved shared folders.
 
+## Models (LLM)
+
+A capability opts into model access with `LLM = True` in `deploy.py` (any `KIND`). The operator
+adds one or more OpenAI-compatible providers on the **Models** tab: a label, a base URL, the auth
+mode (bearer, a custom header, or none), the API key and the model ids. One model is the global
+default and is pre-selected for every capability; the operator can override it per capability and
+the override wins over a capability's own request.
+
+Capability code never receives a provider key. It receives a short-lived capability token and the
+hub runs a loopback-only gateway:
+
+```text
+CAPFORGE_LLM_BASE_URL=http://127.0.0.1:<port>/v1
+CAPFORGE_LLM_TOKEN=<capability token>
+CAPFORGE_LLM_MODEL=<operator-selected model>
+CAPFORGE_LLM_PROVIDER=<provider id>
+CAPFORGE_LLM_API=openai
+```
+
+Point any OpenAI-compatible client at the base URL and use the token as the API key. The gateway
+proxies `/v1/chat/completions`, `/v1/responses` and `/v1/models`, injects the provider credential
+and forces `model` to the operator's selection; a request for a different model is rejected. Tests
+and the web boot probe receive placeholder values. A capability that declares `LLM = True` fails
+closed when no model resolves or the provider key is missing.
+
+Settings live in `<state>/llm.json` (providers, models, default) and
+`<state>/llm/caps/<name>.json` (per-capability override), with keys in
+`<state>/secrets/llm/<provider>.json` (mode `0600`). Keys are write-only in the console.
+
+## Capability authentication
+
+A web capability can require OIDC sign-in with `AUTH` in `deploy.py`:
+
+```python
+AUTH = {
+    "provider": "corp",                  # configured on the Authentication tab
+    "allow_emails": ["a@example.com"],   # optional; any match grants access
+    "allow_domains": ["example.com"],    # optional
+    "allow_groups": ["engineering"],     # optional
+    "public_paths": ["/health"],         # optional; no login required
+}
+```
+
+`AUTH = "corp"` is shorthand for `{"provider": "corp"}`. With no allow list, any identity the
+provider verifies is accepted. The flow is Authorization Code + PKCE with `state` and `nonce`;
+the hub discovers the provider, exchanges the code over TLS, reads the userinfo endpoint and keeps
+a signed, `HttpOnly` session cookie scoped to `/cap/<name>/`.
+
+Register `<CAPFORGE_PUBLIC_URL>/__auth/callback` with the provider. `CAPFORGE_PUBLIC_URL` must be
+explicit when OIDC is used. The hub routes are:
+
+```text
+GET /cap/<name>/__auth/login
+GET /cap/<name>/__auth/logout
+GET /__auth/callback
+```
+
+The proxy forwards the verified identity to the app as `X-Capforge-User` (base64url JSON) and
+`X-Capforge-User-Email`; incoming `x-capforge-*` headers are stripped. Capabilities must not
+implement their own login. A missing or deleted provider fails serve/start closed and the proxy
+returns `503`. OIDC providers and their client secrets live in `<state>/oidc.json` and
+`<state>/secrets/oidc/<provider>.json`.
+
 ## Storage
 
 ```text
@@ -353,6 +418,12 @@ its data directories and approved shared folders.
 <CAPFORGE_STATE_DIR>/shares/<folder>/         operator-owned cross-capability data
 <CAPFORGE_STATE_DIR>/state/<name>.json        active tag + tags
 <CAPFORGE_STATE_DIR>/state/shares.json        shared-folder census and grants
+<CAPFORGE_STATE_DIR>/llm.json                 LLM providers, models and default
+<CAPFORGE_STATE_DIR>/llm/caps/<name>.json     per-capability model override
+<CAPFORGE_STATE_DIR>/oidc.json                OIDC providers
+<CAPFORGE_STATE_DIR>/auth.key                 OIDC session signing key (mode 0600)
+<CAPFORGE_STATE_DIR>/secrets/llm/<provider>.json
+<CAPFORGE_STATE_DIR>/secrets/oidc/<provider>.json
 <CAPFORGE_STATE_DIR>/staging/<name>.json      push pipeline state
 <CAPFORGE_STATE_DIR>/git/<name>.git/          bare receive/upload repository
 <CAPFORGE_STATE_DIR>/logs/<name>/*.log        pipeline/scaffold logs

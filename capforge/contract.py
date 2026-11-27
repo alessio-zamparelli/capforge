@@ -27,7 +27,7 @@ git tokens, but an operator must purge the capability in the console or with `ca
     <name>/
         SKILL.md            name, description and instructions; no deployment fields
         deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT, WEB_ENTRYPOINT,
-                            APP, DATA, SHARES and Env
+                            APP, DATA, SHARES, LLM, AUTH and Env
         pyproject.toml      dependencies; requires-python = ">=3.14,<3.15"
         uv.lock             committed; `uv sync --frozen` is the only install path
         .python-version     3.14
@@ -53,6 +53,8 @@ imports capability code), so keep the assignments literal:
         "datasets": "ro",          # read-only
         "cache": "rw",             # read-write
     }
+    LLM = False                    # True to call the hub's model gateway
+    AUTH = {"provider": "corp"}    # web only; operator-configured OIDC provider
 
 `KIND` lists the surfaces the capability exposes. A CLI capability has
 `CLI_ENTRYPOINT`, a web capability has `WEB_ENTRYPOINT` and `APP`, and a hybrid
@@ -138,6 +140,45 @@ at import time or in a test.
 * `DATA = "shared"` is separate: it is this capability's own `CAPFORGE_SHARED_DATA_DIR`. Other
   capabilities cannot see it.
 
+## Models (LLM)
+
+Set `LLM = True` to call a language model. The hub runs a gateway; you never receive a provider
+key or choose the model. The operator picks the model in the console, and every run receives:
+
+    CAPFORGE_LLM_BASE_URL=http://127.0.0.1:<port>/v1
+    CAPFORGE_LLM_TOKEN=<short-lived capability token>
+    CAPFORGE_LLM_MODEL=<the operator's choice>
+    CAPFORGE_LLM_PROVIDER=<provider id>
+    CAPFORGE_LLM_API=openai
+
+Use an OpenAI-compatible client pointed at `CAPFORGE_LLM_BASE_URL` with
+`api_key=CAPFORGE_LLM_TOKEN`. Only `/v1/chat/completions`, `/v1/responses` and `/v1/models` are
+proxied. The gateway forces `model` to the operator's selection and rejects a different one; do not
+hard-code a model or ask the user to choose one. Tests and the boot probe receive placeholder
+values, so guard any real call behind an explicit runtime check.
+
+## Authentication (web)
+
+`AUTH` gates a served capability behind an OIDC provider the operator configured in the console:
+
+    AUTH = {
+        "provider": "corp",                  # required; provider id from the console
+        "allow_emails": ["a@example.com"],   # optional; any match grants access
+        "allow_domains": ["example.com"],    # optional
+        "allow_groups": ["engineering"],     # optional; from the groups claim
+        "public_paths": ["/health"],         # optional; unauthenticated paths
+    }
+
+`AUTH = "corp"` is shorthand for `{"provider": "corp"}`. With no allow list, any identity the
+provider verifies is accepted. The hub terminates the flow at `/cap/<name>/__auth/login`, keeps a
+signed session cookie scoped to the capability, and forwards the identity to your app:
+
+    X-Capforge-User: <base64url JSON {sub,email,name,groups,provider}>
+    X-Capforge-User-Email: <email>
+
+Trust these headers only behind the hub; client-supplied `X-Capforge-*` values are stripped. Your
+app must not implement its own login, and must not assume a cookie survives the proxy.
+
 ## Rules
 
 1. Validate every argument. It came from a language model.
@@ -204,7 +245,7 @@ Promotion is automatic on a green pipeline. `install_packages`, `test_capability
 
     SKILL.md            name, description and instructions; no deployment fields
     deploy.py           deployment descriptor: KIND, CLI_ENTRYPOINT, WEB_ENTRYPOINT,
-                        APP, DATA, SHARES and Env
+                        APP, DATA, SHARES, LLM, AUTH and Env
     pyproject.toml      requires-python = ">=3.14,<3.15"; dependencies
     uv.lock             committed; uv sync --frozen is the only install path
     .python-version     3.14
@@ -226,6 +267,8 @@ assignments literal:
         "datasets": "ro",          # read-only
         "cache": "rw",             # read-write
     }
+    LLM = False                    # True to call the hub's model gateway
+    AUTH = {"provider": "corp"}    # web only; operator-configured OIDC provider
 
 `KIND` lists the surfaces the capability exposes. A CLI capability has
 `CLI_ENTRYPOINT`, a web capability has `WEB_ENTRYPOINT` and `APP`, and a hybrid
@@ -290,6 +333,25 @@ not production data. Shared folders are unversioned and unsynchronized: use `flo
 concurrent calls can race, and let the operator handle backups.
 
 `DATA = "shared"` is separate: it is this capability's own `CAPFORGE_SHARED_DATA_DIR`.
+
+## Models (LLM)
+
+Set `LLM = True` to call a language model. The hub runs the gateway; you never receive a provider
+key and never choose the model. Every run gets `CAPFORGE_LLM_BASE_URL`, `CAPFORGE_LLM_TOKEN`,
+`CAPFORGE_LLM_MODEL`, `CAPFORGE_LLM_PROVIDER` and `CAPFORGE_LLM_API=openai`. Point an
+OpenAI-compatible client at the base URL and use the token as the API key. The gateway forwards
+`/v1/chat/completions`, `/v1/responses` and `/v1/models`, forces the operator-selected model and
+rejects a different `model` value. Do not hard-code a model. Tests and the boot probe receive
+placeholder values.
+
+## Authentication (web)
+
+`AUTH = {"provider": "corp"}` gates a served capability behind an operator-configured OIDC
+provider. Optional `allow_emails`, `allow_domains`, `allow_groups` restrict access (any match
+grants it), and `public_paths` lists unauthenticated paths such as `/health`. `AUTH = "corp"` is
+shorthand. The hub runs the flow at `/cap/<name>/__auth/login` and forwards the identity as
+`X-Capforge-User` (base64url JSON) and `X-Capforge-User-Email`. Client-supplied `X-Capforge-*`
+headers are stripped, so trust these only behind the hub. Do not implement your own login.
 
 ## Testing
 

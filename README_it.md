@@ -52,6 +52,8 @@ git smart-HTTP è `/git/<name>.git`.
 - [Contratto della capability](#contratto-della-capability)
 - [Autenticazione Git](#autenticazione-git)
 - [Capability web](#capability-web)
+- [Modelli (LLM)](#modelli-llm)
+- [Autenticazione della capability](#autenticazione-della-capability)
 - [Archiviazione](#archiviazione)
 - [Test](#test)
 
@@ -146,7 +148,7 @@ uv run capforge tools                     # schema dei dieci tool
 | `CAPFORGE_MAX_UPLOAD_BYTES` | 64 MiB | spool push / `receive.maxInputSize` |
 | `CAPFORGE_LOG_MAX_BYTES` / `_TAIL_BYTES` | 1 MiB / 64 KiB | rotazione log e tail MCP |
 | `CAPFORGE_WEB_HOST` / `_WEB_PORT` | `0.0.0.0` / `8080` | listener web; `0` disabilita `/ui`, `/api`, `/git` e `/cap` |
-| `CAPFORGE_PUBLIC_URL` | derivato | base raggiungibile dall'esterno, incluso un eventuale prefisso proxy |
+| `CAPFORGE_PUBLIC_URL` | derivato | base raggiungibile dall'esterno, incluso un eventuale prefisso proxy; richiesto per OIDC |
 | `CAPFORGE_WEB_TOKEN` | non impostato | token console/control; se assente disabilita `/api` |
 | `CAPFORGE_WEB_UI` / `_UI_DIR` | `1` / `ui/dist` | bundle della console o indice JSON |
 | `CAPFORGE_MCP_TOKEN` | richiesto | token bearer per MCP HTTP (`stdio` esente) |
@@ -352,6 +354,68 @@ ibrido (`KIND = ["cli", "web"]`) mantiene anche `run_capability` su `CLI_ENTRYPO
 di boot restituiscono il tail del log del child. Il child è confinato da Landlock e scrive solo
 nelle proprie directory dati e nelle cartelle condivise approvate.
 
+## Modelli (LLM)
+
+Una capability abilita l'accesso ai modelli con `LLM = True` in `deploy.py` (qualsiasi `KIND`).
+L'operatore aggiunge provider compatibili OpenAI nella scheda **Models**: etichetta, base URL,
+modalità di autenticazione (bearer, header personalizzato o nessuna), chiave API e id dei modelli.
+Un modello è il default globale ed è preselezionato per ogni capability; l'operatore può
+sovrascriverlo per singola capability.
+
+Il codice della capability non riceve mai la chiave del provider. Riceve un token di capability di
+breve durata e il hub esegue un gateway solo su loopback:
+
+```text
+CAPFORGE_LLM_BASE_URL=http://127.0.0.1:<port>/v1
+CAPFORGE_LLM_TOKEN=<token della capability>
+CAPFORGE_LLM_MODEL=<modello scelto dall'operatore>
+CAPFORGE_LLM_PROVIDER=<id del provider>
+CAPFORGE_LLM_API=openai
+```
+
+Punta un client compatibile OpenAI alla base URL e usa il token come chiave API. Il gateway inoltra
+`/v1/chat/completions`, `/v1/responses` e `/v1/models`, inserisce la credenziale del provider e
+forza `model` alla scelta dell'operatore; una richiesta con un modello diverso viene rifiutata.
+Test e probe di boot ricevono valori segnaposto. Una capability con `LLM = True` fallisce in modo
+chiuso se nessun modello è risolto o manca la chiave del provider.
+
+Le impostazioni stanno in `<state>/llm.json` e `<state>/llm/caps/<name>.json`, con le chiavi in
+`<state>/secrets/llm/<provider>.json` (modo `0600`). Le chiavi sono scrivibili ma mai restituite
+dalla console.
+
+## Autenticazione della capability
+
+Una capability web può richiedere il login OIDC con `AUTH` in `deploy.py`:
+
+```python
+AUTH = {
+    "provider": "corp",                  # configurato nella scheda Authentication
+    "allow_emails": ["a@example.com"],   # opzionale; basta una corrispondenza
+    "allow_domains": ["example.com"],    # opzionale
+    "allow_groups": ["engineering"],     # opzionale
+    "public_paths": ["/health"],         # opzionale; nessun login
+}
+```
+
+`AUTH = "corp"` è la forma abbreviata di `{"provider": "corp"}`. Senza allow list è accettata
+qualsiasi identità verificata dal provider. Il flusso è Authorization Code + PKCE con `state` e
+`nonce`; il hub scopre il provider, scambia il codice su TLS, legge lo userinfo e conserva un cookie
+di sessione firmato e `HttpOnly` con scope `/cap/<name>/`.
+
+Registra `<CAPFORGE_PUBLIC_URL>/__auth/callback` presso il provider. `CAPFORGE_PUBLIC_URL` deve
+essere esplicito quando si usa OIDC. Le route del hub sono:
+
+```text
+GET /cap/<name>/__auth/login
+GET /cap/<name>/__auth/logout
+GET /__auth/callback
+```
+
+Il proxy inoltra l'identità verificata come `X-Capforge-User` (JSON base64url) e
+`X-Capforge-User-Email`; gli header `x-capforge-*` in ingresso vengono rimossi. Le capability non
+devono implementare un proprio login. Un provider mancante o eliminato fa fallire l'avvio in modo
+chiuso e il proxy risponde `503`.
+
 ## Archiviazione
 
 ```text
@@ -363,6 +427,12 @@ nelle proprie directory dati e nelle cartelle condivise approvate.
 <CAPFORGE_STATE_DIR>/shares/<folder>/         dati cross-capability dell'operatore
 <CAPFORGE_STATE_DIR>/state/<name>.json        tag attivo + tag
 <CAPFORGE_STATE_DIR>/state/shares.json        censimento cartelle e grant
+<CAPFORGE_STATE_DIR>/llm.json                 provider LLM, modelli e default
+<CAPFORGE_STATE_DIR>/llm/caps/<name>.json     override del modello per capability
+<CAPFORGE_STATE_DIR>/oidc.json                provider OIDC
+<CAPFORGE_STATE_DIR>/auth.key                 chiave di firma delle sessioni OIDC (0600)
+<CAPFORGE_STATE_DIR>/secrets/llm/<provider>.json
+<CAPFORGE_STATE_DIR>/secrets/oidc/<provider>.json
 <CAPFORGE_STATE_DIR>/staging/<name>.json      stato della pipeline di push
 <CAPFORGE_STATE_DIR>/git/<name>.git/          repository bare receive/upload
 <CAPFORGE_STATE_DIR>/logs/<name>/*.log        log di pipeline/scaffold

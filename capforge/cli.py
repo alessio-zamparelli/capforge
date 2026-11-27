@@ -52,6 +52,20 @@ def _doctor() -> int:
     except Exception as exc:  # a broken web install must not crash doctor
         problems.append(f"web serving is not usable: {exc}")
 
+    try:
+        from . import llm, oidc
+
+        llm_config = llm.read_config()
+        default = llm_config.get("default")
+        default_text = f"{default['provider']}/{default['model']}" if default else "none"
+        print(f"llm        {len(llm_config['providers'])} provider(s), default {default_text}")
+        oidc_config = oidc.read_config()
+        print(f"oidc       {len(oidc_config['providers'])} provider(s)")
+        if oidc_config["providers"] and not os.environ.get("CAPFORGE_PUBLIC_URL", "").strip():
+            problems.append("OIDC providers are configured but CAPFORGE_PUBLIC_URL is unset")
+    except Exception as exc:  # a broken config must not crash doctor
+        problems.append(f"LLM/OIDC configuration is not usable: {exc}")
+
     from .core import mcp_token
 
     transport = os.environ.get("CAPFORGE_TRANSPORT", "http").strip().lower() or "http"
